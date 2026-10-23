@@ -1,0 +1,183 @@
+// 与 Go internal/model/settings.go / system.go / credential.go 的 json tag 对齐。
+
+export interface ToolInstallation {
+  name: string
+  home?: string
+  note?: string
+}
+
+export interface ToolCategory {
+  id: string
+  title: string
+  hint?: string
+  installations: ToolInstallation[]
+}
+
+export interface MavenSettings {
+  default_settings: string
+  global_settings: string
+  maven_opts: string
+  local_repo: string
+}
+
+// 系统配置中集中维护的 SSH 发布目标。
+export interface SshServer {
+  id: string
+  name: string
+  host: string
+  port: number
+  username: string
+  auth_type: 'key' | 'password'
+  private_key_path?: string
+  password?: string
+  known_hosts_path?: string
+  remote_base_dir?: string
+  note?: string
+  has_password?: boolean
+}
+
+export interface EnvVar {
+  key: string
+  value: string
+}
+
+export interface EmailSettings {
+  enabled: boolean
+  smtp_host: string
+  smtp_port: number
+  use_tls: boolean
+  username: string
+  password?: string
+  from: string
+  default_suffix: string
+  recipients: string
+  notify_on_failure: boolean
+  notify_on_success: boolean
+  subject_template: string
+}
+
+export interface Settings {
+  display_name: string
+  system_message: string
+  jenkins_url: string
+  admin_email: string
+  default_branch: string
+  job_name_regex: string
+  quiet_period_seconds: number
+  scm_retry_count: number
+  shell: string
+  global_build_timeout_minutes: number
+  build_retention_max_per_job: number
+  build_retention_max_age_days: number
+  artifact_max_total_mb: number
+  artifact_max_files: number
+  global_env: EnvVar[]
+  git_user_name: string
+  git_user_email: string
+  tool_categories: ToolCategory[]
+  ssh_servers: SshServer[]
+  maven: MavenSettings
+  email: EmailSettings
+  quiet_mode: boolean
+  auth_enabled: boolean
+  auth_user: string
+  auth_password?: string
+  workers: number
+  queue_size: number
+  workspace_ttl_minutes: number
+  clean_interval_minutes: number
+  updated_at: string
+  has_password: boolean
+}
+
+export interface SystemInfo {
+  app_name: string
+  version: string
+  commit: string
+  build_date: string
+  go_version: string
+  os: string
+  arch: string
+  cpus: number
+  goroutines: number
+  memory_alloc_mb: number
+  memory_sys_mb: number
+  uptime_seconds: number
+  data_home: string
+  jobs_dir: string
+  workspace_dir: string
+  workers: number
+  queue_capacity: number
+  queue_length: number
+  quiet_mode: boolean
+  auth_enabled: boolean
+  pipeline_count: number
+  build_count: number
+  running_builds: number
+  server_time: string
+}
+
+export interface DataHomeInfo {
+  data_home: string
+  configured_data_home: string
+  config_file: string
+  jobs_dir: string
+  workspace_dir: string
+  explicit: boolean
+  restart_required: boolean
+}
+
+export interface LoadStats {
+  pipeline_count: number
+  build_count: number
+  success_builds: number
+  failed_builds: number
+  running_builds: number
+  pending_builds: number
+  queue_length: number
+  queue_capacity: number
+  average_duration_ms: number
+  workspace_count: number
+  workspace_bytes: number
+  jobs_bytes: number
+}
+
+export interface Feature {
+  name: string
+  version: string
+  status: string
+  description: string
+}
+
+export interface OldDataItem {
+  kind: 'workspace' | 'orphan_job' | string
+  path: string
+  bytes: number
+  detail: string
+}
+
+export interface OldDataReport {
+  items: OldDataItem[]
+  total_bytes: number
+  scanned_at: string
+}
+
+export type CredentialType = 'username_password' | 'secret_text' | 'ssh_key'
+
+export interface Credential {
+  id: string
+  name: string
+  type: CredentialType
+  username?: string
+  description: string
+  created_at: string
+  updated_at: string
+}
+
+export interface CredentialPayload {
+  name: string
+  type: CredentialType
+  username: string
+  description: string
+  secret: string
+}

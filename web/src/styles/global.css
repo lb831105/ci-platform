@@ -1,0 +1,198 @@
+/* ==========================================================================
+   CI Platform — 全局设计系统
+   统一色彩 / 间距 / 圆角 / 阴影，并覆盖 Element Plus 主题变量。
+   ========================================================================== */
+
+:root {
+  /* 品牌色 */
+  --brand-50: #eef4ff;
+  --brand-100: #dbe6ff;
+  --brand-200: #bdd0fd;
+  --brand-500: #3b82f6;
+  --brand-600: #2563eb;
+  --brand-700: #1d4ed8;
+
+  /* 中性色 */
+  --text-1: #0f172a;
+  --text-2: #334155;
+  --text-3: #64748b;
+  --text-4: #94a3b8;
+  --border-1: #e6e9ef;
+  --border-2: #eef1f5;
+  --bg-app: #f5f7fa;
+  --bg-card: #ffffff;
+  --bg-hover: #f1f5f9;
+
+  /* 语义色 */
+  --success: #16a34a;
+  --warning: #f59e0b;
+  --danger: #dc2626;
+  --info: #0ea5e9;
+
+  /* 圆角与阴影 */
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.08), 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-md: 0 6px 18px rgba(15, 23, 42, 0.08);
+  --shadow-lg: 0 16px 40px rgba(15, 23, 42, 0.14);
+
+  /* Element Plus 主题覆盖 */
+  --el-color-primary: #2563eb;
+  --el-color-primary-light-3: #6692f1;
+  --el-color-primary-light-5: #92b1f5;
+  --el-color-primary-light-7: #bed0f9;
+  --el-color-primary-light-8: #d3e0fb;
+  --el-color-primary-light-9: #e9f0fd;
+  --el-color-primary-dark-2: #1e4fbc;
+  --el-color-success: #16a34a;
+  --el-color-warning: #f59e0b;
+  --el-color-danger: #dc2626;
+  --el-color-error: #dc2626;
+  --el-border-radius-base: 8px;
+  --el-border-radius-small: 6px;
+  --el-border-color: #e6e9ef;
+  --el-border-color-light: #eef1f5;
+  --el-text-color-primary: #0f172a;
+  --el-text-color-regular: #334155;
+  --el-text-color-secondary: #64748b;
+  --el-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  --el-font-size-base: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  font-family: var(--el-font-family);
+  font-size: 14px;
+  color: var(--text-1);
+  background: var(--bg-app);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  color: var(--brand-600);
+}
+
+/* --------------------------------------------------------------------------
+   页面容器
+   -------------------------------------------------------------------------- */
+.page {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 24px 28px 48px;
+}
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+.page-title {
+  display: flex;
+  align-items: center;
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--text-1);
+  margin: 0 0 4px;
+}
+.muted {
+  color: var(--text-3);
+  font-size: 13px;
+}
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+}
+.form-tip {
+  font-size: 12px;
+  color: var(--text-3);
+  margin-top: 4px;
+  line-height: 1.6;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 16px;
+}
+
+/* --------------------------------------------------------------------------
+   Element Plus 细节统一
+   -------------------------------------------------------------------------- */
+.el-card {
+  border-radius: var(--radius);
+  border-color: var(--border-1);
+}
+.el-card__header {
+  padding: 14px 18px;
+  font-weight: 600;
+  color: var(--text-1);
+  border-bottom-color: var(--border-2);
+}
+.el-card__body {
+  padding: 18px;
+}
+.el-button {
+  font-weight: 500;
+}
+.el-table {
+  --el-table-border-color: var(--border-2);
+  --el-table-header-bg-color: #f8fafc;
+  --el-table-header-text-color: var(--text-2);
+  font-size: 13.5px;
+}
+.el-table th.el-table__cell {
+  font-weight: 600;
+}
+.el-tag {
+  border-radius: var(--radius-sm);
+}
+.el-alert {
+  border-radius: var(--radius-sm);
+}
+.el-input__wrapper,
+.el-textarea__inner {
+  border-radius: var(--radius-sm);
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 通用状态色工具类 */
+.is-ok {
+  color: var(--success);
+}
+.is-bad {
+  color: var(--danger);
+}

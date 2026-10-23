@@ -1,0 +1,21 @@
+# 运行时数据目录（文件系统存储，替代数据库），由程序自动创建
+data/
+# 引导配置文件：记录数据目录位置（可用 -config / CI_CONFIG_FILE 改到别处）
+ci-platform.json
+
+# 构建产物目录（build.sh 输出）
+/dist/
+
+# Go 构建产物
+bin/
+*.exe
+
+# 前端依赖
+# 注意：web/dist 需要入库 —— go:embed 在编译期要求该目录存在，
+# 保留前端产物可以让 `go build` 在未执行 npm 构建时也能通过。
+web/node_modules/
+
+# 本地环境与系统文件
+.env
+.DS_Store
+Thumbs.db

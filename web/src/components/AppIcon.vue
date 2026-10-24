@@ -41,6 +41,15 @@ withDefaults(defineProps<{ name: string; size?: number }>(), { size: 18 })
       <path d="M20 11a8 8 0 1 0-2 5.3" />
       <path d="M20 4v7h-7" />
     </template>
+    <!-- 视图/列表类图标（侧边栏 RBAC 导航用） -->
+    <template v-else-if="name === 'list'">
+      <path d="M8 6h13M8 12h13M8 18h13" />
+      <circle cx="4" cy="4" r="0.5" /><circle cx="4" cy="12" r="0.5" /><circle cx="4" cy="20" r="0.5" />
+    </template>
+    <template v-else-if="name === 'grid'">
+      <rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" />
+      <rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" />
+    </template>
   </svg>
 </template>
 

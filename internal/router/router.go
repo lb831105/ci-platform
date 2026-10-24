@@ -12,6 +12,7 @@ import (
 	"ci-platform/internal/config"
 	"ci-platform/internal/handler"
 	"ci-platform/internal/middleware"
+	"ci-platform/internal/model"
 	"ci-platform/internal/pkg"
 	"ci-platform/internal/service"
 )
@@ -27,9 +28,20 @@ type Deps struct {
 	Auth       *handler.AuthHandler
 	System     *handler.SystemHandler
 	Credential *handler.CredentialHandler
+	RBAC       *handler.RbacHandler
+	View       *handler.ViewHandler
+	Notify     *handler.NotifyHandler
+	Profile    *handler.ProfileHandler
 
 	// AuthService 同时供中间件校验会话。为 nil 或未启用时接口不鉴权。
 	AuthService *service.AuthService
+
+	// RBAC 与 PipelineService 供权限中间件做角色/任务级检查。
+	RBACService     *service.RBACService
+	PipelineService *service.PipelineService
+
+	// AuditService 供审计中间件记录变更类操作；为 nil 时不记录。
+	AuditService *service.AuditService
 
 	// WebAssets 是前端静态资源文件系统（内嵌或磁盘均可）。为 nil 时将返回明确的提示页。
 	WebAssets fs.FS
@@ -70,66 +82,127 @@ func New(d Deps) http.Handler {
 	spa := spaHandler(d.WebAssets)
 	apiMiss := apiNotFound()
 
+	// 权限检查：全局权限与任务级权限（任务角色按任务名 Pattern 匹配授权）。
+	perm := func(p string) func(http.Handler) http.Handler {
+		return middleware.RequirePerm(d.RBACService, p)
+	}
+	jobPerm := func(action string) func(http.Handler) http.Handler {
+		return middleware.RequireJobPerm(d.RBACService, d.PipelineService, action)
+	}
+
 	r.Route("/api", func(r chi.Router) {
 		// 公开接口：登录、登录态探测、Webhook（Webhook 用自身密钥鉴权）。
 		r.Get("/auth/status", d.Auth.Status)
-		r.Post("/auth/login", d.Auth.Login)
+		// 登录单独挂审计（在 Auth 之外；用户名从响应体解析，密码等请求体绝不落盘）。
+		if d.AuditService != nil {
+			r.With(middleware.Audit(d.AuditService)).Post("/auth/login", d.Auth.Login)
+		} else {
+			r.Post("/auth/login", d.Auth.Login)
+		}
 		r.Post("/webhook/{pipeline_id}", d.Webhook.Handle)
 
 		// 需要登录的接口。
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.Auth(d.AuthService))
+			// 审计：记录变更类操作（必须在 Auth 之后取当前用户；登录在上方单独挂）。
+			if d.AuditService != nil {
+				r.Use(middleware.Audit(d.AuditService))
+			}
 
 			r.Get("/auth/me", d.Auth.Me)
 			r.Post("/auth/logout", d.Auth.Logout)
 			r.Post("/auth/password", d.Auth.ChangePassword)
 
-			r.Get("/overview", d.Pipeline.Overview)
-			r.Get("/builds", d.Pipeline.AllBuilds)
+			// 个人资料：自助维护联系方式与邮箱验证码（任何已登录用户，无需 Administer）。
+			if d.Profile != nil {
+				r.Get("/profile", d.Profile.Get)
+				r.Put("/profile/contact", d.Profile.UpdateContact)
+				r.Post("/profile/email/verify", d.Profile.RequestEmailVerify)
+				r.Post("/profile/email/confirm", d.Profile.ConfirmEmail)
+			}
+
+			// 平台内用户与角色管理：仅 Administer。
+			r.Route("/security", func(r chi.Router) {
+				r.Use(perm(model.PermOverallAdminister))
+				r.Get("/rbac", d.RBAC.Get)
+				r.Put("/rbac/roles", d.RBAC.PutRoles)
+				r.Put("/rbac/assignments", d.RBAC.PutAssignments)
+				r.Get("/users", d.RBAC.Users)
+				r.Post("/users", d.RBAC.AddUser)
+				r.Post("/users/delete", d.RBAC.DeleteUser)
+				r.Put("/users/password", d.RBAC.ResetUserPassword)
+				r.Put("/users/contact", d.RBAC.SetUserContact)
+			})
+
+			// 视图：给任务归类（列表视图 + 我的视图）。
+			r.Route("/views", func(r chi.Router) {
+				r.With(perm(model.PermViewRead)).Get("/", d.View.List)
+				r.With(perm(model.PermViewRead)).Get("/{name}/jobs", d.View.Jobs)
+				r.With(perm(model.PermViewCreate)).Post("/", d.View.Create)
+				r.With(perm(model.PermViewUpdate)).Put("/{name}", d.View.Update)
+				r.With(perm(model.PermViewDelete)).Delete("/{name}", d.View.Delete)
+			})
+
+			// 总览/全局列表：Overall Read。
+			r.With(perm(model.PermOverallRead)).Get("/overview", d.Pipeline.Overview)
+			r.With(perm(model.PermOverallRead)).Get("/builds", d.Pipeline.AllBuilds)
 
 			r.Route("/system", func(r chi.Router) {
-				r.Get("/info", d.System.Info)
-				r.Get("/load", d.System.Load)
-				r.Get("/log", d.System.Log)
-				r.Delete("/log", d.System.ClearLog)
-				r.Get("/features", d.System.Features)
-				r.Get("/settings", d.System.GetSettings)
-				r.Put("/settings", d.System.UpdateSettings)
-				r.Post("/reload", d.System.ReloadSettings)
-				r.Post("/quiet", d.System.SetQuiet)
-				r.Post("/email/test", d.System.TestEmail)
-				r.Get("/old-data", d.System.OldData)
-				r.Post("/old-data/clean", d.System.CleanOldData)
-				r.Get("/data-home", d.System.GetDataHome)
-				r.Put("/data-home", d.System.UpdateDataHome)
+				r.With(perm(model.PermSystemRead)).Get("/info", d.System.Info)
+				r.With(perm(model.PermSystemRead)).Get("/load", d.System.Load)
+				r.With(perm(model.PermSystemRead)).Get("/log", d.System.Log)
+				r.With(perm(model.PermSystemManage)).Delete("/log", d.System.ClearLog)
+				r.With(perm(model.PermSystemRead)).Get("/features", d.System.Features)
+				r.With(perm(model.PermSystemRead)).Get("/settings", d.System.GetSettings)
+				r.With(perm(model.PermSystemManage)).Put("/settings", d.System.UpdateSettings)
+				r.With(perm(model.PermSystemManage)).Post("/reload", d.System.ReloadSettings)
+				r.With(perm(model.PermSystemManage)).Post("/quiet", d.System.SetQuiet)
+				r.With(perm(model.PermSystemManage)).Post("/email/test", d.System.TestEmail)
+				r.With(perm(model.PermSystemManage)).Post("/webhook/test", d.System.TestWebhookNotify)
+				r.With(perm(model.PermSystemRead)).Get("/audit", d.System.Audit)
+				// 通知投递记录：按任务/收件人/状态过滤，排查「谁漏收了告警」。
+				if d.Notify != nil {
+					r.With(perm(model.PermSystemRead)).Get("/notify", d.Notify.History)
+				}
+				r.With(perm(model.PermSystemRead)).Get("/old-data", d.System.OldData)
+				r.With(perm(model.PermSystemManage)).Post("/old-data/clean", d.System.CleanOldData)
+				r.With(perm(model.PermSystemRead)).Get("/data-home", d.System.GetDataHome)
+				r.With(perm(model.PermSystemManage)).Put("/data-home", d.System.UpdateDataHome)
 			})
 
 			r.Route("/credentials", func(r chi.Router) {
-				r.Get("/", d.Credential.List)
-				r.Post("/", d.Credential.Create)
-				r.Get("/{cid}", d.Credential.Get)
-				r.Put("/{cid}", d.Credential.Update)
-				r.Delete("/{cid}", d.Credential.Delete)
+				r.With(perm(model.PermCredentialView)).Get("/", d.Credential.List)
+				r.With(perm(model.PermCredentialCreate)).Post("/", d.Credential.Create)
+				r.With(perm(model.PermCredentialView)).Get("/{cid}", d.Credential.Get)
+				r.With(perm(model.PermCredentialUpdate)).Put("/{cid}", d.Credential.Update)
+				r.With(perm(model.PermCredentialDelete)).Delete("/{cid}", d.Credential.Delete)
 			})
 
+			// 通知选人：需要任务配置权限（邮箱属于个人信息）。
+			r.With(perm(model.PermJobConfigure)).Get("/notify/contacts", d.Notify.Contacts)
+
 			r.Route("/pipelines", func(r chi.Router) {
-				r.Get("/", d.Pipeline.List)
-				r.Post("/", d.Pipeline.Create)
+				r.With(perm(model.PermOverallRead)).Get("/", d.Pipeline.List)
+				r.With(perm(model.PermJobCreate)).Post("/", d.Pipeline.Create)
 
 				r.Route("/{pid}", func(r chi.Router) {
-					r.Get("/", d.Pipeline.Get)
-					r.Put("/", d.Pipeline.Update)
-					r.Delete("/", d.Pipeline.Delete)
-					r.Post("/build", d.Pipeline.TriggerBuild)
-					r.Post("/rename", d.Pipeline.Rename)
+					r.With(jobPerm(model.PermJobRead)).Get("/", d.Pipeline.Get)
+					r.With(jobPerm(model.PermJobConfigure)).Put("/", d.Pipeline.Update)
+					r.With(jobPerm(model.PermJobDelete)).Delete("/", d.Pipeline.Delete)
+					r.With(jobPerm(model.PermJobBuild)).Post("/build", d.Pipeline.TriggerBuild)
+					r.With(jobPerm(model.PermJobBuild)).Post("/builds/{bid}/cancel", d.Build.Cancel)
+					r.With(jobPerm(model.PermJobConfigure)).Post("/rename", d.Pipeline.Rename)
+					r.With(jobPerm(model.PermJobConfigure)).Post("/notify/test", d.Notify.TestNotify)
 
-					r.Get("/builds", d.Build.List)
-					r.Get("/builds/{bid}", d.Build.Get)
-					r.Get("/builds/{bid}/log", d.Build.Log)
-					r.Get("/builds/{bid}/artifacts", d.Build.Artifacts)
-					r.Get("/builds/{bid}/artifacts/download", d.Build.DownloadArtifact)
-					r.Get("/builds/{bid}/artifacts.zip", d.Build.DownloadArtifactsZip)
-					r.Post("/builds/{bid}/republish", d.Build.Republish)
+					r.With(jobPerm(model.PermJobRead)).Get("/builds", d.Build.List)
+					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}", d.Build.Get)
+					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}/log", d.Build.Log)
+					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}/artifacts", d.Build.Artifacts)
+					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}/artifacts/download", d.Build.DownloadArtifact)
+					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}/artifacts.zip", d.Build.DownloadArtifactsZip)
+					r.With(jobPerm(model.PermJobReplay)).Post("/builds/{bid}/republish", d.Build.Republish)
+					// 删除构建（含 data/jobs/{pid}/builds/{bid} 目录）。
+					r.With(jobPerm(model.PermJobDelete)).Delete("/builds/{bid}", d.Build.Delete)
 				})
 			})
 		})
@@ -139,8 +212,9 @@ func New(d Deps) http.Handler {
 		r.NotFound(apiMiss)
 	})
 
-	// 实时日志流（WebSocket 通过 token 查询参数鉴权）。
+	// 实时日志流（WebSocket 通过 token 查询参数鉴权 + 任务读权限）。
 	r.With(middleware.Auth(d.AuthService)).
+		With(middleware.RequireJobPerm(d.RBACService, d.PipelineService, model.PermJobRead)).
 		Get("/ws/pipelines/{pid}/builds/{bid}/logs", d.WebSocket.ServeLog)
 
 	// 前端资源：真实文件直出，未命中回退 index.html（支持 history 模式深链）。

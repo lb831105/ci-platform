@@ -1,8 +1,8 @@
 // 与 Go internal/model/build.go 的 json tag 严格对齐。
 
-export type BuildStatus = 'pending' | 'running' | 'success' | 'failed'
+export type BuildStatus = 'pending' | 'running' | 'success' | 'failed' | 'aborted'
 
-export type TriggerType = 'manual' | 'webhook'
+export type TriggerType = 'manual' | 'webhook' | 'timer'
 
 export interface Build {
   id: string
@@ -34,5 +34,5 @@ export interface ArtifactManifest {
 
 // 终态判断，供日志页决定是否建立 WebSocket。
 export function isFinished(status: BuildStatus): boolean {
-  return status === 'success' || status === 'failed'
+  return status === 'success' || status === 'failed' || status === 'aborted'
 }

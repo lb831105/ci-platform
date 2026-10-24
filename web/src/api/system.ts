@@ -1,10 +1,13 @@
 import { http } from './request'
 import type {
+  AuditEntry,
   Credential,
   CredentialPayload,
   DataHomeInfo,
   Feature,
   LoadStats,
+  NotifyHistoryQuery,
+  NotifyRecord,
   OldDataReport,
   Settings,
   SystemInfo,
@@ -51,6 +54,16 @@ export const systemApi = {
     return http.post<null>('/system/email/test', { to })
   },
 
+  // 发送 Webhook 测试通知（钉钉/企微/Slack）。
+  testWebhookNotify(): Promise<null> {
+    return http.post<null>('/system/webhook/test')
+  },
+
+  // 操作审计日志（最近 limit 条，时间倒序）。
+  audit(limit = 300): Promise<AuditEntry[]> {
+    return http.get<AuditEntry[]>(`/system/audit?limit=${limit}`)
+  },
+
   oldData(): Promise<OldDataReport> {
     return http.get<OldDataReport>('/system/old-data')
   },
@@ -65,6 +78,17 @@ export const systemApi = {
 
   cleanOldData(): Promise<OldDataReport> {
     return http.post<OldDataReport>('/system/old-data/clean')
+  },
+
+  // 通知投递记录：按任务/收件人/状态过滤，用于排查「谁漏收了告警」。
+  notifyHistory(query: NotifyHistoryQuery = {}): Promise<NotifyRecord[]> {
+    const params = new URLSearchParams()
+    if (query.limit) params.set('limit', String(query.limit))
+    if (query.pipeline) params.set('pipeline', query.pipeline)
+    if (query.recipient) params.set('recipient', query.recipient)
+    if (query.status) params.set('status', query.status)
+    const qs = params.toString()
+    return http.get<NotifyRecord[]>(`/system/notify${qs ? '?' + qs : ''}`)
   },
 }
 

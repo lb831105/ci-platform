@@ -55,7 +55,8 @@ func (c *ArtifactCollector) Collect(
 		return nil, fmt.Errorf("artifact: no files matched %v under the workspace", patterns)
 	}
 	if limits.MaxFiles > 0 && len(files) > limits.MaxFiles {
-		return nil, fmt.Errorf("artifact: matched %d files, exceeding the limit of %d", len(files), limits.MaxFiles)
+		return nil, fmt.Errorf("artifact: matched %d files, exceeding artifact_max_files (%d); "+
+			"raise it in 系统配置 → 全局构建丢弃器, or narrow the archive patterns", len(files), limits.MaxFiles)
 	}
 
 	dest := filepath.Join(buildDir, model.ArtifactDirName)
@@ -103,7 +104,8 @@ func (c *ArtifactCollector) Collect(
 		}
 		if limits.MaxTotalBytes > 0 && total+info.Size() > limits.MaxTotalBytes {
 			_ = os.RemoveAll(dest)
-			return nil, fmt.Errorf("artifact: total size exceeds the limit of %s", artifactBytes(limits.MaxTotalBytes))
+			return nil, fmt.Errorf("artifact: total size of matched files exceeds artifact_max_total_mb (%s); "+
+				"raise it in 系统配置 → 全局构建丢弃器, or narrow the archive patterns", artifactBytes(limits.MaxTotalBytes))
 		}
 
 		if err = pkg.EnsureDir(filepath.Dir(target)); err != nil {

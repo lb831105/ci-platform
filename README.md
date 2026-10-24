@@ -196,7 +196,7 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | DELETE | `/api/pipelines/{pid}` | 删除任务（递归删目录） |
 | POST | `/api/pipelines/{pid}/build` | 手动触发 |
 | POST | `/api/pipelines/{pid}/rename` | 重命名任务（受工程命名限制约束） |
-| POST | `/api/webhook/{pipeline_id}` | Webhook 触发（Header `X-Webhook-Secret`） |
+| POST | `/api/webhook/{pipeline_id}` | Webhook 触发（密钥兼容 `X-Webhook-Secret` / GitLab `X-Gitlab-Token` / GitHub `X-Hub-Signature-256`，任一匹配即通过） |
 | GET | `/api/pipelines/{pid}/builds` | 构建历史（遍历目录，编号倒序） |
 | GET | `/api/pipelines/{pid}/builds/{bid}` | 构建详情 |
 | GET | `/api/pipelines/{pid}/builds/{bid}/log` | 拉取日志全文 |
@@ -204,22 +204,52 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | GET | `/api/pipelines/{pid}/builds/{bid}/artifacts/download?file=...` | 下载单个产物（二进制） |
 | GET | `/api/pipelines/{pid}/builds/{bid}/artifacts.zip` | 下载全部产物 ZIP |
 | POST | `/api/pipelines/{pid}/builds/{bid}/republish` | 把该次构建的产物直接重新发布到 SSH（不重新编译） |
+| POST | `/api/pipelines/{pid}/builds/{bid}/cancel` | 取消运行中/等待中的构建（状态落 `aborted`） |
+| DELETE | `/api/pipelines/{pid}/builds/{bid}` | 删除单次构建（连 `builds/{bid}` 目录：日志 + 产物，权限 `job.delete`） |
+
+**任务配置扩展**：新建任务支持 **Copy from**（从现有任务复制全部配置，对齐 Jenkins New Item）；
+`cron_spec` 字段支持 5 字段 cron 定时构建（含 `H` 散列均衡），触发记录显示「定时触发」。
 | WS | `/ws/pipelines/{pid}/builds/{bid}/logs` | 实时日志流 |
-| GET/PUT | `/api/system/settings` | 系统配置读取 / 更新 |
+| GET/PUT | `/api/system/settings` | 系统配置读取 / 更新（含 `log_max_mb` 日志上限、保留策略定期扫描） |
+| POST | `/api/system/email/test` | 发送测试邮件（管理员） |
+| POST | `/api/system/webhook/test` | 发送 Webhook 测试通知（钉钉/企微/Slack，管理员） |
+| GET | `/api/notify/contacts` | 平台用户联系方式（任务通知选人用，需任务配置权限） |
+| POST | `/api/pipelines/{pid}/notify/test` | 向该任务配置的人员/群发送测试通知 |
+| PUT | `/api/security/users/contact` | 设置用户通知联系方式（邮箱/企微 ID/手机号，管理员） |
+| GET | `/api/system/audit?limit=300` | 操作审计日志（最近 N 条，时间倒序，管理员） |
+| GET | `/api/system/notify?limit=&pipeline=&recipient=&status=` | 通知投递记录（按收件人粒度，排查漏收） |
+| GET/PUT | `/api/profile` `/api/profile/contact` | 个人资料：查看 / 自助维护联系方式（任何登录用户） |
+| POST | `/api/profile/email/verify` `/api/profile/email/confirm` | 发送邮箱验证码 / 提交验证码确认 |
+| GET | `/api/security/users` | 用户管理页数据：内置管理员 + 平台用户 + 联系方式 + 角色摘要 |
+| POST | `/api/security/users` | 创建平台内用户（bcrypt，管理员） |
+| POST | `/api/security/users/delete` | 删除用户及授权（管理员） |
+| PUT | `/api/security/users/password` | 管理员重置用户密码（撤销会话） |
 | POST | `/api/system/reload` | 从磁盘重新读取设置 |
 | POST | `/api/system/quiet` | 静默模式（准备关机） |
 | GET | `/api/system/info` `/load` `/log` `/features` | 系统信息 / 负载 / 日志 / 内置组件 |
 | GET/POST | `/api/system/old-data` `/old-data/clean` | 扫描 / 清理旧数据 |
 | GET/PUT | `/api/system/data-home` | 读取 / 修改数据目录（写入引导配置，重启生效；可迁移现有数据） |
 | GET/POST/PUT/DELETE | `/api/credentials` | 凭据管理（密钥不回传） |
+| GET | `/api/security/rbac` | 角色与授权数据（Manage and Assign Roles，仅 Administer） |
+| PUT | `/api/security/rbac/roles` | 替换全部角色（全局/任务角色 + 权限矩阵） |
+| PUT | `/api/security/rbac/assignments` | 替换全部授权（用户/组 → 角色） |
+| POST | `/api/security/users` | 创建平台内用户（bcrypt 落盘） |
+| POST | `/api/security/users/delete` | 删除用户（同时清理授权与会话） |
+| PUT | `/api/security/users/password` | 管理员重置用户密码 |
 
 ```bash
 # 手动触发
 curl -X POST http://127.0.0.1:8080/api/pipelines/1703123456/build
 
 # Webhook 触发
-curl -X POST http://127.0.0.1:8080/api/webhook/1703123456 \
+
+# 方式一：平台自定义 header（curl / CI 脚本）
+curl -X POST http://[IP]:8080/api/webhook/1703123456 \
      -H "X-Webhook-Secret: abc123"
+
+# 方式二：GitLab Webhook（项目 Settings → Webhooks，Secret token 填 abc123，
+# GitLab 会以 X-Gitlab-Token 头发送；内网 HTTP 地址请关闭「SSL verification」）
+curl -X POST http://[IP]:8080/api/webhook/1703123456
 ```
 
 ---
@@ -390,12 +420,15 @@ ci-platform/
 
 | 分类 | 页面 | 能力 |
 |---|---|---|
-| 系统配置 | 系统配置 | 主目录、系统消息、Jenkins Location、默认分支、工程命名限制、静默期/SCM 重试/Shell/超时、Global Build Discarders、全局环境变量、Maven 项目配置、Git plugin、SSH 服务器（Publish Over SSH）、邮件通知、准备关机、读取设置 |
+| 系统配置 | 系统配置 | 主目录、系统消息、Jenkins Location、默认分支、工程命名限制、静默期/SCM 重试/Shell/超时、Global Build Discarders（含日志上限）、全局环境变量、Maven 项目配置、Git plugin、SSH 服务器（Publish Over SSH）、邮件通知、Webhook 通知（钉钉/企微/Slack）、准备关机、读取设置 |
 | 系统配置 | 全局工具配置 | 按 JDK / Git / Gradle / Ant / Maven / NodeJS 分类维护安装项（工具主目录），以及 Maven settings.xml 提供者 |
 | 系统配置 | 插件管理 | 内置能力清单（只读，单二进制交付无插件生态） |
 | 系统配置 | 节点和云管理 | 执行器数量、构建队列、工作区 |
 | 安全 | 全局安全配置 | 登录开关、管理员账号、修改密码 |
 | 安全 | 凭据管理 | 用户名密码 / 密钥文本 / SSH 私钥的增删改查（密钥不回传） |
+| 安全 | Manage and Assign Roles | 全局角色 + 任务角色（Pattern 匹配任务名、Template 模板继承）与用户/组授权；**权限真实生效**：未授权用户访问 API 返回 `code=40300`，前端隐藏对应入口 |
+| 安全 | Manage Roles / Assign Roles | 角色数据存 `data/rbac.json`（用户密码 bcrypt）；内置主体 `anonymous` / `authenticated`；代理/SCM/Metrics 列展示为禁用（平台不支持） |
+| 视图 | 新建视图 / 编辑视图 | 列表视图（显式任务 + 任务名正则）与我的视图（自动显示当前用户有权限访问的任务）；数据存 `data/views.json`；展示列与 Widgets（过滤构建队列/执行器）可配置 |
 | 状态信息 | 系统信息 / 系统日志 / 负载统计 / 关于 | 运行时信息、内存环形日志、队列与磁盘占用、版本 |
 | 问题排查 | 管理旧数据 | 扫描并清理无主工作区与孤儿任务目录（仍存在任务的工作区保留） |
 | 工具和动作 | 读取设置 / 准备关机 / REST API | 重载 settings.json、进入静默模式、接口说明 |
@@ -406,13 +439,33 @@ ci-platform/
 - 认证默认单管理员账号；密码以 bcrypt hash 落盘，修改会同步落盘，重启后仍生效；新密码至少 8 个字符。
 - 系统配置中的「单次产物大小上限（MB）」「单次产物文件数上限」会在归档时强制执行，防止异常产物写满磁盘。
 - 「准备关机（静默模式）」只拒绝**新的**构建入队，不影响正在运行的构建。
-- 以下配置会**直接作用于构建**：静默期（开始前等待）、SCM 重试次数、Shell、Global Time Out、构建保留策略、全局环境变量（含 Maven / Git 相关变量）、邮件通知。
+- 以下配置会**直接作用于构建**：静默期（开始前等待）、SCM 重试次数、Shell、Global Time Out、构建保留策略、全局环境变量（含 Maven / Git 相关变量）、邮件通知、Webhook 通知（钉钉/企微/Slack）。
+- **构建历史可删除**：任务页构建历史、构建日志页、全局构建历史都支持删除单次构建，
+  会连同 `data/jobs/{pid}/builds/{bid}` 目录（日志 + 已归档产物）一起删除，需二次确认；
+  运行中/排队中的构建需先停止。删除最新构建后编号不会回退（`next_build` 记录）。
+- **用户邮箱必填**：创建用户 / 改联系方式 / 个人资料都要求填写有效邮箱——构建通知按人员发邮件，
+  没有邮箱等于收不到告警。历史遗留的空邮箱会在启动日志告警、用户管理页列出，并在构建日志中以
+  `[notify] ... 警告：人员 X 未配置邮箱` 提示。
+- **通知按项目挂人/挂群**：在任务的「构建后操作 → 构建通知」里选择平台用户（自动解析其邮箱/企微 ID/手机号）、
+  填外部邮箱、添加钉钉/企微/Slack 群机器人，并勾选通知事件（失败 / 成功 / **修复**（上次失败→本次成功）/ 取消）。
+  任务未配置时沿用「系统配置」的全局默认；勾选「同时发送全局默认」可叠加。用户联系方式在
+  「系统管理 → 用户管理」维护（用户也可在「个人资料」页自助维护并验证邮箱）。发送结果会写入构建日志（`[notify] ...`）。
+- **值班轮值（on-call）**：任务里配置轮值人员与周期，失败时自动 @ 当周值班人；轮值由日期推算，重启不影响。
+- **升级策略（escalation）**：连续失败达到阈值（默认 3 次）追加通知上级/更大群；升级优先于抑制窗口。
+- **失败抑制与聚合**：设置抑制窗口（分钟，默认关闭）后，同一任务的重复失败只发首条，后续合并为
+  「已连续失败 N 次」，避免刷屏；被合并的记录仍可在「通知记录」里查到。
+- **按分支/环境路由**：按分支 glob（`main` / `feature/*` / `release/**`）叠加人员、群，或勾选「提交者」
+  只通知本次 git 提交作者（分支与提交人从实际签出的工作区读取）。
+- **通知记录（谁漏收了告警）**：每次发送按收件人/群落盘到 `data/notify.log`，在「系统管理 → 通知记录」
+  可按任务、收件人、状态（已送达/失败/已合并）查询，失败记录带错误原因。
+- **消息模板**：任务级自定义文案，占位符 `{{job}} {{build}} {{event}} {{branch}} {{commit}} {{streak}}
+  {{oncall}} {{url}}` 等；邮件与群消息共用模板，@ 提醒始终追加在末尾。
 
 ---
 
 ## 十二、明确的非目标
 
-不实现：权限体系、多节点 agent、DAG 并行、定时触发、插件系统。构建执行使用**服务器本地串行步骤**，发布固定走 **SSH/SFTP**。
+不实现：多节点 agent、DAG 并行、定时触发、插件系统。权限体系已实现（对齐 Jenkins Role Strategy 的精简版，见「系统管理 → Manage and Assign Roles」）；构建执行使用**服务器本地串行步骤**，发布固定走 **SSH/SFTP**。
 
 详细设计（架构分层、时序、日志背压、内嵌方案权衡等）见 [DESIGN.md](./DESIGN.md)。
 

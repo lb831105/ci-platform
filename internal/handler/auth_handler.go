@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"ci-platform/internal/model"
 	"ci-platform/internal/pkg"
 	"ci-platform/internal/service"
 )
@@ -13,7 +14,13 @@ import (
 type AuthHandler struct {
 	auth         *service.AuthService
 	settings     *service.SettingsService
+	rbac         *service.RBACService
 	loginLimiter *pkg.RateLimiter
+}
+
+// SetRBAC 注入 RBAC 服务（供 /auth/me 返回用户有效权限，前端据此隐藏入口）。
+func (h *AuthHandler) SetRBAC(rbac *service.RBACService) {
+	h.rbac = rbac
 }
 
 // NewAuthHandler 构造认证接口处理器。settings 用于持久化密码修改。
@@ -40,9 +47,18 @@ type loginResponse struct {
 
 // statusResponse 描述认证开关与当前请求的登录态，供前端路由守卫初始化。
 type statusResponse struct {
-	Enabled       bool   `json:"enabled"`
-	Authenticated bool   `json:"authenticated"`
-	Username      string `json:"username"`
+	Enabled       bool     `json:"enabled"`
+	Authenticated bool     `json:"authenticated"`
+	Username      string   `json:"username"`
+	Permissions   []string `json:"permissions,omitempty"` // 有效权限（前端隐藏入口用）
+}
+
+// permissionsOf 返回用户的有效权限；rbac 未注入时返回 nil（不隐藏任何入口）。
+func (h *AuthHandler) permissionsOf(username string) []string {
+	if h.rbac == nil {
+		return nil
+	}
+	return h.rbac.EffectivePermissions(username)
 }
 
 // Login POST /api/auth/login
@@ -73,7 +89,12 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 // Me GET /api/auth/me
 func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 	username, _ := h.auth.Verify(pkg.BearerToken(r))
-	pkg.OK(w, statusResponse{Enabled: h.auth.Enabled(), Authenticated: true, Username: username})
+	pkg.OK(w, statusResponse{
+		Enabled:       h.auth.Enabled(),
+		Authenticated: true,
+		Username:      username,
+		Permissions:   h.permissionsOf(username),
+	})
 }
 
 // Status GET /api/auth/status
@@ -82,11 +103,21 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 // 认证关闭时直接返回 authenticated=true，避免无谓的登录流程。
 func (h *AuthHandler) Status(w http.ResponseWriter, r *http.Request) {
 	if !h.auth.Enabled() {
-		pkg.OK(w, statusResponse{Enabled: false, Authenticated: true, Username: "anonymous"})
+		pkg.OK(w, statusResponse{
+			Enabled:       false,
+			Authenticated: true,
+			Username:      "anonymous",
+			Permissions:   h.permissionsOf(""),
+		})
 		return
 	}
 	username, ok := h.auth.Verify(pkg.BearerToken(r))
-	pkg.OK(w, statusResponse{Enabled: true, Authenticated: ok, Username: username})
+	perms := h.permissionsOf(username)
+	if !ok {
+		// 未登录：返回匿名主体被授予的权限（通常为空）。
+		perms = h.permissionsOf(model.SubjectAnonymous)
+	}
+	pkg.OK(w, statusResponse{Enabled: true, Authenticated: ok, Username: username, Permissions: perms})
 }
 
 // changePasswordRequest 是修改密码请求体。

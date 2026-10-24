@@ -3,13 +3,26 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import ArtifactConfig from '@/components/ArtifactConfig.vue'
+import NotifyConfig from '@/components/NotifyConfig.vue'
 import StepEditor from '@/components/StepEditor.vue'
 import SshPublishConfig from '@/components/SshPublishConfig.vue'
 import { describeError } from '@/api/request'
+import { pipelineApi } from '@/api/pipeline'
 import { credentialApi } from '@/api/system'
 import { usePipeline } from '@/composables/usePipeline'
 import { useSettingsStore } from '@/stores/settingsStore'
-import { emptyPipeline, emptySshPublish, type Pipeline, type PipelinePayload } from '@/types/pipeline'
+import {
+  emptyPipeline,
+  emptyEscalation,
+  emptyOnCall,
+  emptyRoute,
+  emptySshPublish,
+  noNotifyEvents,
+  type NotifyContact,
+  type NotifyTarget,
+  type Pipeline,
+  type PipelinePayload,
+} from '@/types/pipeline'
 import type { Credential } from '@/types/system'
 import { applyJobTypePreset, findJobType } from '@/types/jobType'
 import { validatePipeline } from '@/utils/validate'
@@ -26,6 +39,39 @@ const saving = ref(false)
 const form = ref<PipelinePayload>(emptyPipeline())
 const credentials = ref<Credential[]>([])
 
+// 通知：人员联系方式（选人用）与测试发送状态。
+const notifyContacts = ref<NotifyContact[]>([])
+const testingNotify = ref(false)
+
+async function loadNotifyContacts(): Promise<void> {
+  try {
+    notifyContacts.value = await pipelineApi.notifyContacts()
+  } catch {
+    // 无权限（如仅有任务角色）时保持空列表，仍可手动输入用户名。
+    notifyContacts.value = []
+  }
+}
+
+async function onTestNotify(): Promise<void> {
+  if (!props.pipelineId) {
+    ElMessage.warning('请先保存任务，再发送测试通知')
+    return
+  }
+  testingNotify.value = true
+  try {
+    const res = await pipelineApi.testNotify(props.pipelineId)
+    if (res.errors?.length) {
+      ElMessage.warning(`测试通知部分失败：${res.errors.join('；')}`)
+    } else {
+      ElMessage.success(res.summary || '测试通知已发送')
+    }
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    testingNotify.value = false
+  }
+}
+
 const credDialog = ref(false)
 const credSaving = ref(false)
 const credForm = reactive({ name: '', username: '', password: '' })
@@ -34,6 +80,12 @@ const jobTypeTitle = computed(() => findJobType(jobTypeId())?.title ?? '')
 
 function jobTypeId(): string {
   const value = route.query.type
+  return typeof value === 'string' ? value : ''
+}
+
+// 任务模板：copy 模式下从源任务复制配置（New Item 的 Copy from）。
+function copySourceId(): string {
+  const value = route.query.copy
   return typeof value === 'string' ? value : ''
 }
 
@@ -79,12 +131,45 @@ function toPayload(pipeline: Pipeline): PipelinePayload {
     webhook_secret: pipeline.webhook_secret,
     build_retention_max_per_job: pipeline.build_retention_max_per_job ?? 0,
     build_retention_max_age_days: pipeline.build_retention_max_age_days ?? 0,
+    cron_spec: pipeline.cron_spec ?? '',
     delete_workspace_before_build: pipeline.delete_workspace_before_build ?? false,
     executor: pipeline.executor ?? 'local',
     artifacts: {
       enabled: pipeline.artifacts?.enabled ?? false,
       files: [...(pipeline.artifacts?.files ?? [])],
     },
+    // 通知：任务级配置（人员/群/事件）；null 表示沿用全局默认。
+    notify: pipeline.notify
+      ? {
+          enabled: pipeline.notify.enabled,
+          use_global: pipeline.notify.use_global,
+          people: [...(pipeline.notify.people ?? [])],
+          emails: [...(pipeline.notify.emails ?? [])],
+          // 目标事件用 noNotifyEvents() 兜底：后端「全 false」= 继承任务事件，
+          // 若用 emptyNotifyEvents()（failure=true）兜底，打开再保存会把「继承」
+          // 静默改成「只发失败+修复」，属于回写破坏配置。
+          targets: mapNotifyTargets(pipeline.notify.targets),
+          events: { ...noNotifyEvents(), ...(pipeline.notify.events ?? {}) },
+          // 运维增强：默认值兜底，确保「打开再保存」不会丢字段。
+          on_call: { ...emptyOnCall(), ...(pipeline.notify.on_call ?? {}) },
+          escalation: {
+            ...emptyEscalation(),
+            ...(pipeline.notify.escalation ?? {}),
+            people: [...(pipeline.notify.escalation?.people ?? [])],
+            emails: [...(pipeline.notify.escalation?.emails ?? [])],
+            targets: mapNotifyTargets(pipeline.notify.escalation?.targets),
+          },
+          routes: (pipeline.notify.routes ?? []).map((r) => ({
+            ...emptyRoute(),
+            ...r,
+            people: [...(r.people ?? [])],
+            emails: [...(r.emails ?? [])],
+            targets: mapNotifyTargets(r.targets),
+          })),
+          suppress_window_min: pipeline.notify.suppress_window_min ?? 0,
+          template: pipeline.notify.template ?? '',
+        }
+      : null,
     // 敏感字段不回显：密码置空，服务端会沿用旧值。
     ssh_publish: pipeline.ssh_publish
       ? {
@@ -99,8 +184,30 @@ function toPayload(pipeline: Pipeline): PipelinePayload {
 
 onMounted(async () => {
   // 强制刷新：确保刚在「系统配置」中新增的 SSH 服务器/工具主目录能立即生效。
-  await Promise.all([settingsStore.fetch(true), loadCredentials()])
+  await Promise.all([settingsStore.fetch(true), loadCredentials(), loadNotifyContacts()])
   if (!props.pipelineId) {
+    // 模板模式：从源任务复制配置；拉取失败（404/无权限）回退到类型预设。
+    const sourceId = copySourceId()
+    if (sourceId) {
+      const source = await fetchOne(sourceId)
+      if (source !== null) {
+        form.value = toPayload(source)
+        form.value.name = ''
+        const nameFromQuery = route.query.name
+        if (typeof nameFromQuery === 'string' && nameFromQuery.trim()) {
+          form.value.name = nameFromQuery.trim()
+        }
+        // 群机器人 URL 在接口返回时已脱敏为 ***；新建任务没有旧配置可回填，
+        // 直接保存会把 *** 当成真实地址导致通知永久失效，故清空并要求重填。
+        const stripped = stripMaskedNotifyURLs(form.value.notify)
+        if (stripped > 0) {
+          ElMessage.warning(`已复制配置，但有 ${stripped} 个群机器人的 URL 含密钥无法复制，请重新填写`)
+        }
+        scm.value = form.value.git_url ? 'git' : 'none'
+        return
+      }
+      ElMessage.error('模板任务不存在或无权访问，已回退到空白配置')
+    }
     const preset = applyJobTypePreset(jobTypeId())
     if (!preset.git_branch || preset.git_branch === 'main') {
       preset.git_branch = settingsStore.defaultBranch
@@ -120,6 +227,39 @@ onMounted(async () => {
     scm.value = form.value.git_url ? 'git' : 'none'
   }
 })
+
+// mapNotifyTargets 统一映射群目标：events 用「全 false」兜底（= 继承任务事件），
+// 不能用 emptyNotifyEvents()，否则「打开再保存」会把继承改成只发失败+修复。
+function mapNotifyTargets(targets: NotifyTarget[] | undefined): NotifyTarget[] {
+  return (targets ?? []).map((t) => ({
+    channel: t.channel,
+    url: t.url,
+    events: { ...noNotifyEvents(), ...(t.events ?? {}) },
+  }))
+}
+
+// stripMaskedNotifyURLs 清空含 *** 的群机器人 URL（复制任务时无旧值可回填），
+// 升级群与分支路由的群同样会脱敏，必须一并处理；返回被清空的数量。
+function stripMaskedNotifyURLs(notify: PipelinePayload['notify']): number {
+  if (!notify) {
+    return 0
+  }
+  let count = 0
+  const strip = (targets: NotifyTarget[] | undefined): void => {
+    for (const target of targets ?? []) {
+      if (target.url.includes('***')) {
+        target.url = ''
+        count++
+      }
+    }
+  }
+  strip(notify.targets)
+  strip(notify.escalation?.targets)
+  for (const route of notify.routes ?? []) {
+    strip(route.targets)
+  }
+  return count
+}
 
 async function loadCredentials(): Promise<void> {
   try {
@@ -398,17 +538,36 @@ function copyWebhook(): void {
               <el-input :model-value="webhookUrl" readonly class="mono" />
               <el-button @click="copyWebhook">复制</el-button>
             </div>
-            <div class="form-tip">通过该地址触发构建，请求头 <span class="mono">X-Webhook-Secret</span> 用于校验。</div>
+            <div class="form-tip">通过该地址触发构建。密钥校验兼容三种来源（任一匹配即通过）：请求头 <span class="mono">X-Webhook-Secret</span>（curl / CI 脚本）、<span class="mono">X-Gitlab-Token</span>（GitLab Webhook）、<span class="mono">X-Hub-Signature-256</span>（GitHub Webhook HMAC）。</div>
           </el-form-item>
           <el-form-item label="Webhook 密钥">
             <el-input v-model="form.webhook_secret" placeholder="留空表示该 Webhook 不校验密钥（不建议）" style="max-width: 480px" />
+          </el-form-item>
+          <el-form-item label="GitLab / GitHub">
+            <div class="form-tip">
+              GitLab：项目 Settings → Webhooks 中填入上方 URL，Secret token 与「Webhook 密钥」一致（以
+              <span class="mono">X-Gitlab-Token</span> 头发送），Push / Tag 事件即可触发构建；内网 HTTP 地址请关闭「SSL verification」。
+            </div>
+          </el-form-item>
+          <el-form-item label="定时构建">
+            <el-input
+              v-model="form.cron_spec"
+              class="mono"
+              placeholder="留空表示不启用，如 H/30 * * * * 或 0 2 * * *（每天凌晨 2 点）"
+              style="max-width: 480px"
+            />
+            <div class="form-tip">
+              5 字段 cron 规格（分 时 日 月 周），对齐 Jenkins Build periodically。
+              支持 <span class="mono">H</span> 散列均衡（如 <span class="mono">H/15 * * * *</span> 每小时 4 次，
+              按任务名散列偏移，避免集中触发）；修改后保存即生效，触发记录在构建历史中显示为「定时触发」。
+            </div>
           </el-form-item>
           <el-form-item label="其他触发器">
             <el-alert
               type="info"
               :closable="false"
               show-icon
-              title="定时构建、SCM 轮询、GitLab / GitHub / Generic Webhook Trigger 在基础版中暂不支持。"
+              title="SCM 轮询在当前版本中暂不支持，可用定时构建替代。"
             />
           </el-form-item>
         </el-form>
@@ -468,12 +627,11 @@ function copyWebhook(): void {
         <ArtifactConfig v-if="form.artifacts" v-model="form.artifacts" />
         <SshPublishConfig v-if="form.ssh_publish" v-model="form.ssh_publish" />
         <el-alert v-else type="info" :closable="false" show-icon title="当前任务未配置 SSH 发布" />
-        <el-alert
-          style="margin-top: 12px"
-          type="info"
-          :closable="false"
-          show-icon
-          title="构建扫描暂不支持；邮件通知由「系统管理 → 系统配置」统一处理。"
+        <NotifyConfig
+          v-model="form.notify"
+          :contacts="notifyContacts"
+          :testing="testingNotify"
+          @test="onTestNotify"
         />
       </section>
 

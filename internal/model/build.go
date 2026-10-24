@@ -19,14 +19,18 @@ const (
 	BuildRunning BuildStatus = "running"
 	BuildSuccess BuildStatus = "success"
 	BuildFailed  BuildStatus = "failed"
+	// BuildAborted 手动取消（对齐 Jenkins 的 aborted）：构建被用户主动停止，
+	// 与失败区分开，便于区分“代码问题”与“人为干预”。
+	BuildAborted BuildStatus = "aborted"
 )
 
-// TriggerType 触发方式枚举，仅支持手动与 Webhook 两种。
+// TriggerType 触发方式枚举：手动、Webhook 与定时（cron）。
 type TriggerType string
 
 const (
 	TriggerManual  TriggerType = "manual"
 	TriggerWebhook TriggerType = "webhook"
+	TriggerTimer   TriggerType = "timer"
 )
 
 // ArtifactFile 描述一个已归档的构建产物。
@@ -54,6 +58,13 @@ type Build struct {
 	StartedAt   *time.Time  `json:"started_at"`
 	FinishedAt  *time.Time  `json:"finished_at"`
 	ExitCode    int         `json:"exit_code"`
+
+	// SCM 现场信息：从实际签出的工作区读取，供「按分支路由」与「通知提交者」使用。
+	// 非 Git 任务为空。
+	Branch       string `json:"branch,omitempty"`
+	Commit       string `json:"commit,omitempty"`        // 短 SHA
+	CommitAuthor string `json:"commit_author,omitempty"` // 提交人姓名
+	CommitEmail  string `json:"commit_email,omitempty"`  // 提交人邮箱（路由到提交者用）
 }
 
 // LogKey 返回日志 Hub 的订阅键，格式 pipeline_id/build_id。

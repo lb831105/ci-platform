@@ -52,6 +52,23 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/GlobalBuildHistoryView.vue'),
       },
       {
+        path: 'views/new',
+        name: 'view-create',
+        component: () => import('@/views/ViewCreateView.vue'),
+      },
+      {
+        path: 'views/:viewName',
+        name: 'view-page',
+        component: () => import('@/views/ViewPageView.vue'),
+        props: true,
+      },
+      {
+        path: 'views/:viewName/edit',
+        name: 'view-edit',
+        component: () => import('@/views/ViewEditView.vue'),
+        props: true,
+      },
+      {
         path: 'system',
         name: 'system-config',
         component: () => import('@/views/manage/ManageJenkinsView.vue'),
@@ -82,6 +99,31 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/manage/SecurityView.vue'),
       },
       {
+        path: 'profile',
+        name: 'profile',
+        component: () => import('@/views/ProfileView.vue'),
+      },
+      {
+        path: 'system/notify-history',
+        name: 'system-notify-history',
+        component: () => import('@/views/manage/ManageNotifyView.vue'),
+      },
+      {
+        path: 'system/users',
+        name: 'system-users',
+        component: () => import('@/views/manage/ManageUsersView.vue'),
+      },
+      {
+        path: 'system/roles-manage',
+        name: 'system-roles-manage',
+        component: () => import('@/views/manage/ManageRolesView.vue'),
+      },
+      {
+        path: 'system/roles-assign',
+        name: 'system-roles-assign',
+        component: () => import('@/views/manage/AssignRolesView.vue'),
+      },
+      {
         path: 'system/credentials',
         name: 'system-credentials',
         component: () => import('@/views/manage/CredentialsView.vue'),
@@ -95,6 +137,11 @@ const routes: RouteRecordRaw[] = [
         path: 'system/log',
         name: 'system-log',
         component: () => import('@/views/manage/SystemLogView.vue'),
+      },
+      {
+        path: 'system/audit',
+        name: 'system-audit',
+        component: () => import('@/views/manage/ManageAuditView.vue'),
       },
       {
         path: 'system/load',

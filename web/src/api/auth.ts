@@ -4,6 +4,7 @@ export interface AuthStatus {
   enabled: boolean
   authenticated: boolean
   username: string
+  permissions?: string[]
 }
 
 export interface LoginResult {

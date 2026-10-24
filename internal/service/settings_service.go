@@ -112,6 +112,11 @@ func (s *SettingsService) Update(in model.Settings) (model.Settings, error) {
 			}
 		}
 	}
+	// Webhook 通知 URL：含 access_token，GET 不回传；留空表示沿用旧值。
+	// 需要清空时先禁用 Enabled（禁用后 URL 不会参与通知）。
+	if strings.TrimSpace(in.WebhookNotify.URL) == "" {
+		in.WebhookNotify.URL = s.current.WebhookNotify.URL
+	}
 
 	if err := validateSettings(&in); err != nil {
 		return model.Settings{}, err
@@ -235,6 +240,9 @@ func mergeSettings(base, loaded model.Settings) model.Settings {
 	if loaded.ArtifactMaxFiles <= 0 {
 		loaded.ArtifactMaxFiles = base.ArtifactMaxFiles
 	}
+	if loaded.LogMaxMB <= 0 {
+		loaded.LogMaxMB = base.LogMaxMB
+	}
 	if loaded.ToolCategories == nil {
 		loaded.ToolCategories = base.ToolCategories
 	} else {
@@ -316,6 +324,12 @@ func validateSettings(in *model.Settings) error {
 	}
 	if in.ArtifactMaxFiles <= 0 {
 		in.ArtifactMaxFiles = 10000
+	}
+	if in.LogMaxMB <= 0 {
+		in.LogMaxMB = 100
+	}
+	if in.LogMaxMB > 10240 {
+		in.LogMaxMB = 10240
 	}
 	for i := range in.GlobalEnv {
 		item := &in.GlobalEnv[i]

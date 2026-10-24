@@ -1,7 +1,11 @@
 package handler
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
+	"io"
 	"net/http"
 	"time"
 
@@ -31,7 +35,12 @@ func NewWebhookHandler(pipelines *service.PipelineService, builds *service.Build
 }
 
 // Handle POST /api/webhook/{pipeline_id}
-// 校验 X-Webhook-Secret 后触发构建；pipeline 未配置 secret 时视为开放触发。
+// 密钥校验兼容三种来源（任一匹配即通过，均为恒定时间比较，见 verifySecret）：
+//   - X-Webhook-Secret: 平台自定义 header（curl / CI 脚本）
+//   - X-Gitlab-Token:   GitLab Webhook 的 Secret Token
+//   - X-Hub-Signature-256: GitHub Webhook 的 HMAC-SHA256 签名
+//
+// pipeline 未配置 secret 时视为开放触发。
 func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	pipelineID := chi.URLParam(r, "pipeline_id")
 	if !h.limiter.Allow(pkg.ClientIP(r) + "|" + pipelineID) {
@@ -46,12 +55,38 @@ func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if p.WebhookSecret != "" {
-		got := r.Header.Get("X-Webhook-Secret")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(p.WebhookSecret)) != 1 {
+		if !h.verifySecret(w, r, p.WebhookSecret) {
 			pkg.Fail(w, pkg.NewError(pkg.CodeBadRequest, "invalid webhook secret"))
 			return
 		}
 	}
 
 	h.trigger.trigger(w, r, pipelineID, model.TriggerWebhook, "webhook")
+}
+
+// verifySecret 校验 webhook 密钥，兼容 GitLab（明文 token）与 GitHub（HMAC 签名）：
+// 任一匹配即通过。GitLab 不支持自定义 header，所以只认 X-Gitlab-Token 就无法兼容；
+// 反之平台自定义 header 也必须保留。恒定时间比较防止计时侧信道。
+func (h *WebhookHandler) verifySecret(w http.ResponseWriter, r *http.Request, secret string) bool {
+	// 1. 平台自定义 header。
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Webhook-Secret")), []byte(secret)) == 1 {
+		return true
+	}
+	// 2. GitLab: Secret Token 明文比较。
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Gitlab-Token")), []byte(secret)) == 1 {
+		return true
+	}
+	// 3. GitHub: X-Hub-Signature-256: sha256=<hex hmac(secret, body)>；签名校验需要请求体。
+	sig := r.Header.Get("X-Hub-Signature-256")
+	if sig == "" {
+		return false
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	return subtle.ConstantTimeCompare([]byte(sig), []byte(want)) == 1
 }

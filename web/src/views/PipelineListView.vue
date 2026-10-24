@@ -6,6 +6,7 @@ import JobStatusIcon from '@/components/JobStatusIcon.vue'
 import JobWeatherIcon from '@/components/JobWeatherIcon.vue'
 import { describeError } from '@/api/request'
 import { useOverviewStore } from '@/stores/overviewStore'
+import { useAuthStore } from '@/stores/authStore'
 import { usePolling } from '@/composables/usePolling'
 import { usePipeline } from '@/composables/usePipeline'
 import { formatDurationCN, formatRelativeTime } from '@/utils/format'
@@ -13,6 +14,7 @@ import type { BuildRef, PipelineSummary } from '@/types/summary'
 
 const router = useRouter()
 const overview = useOverviewStore()
+const auth = useAuthStore()
 const { remove, triggerBuild } = usePipeline()
 
 const jobs = computed(() => overview.items)
@@ -166,9 +168,9 @@ async function onRemove(job: PipelineSummary): Promise<void> {
 
         <el-table-column label="操作" width="220" align="right">
           <template #default="{ row }">
-            <el-button size="small" type="primary" @click.stop="onBuild(row)">构建</el-button>
-            <el-button size="small" @click.stop="goEdit(row)">配置</el-button>
-            <el-button size="small" type="danger" plain @click.stop="onRemove(row)">删除</el-button>
+            <el-button v-if="auth.hasPerm('job.build')" size="small" type="primary" @click.stop="onBuild(row)">构建</el-button>
+            <el-button v-if="auth.hasPerm('job.configure')" size="small" @click.stop="goEdit(row)">配置</el-button>
+            <el-button v-if="auth.hasPerm('job.delete')" size="small" type="danger" plain @click.stop="onRemove(row)">删除</el-button>
           </template>
         </el-table-column>
 

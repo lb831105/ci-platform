@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	"ci-platform/internal/model"
@@ -39,6 +40,16 @@ func (s *BuildStore) buildsDir(pipelineID string) string {
 // buildDir 返回某次构建的目录。
 func (s *BuildStore) buildDir(pipelineID, buildID string) string {
 	return filepath.Join(s.buildsDir(pipelineID), buildID)
+}
+
+// nextBuildFile 记录「下一个构建编号」（data/jobs/{pid}/next_build）。
+//
+// 为什么需要它：编号原本由「扫描构建目录取最大 +1」得出，一旦用户删除最新的
+// 构建（或保留策略删掉目录），下一次构建会复用同一个编号，导致同一任务出现
+// 两个内容不同的 #5，历史/产物/通知对不上账。Jenkins 用 nextBuildNumber 文件
+// 保证单调递增，这里保持一致。
+func (s *BuildStore) nextBuildFile(pipelineID string) string {
+	return filepath.Join(s.jobsRoot, pipelineID, "next_build")
 }
 
 // BuildDir 返回某次构建目录（供产物归档与读取使用）。
@@ -104,6 +115,9 @@ func (s *BuildStore) CreateNext(ctx context.Context, b *model.Build) error {
 // nextBuildIDLocked 需在持有 s.mu 的前提下调用。
 func (s *BuildStore) nextBuildIDLocked(pipelineID string) (string, error) {
 	max := 0
+	if n, ok := s.readNextBuildMark(pipelineID); ok && n > max {
+		max = n - 1 // 标记存的是「下一个编号」，这里换算成已用最大值
+	}
 	dir := s.buildsDir(pipelineID)
 	if pkg.IsDir(dir) {
 		entries, err := os.ReadDir(dir)
@@ -119,7 +133,36 @@ func (s *BuildStore) nextBuildIDLocked(pipelineID string) (string, error) {
 			}
 		}
 	}
-	return strconv.Itoa(max + 1), nil
+	next := max + 1
+	// 分配即落盘（标记存「下一个编号」= next+1）：
+	// 即使随后最新构建目录被删除，编号也不会回退复用。
+	_ = s.writeNextBuildMark(pipelineID, strconv.Itoa(next+1))
+	return strconv.Itoa(next), nil
+}
+
+// readNextBuildMark 读取编号标记；不存在或损坏时返回 false。
+func (s *BuildStore) readNextBuildMark(pipelineID string) (int, bool) {
+	raw, err := os.ReadFile(s.nextBuildFile(pipelineID))
+	if err != nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// writeNextBuildMark 写入「下一个编号」；失败不影响构建（编号仍可由目录推导）。
+func (s *BuildStore) writeNextBuildMark(pipelineID, next string) error {
+	n, err := strconv.Atoi(next)
+	if err != nil || n <= 0 {
+		return nil
+	}
+	if err := pkg.EnsureDir(filepath.Join(s.jobsRoot, pipelineID)); err != nil {
+		return err
+	}
+	return os.WriteFile(s.nextBuildFile(pipelineID), []byte(strconv.Itoa(n)+"\n"), 0o644)
 }
 
 // Create 创建构建目录并写入 build.json。

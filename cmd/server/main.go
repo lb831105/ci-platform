@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -122,9 +123,18 @@ func main() {
 	})
 	buildSvc.SetEnqueuer(scheduler)
 	scheduler.SetQuiet(settings.QuietMode)
+	// 定时构建触发器随任务在 Start 前创建；扫描循环在 workerCtx 启动后开启。
+	cronTrigger := service.NewCronTrigger(pipelineStore, buildSvc, 30*time.Second)
 
 	// 4.1 认证服务（基础版单管理员账号，会话存内存；凭据以 settings.json 为准）
 	authSvc := service.NewAuthService(settings.AuthEnabled, settings.AuthUser, settings.AuthPasswordHash, cfg.AuthTokenTTL)
+	// RBAC：角色、授权与平台内用户（data/rbac.json），对齐 Jenkins Manage and Assign Roles。
+	rbacSvc, rbacErr := service.NewRBACService(store.NewRbacStore(cfg.DataHome), authSvc)
+	if rbacErr != nil {
+		log.Fatalf("init rbac: %v", rbacErr)
+	}
+	// 多用户登录：管理员凭据不匹配时回退校验平台内用户。
+	authSvc.SetUserVerifier(rbacSvc)
 	if authSvc.Enabled() {
 		log.Printf("auth enabled: user=%s (可在「系统管理 → 全局安全配置」中修改，-no-auth 关闭)", settings.AuthUser)
 		if authSvc.UsesPassword("admin") {
@@ -137,9 +147,18 @@ func main() {
 	// 4.2 凭据管理与系统管理服务
 	credentialSvc := service.NewCredentialService(store.NewCredentialStore(cfg.DataHome))
 	buildSvc.SetCredentialResolver(credentialSvc)
+	// 操作审计：JSONL 追加写 data/audit.log；启动时恢复最大 ID 保证单调。
+	auditStore := store.NewAuditStore(cfg.DataHome)
+	var auditSvc *service.AuditService
+	if lastEntries, err := auditStore.Tail(1); err == nil {
+		auditSvc = service.NewAuditService(auditStore, service.LastIDFromEntries(lastEntries))
+	} else {
+		auditSvc = service.NewAuditService(auditStore, 0)
+	}
 	systemSvc := service.NewSystemService(
 		cfg, settingsSvc, pipelineStore, buildSvc, scheduler, logBuffer,
 		pkg.BuildInfo{Version: buildVersion, Commit: buildCommit, Date: buildDate},
+		auditSvc,
 	)
 
 	// 5. 前端资源：优先使用二进制内嵌的 web/dist，其次回退磁盘目录
@@ -156,20 +175,50 @@ func main() {
 	webhookHandler := handler.NewWebhookHandler(pipelineSvc, buildSvc, pipelineHandler)
 	wsHandler := handler.NewWSHandler(hub, buildSvc, cfg.LogBufferSize, cfg.CORSOrigins)
 	authHandler := handler.NewAuthHandler(authSvc, settingsSvc)
+	authHandler.SetRBAC(rbacSvc)
 	systemHandler := handler.NewSystemHandler(systemSvc, authSvc)
 	credentialHandler := handler.NewCredentialHandler(credentialSvc)
+	rbacHandler := handler.NewRbacHandler(rbacSvc, authSvc)
+	// 历史用户可能没有邮箱（旧版本允许留空）：启动时显式告警，
+	// 否则「任务里选了人却收不到邮件」会变成静默故障。
+	if missing := rbacSvc.UsersWithoutEmail(); len(missing) > 0 {
+		log.Printf("WARN: 以下用户缺少邮箱，构建通知的邮件无法送达，请在「系统管理 → 用户管理」补全: %s",
+			strings.Join(missing, ", "))
+	}
+
+	// 构建结果通知：把「项目」与「人员/群」绑定（人员联系方式来自 RBAC 用户）。
+	notifySvc := service.NewNotifyService(settingsSvc, rbacSvc)
+	// 通知记录（data/notify.log）：结构化的投递结果，用于排查「谁漏收了告警」。
+	notifySvc.SetRecorder(store.NewNotifyStore(cfg.DataHome))
+	// 连续失败计数与抑制窗口需要构建历史。
+	notifySvc.SetHistory(buildStore)
+	buildSvc.SetNotifier(notifySvc)
+	notifyHandler := handler.NewNotifyHandler(pipelineSvc, notifySvc, rbacSvc)
+	// 个人资料：用户自助维护联系方式与邮箱验证。
+	profileSvc := service.NewProfileService(rbacSvc, settingsSvc)
+	profileHandler := handler.NewProfileHandler(profileSvc)
+	// 视图：给任务归类（列表视图 + 我的视图），data/views.json。
+	viewSvc := service.NewViewService(store.NewViewStore(cfg.DataHome), pipelineSvc, rbacSvc)
+	viewHandler := handler.NewViewHandler(viewSvc, pipelineSvc, buildSvc)
 
 	handlerRouter := router.New(router.Deps{
-		Config:      cfg,
-		Pipeline:    pipelineHandler,
-		Build:       buildHandler,
-		Webhook:     webhookHandler,
-		WebSocket:   wsHandler,
-		Auth:        authHandler,
-		System:      systemHandler,
-		Credential:  credentialHandler,
-		AuthService: authSvc,
-		WebAssets:   webAssets,
+		Config:          cfg,
+		Pipeline:        pipelineHandler,
+		Build:           buildHandler,
+		Webhook:         webhookHandler,
+		WebSocket:       wsHandler,
+		Auth:            authHandler,
+		System:          systemHandler,
+		Credential:      credentialHandler,
+		RBAC:            rbacHandler,
+		View:            viewHandler,
+		Notify:          notifyHandler,
+		Profile:         profileHandler,
+		AuthService:     authSvc,
+		RBACService:     rbacSvc,
+		PipelineService: pipelineSvc,
+		AuditService:    auditSvc,
+		WebAssets:       webAssets,
 	})
 
 	// 7. 根 context：收到 SIGINT/SIGTERM 时取消，worker 与清理协程随之退出
@@ -193,6 +242,22 @@ func main() {
 	workerCtx, stopWorkers := context.WithCancel(context.Background())
 	defer stopWorkers()
 	scheduler.Start(workerCtx, cfg.Workers)
+	// 定时构建：随 worker 上下文启停（优雅停机时一并退出）。
+	cronTrigger.Start(workerCtx)
+	// 构建保留策略定期扫描：每小时应用全局保留策略到全部任务
+	// （构建后清理只覆盖有新构建的任务，旧任务需要定期补扫）。
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-ticker.C:
+				buildSvc.PruneAll(workerCtx)
+			}
+		}
+	}()
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
@@ -323,6 +388,8 @@ func defaultSettings(cfg *config.Config) model.Settings {
 		QueueSize:            cfg.QueueSize,
 		WorkspaceTTLMinutes:  int(cfg.WorkspaceTTL.Minutes()),
 		CleanIntervalMinutes: int(cfg.CleanInterval.Minutes()),
+		// 构建日志单次上限：默认 100MB（0/缺失时归一化为该值），超长日志截断。
+		LogMaxMB: 100,
 	}
 }
 

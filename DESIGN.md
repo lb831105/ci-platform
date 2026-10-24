@@ -304,9 +304,36 @@ jobs chan Job (容量 100)  +  N 个 worker goroutine（默认 3，CI_WORKERS �
 | 明确边界 | 失败时立即停止后续步骤并打印 `step %q failed with exit code %d` |
 | 环境一致 | 每步继承同一份环境变量（全局变量 + 工具主目录 + PATH） |
 
-构建被取消时 `CommandContext` 会终止当前子进程，无需额外的清理逻辑。
+构建被取消时的进程树处理（`local_executor.go`）：
 
-### 6.5 构建产物归档
+- **不能用 `exec.CommandContext`**：它会在 ctx 取消时抢先杀掉 `cmd.exe` 本身，导致
+  `taskkill /T` 找不到进程树，而孙进程（`sleep`/`npm`/`mvn`）仍持有管道写端，
+  `cmd.Wait()` 永远阻塞，构建状态无法落盘。
+- 因此手动 `Start` + `Wait`，ctx 取消/超时时用 `taskkill /T /F`（Windows）/
+  `SIGKILL` 进程组（Unix）杀整树，彻底释放管道与文件句柄。
+- 取消分支在 `ExitError` 分支之前判断：被强杀的进程返回 ExitError，若不先判 ctx
+  会把退出码 1 当成构建失败；先判 ctx 则正确落入 `aborted`。
+- 用户主动取消（`POST .../cancel`）状态落 `aborted`（`ExitCode = -1`），与
+  「代码问题导致的 `failed`」区分开，对齐 Jenkins 的 aborted 语义。
+
+### 6.5 定时构建（Cron）
+
+- 任务配置 `cron_spec`：5 字段 cron 规格（分 时 日 月 周），对齐 Jenkins Build periodically。
+- 支持 `H` 散列均衡（Jenkins 语义）：`H/15 * * * *` 每小时 4 次，偏移按任务名 FNV-1a 散列
+  固定（重启后不变），避免大量任务同时配置时同一瞬间集中触发；也支持 `H(a-b)` 范围散列。
+- 标准语法：`*`、`*/n`、`a-b`、`a-b/n`、`a,b`；dom 与 dow 都受限时取并集（Vixie cron 语义）。
+- 保存前校验语法（`NextCron` 同时验证一年内存在命中时刻，如 2 月 30 日会被拒绝）。
+- `CronTrigger`（`cron_trigger.go`）每 30s 扫描任务列表，到期即以 `timer` 触发方式入队；
+  计划时刻仅存内存（重启后重算，最多延迟一个扫描周期）；静默模式下顺延不触发。
+- 触发记录在构建历史中显示为「定时触发」（`trigger_type=timer`）。
+
+### 6.6 删除任务时清理工作区
+
+`PipelineService.Delete` 在删除 `data/jobs/{id}` 之前先删除工作区目录
+`data/workspace/{workspace_dir}`（递归），避免同名任务重建时残留旧构建产物；
+工作区删除失败时返回错误并中止删除（不留下孤儿目录）。
+
+### 6.7 构建产物归档
 
 - 每个 build 目录下独立保存 `artifacts/` 与 `artifacts.json`，**下次构建不会覆盖历史产物**，用于回滚。
 - 配置在任务「构建后操作 → 归档构建产物」：`artifacts.enabled` + `artifacts.files`（相对工作区 glob）。
@@ -321,7 +348,34 @@ jobs chan Job (容量 100)  +  N 个 worker goroutine（默认 3，CI_WORKERS �
   `SshPublisher.PublishArtifacts` 只上传不编译；要求任务/请求提供 `server_id`，远程目录为空或 `/` 直接拒绝。
 - 读取侧只允许下载 `artifacts.json` 清单中的相对路径，拒绝 `../`、绝对路径与符号链接。
 
-### 6.6 工作区生命周期
+### 6.7 构建产物清理
+
+- **构建后清理**：每次构建结束后应用保留策略（任务级配置优先，否则回落全局
+  Build Discarders：`build_retention_max_per_job` / `build_retention_max_age_days`），
+  删除超量的旧构建目录（含日志与产物）。
+- **定期扫描**（`PruneAll`）：每小时对全部任务应用全局保留策略，
+  补上「不活跃任务永不清理」的缺口（构建后清理只覆盖有新构建的任务）。
+- **日志大小上限**（`log_max_mb`，默认 100）：单次构建日志超过上限后截断并标注
+  （`LimitedWriter`），不中断构建、不影响构建结果；在线 WebSocket 实时日志不限制。
+- **产物限制**：`artifact_max_total_mb` / `artifact_max_files` 超限时构建失败（防假绿）。
+- 启动时清理孤儿工作区（TTL 之外），删除任务时连工作区一并删除。
+
+### 6.7.1 手动删除单次构建
+
+- **接口**：`DELETE /api/pipelines/{pid}/builds/{bid}`，权限 `job.delete`（与删除任务同权限点）。
+- **删除范围**：整个构建目录 `data/jobs/{pid}/builds/{bid}`——`build.json`、`log.txt`、
+  `artifacts/`（清单与产物文件）一次性移除；任务目录与其它构建保持不变。
+- **拒绝运行中/排队中的构建**（40900）：日志与产物仍在写入，删目录会让状态永远停在
+  running 并留下半截日志。正确顺序是「停止构建 →（aborted）→ 删除」。
+- **幂等**：目标不存在（重复点击 / 并发删除）返回成功，避免前端重试看到无意义的 40400。
+- **编号单调**：编号原本由「扫描构建目录取最大 +1」得出，删掉最新构建后会复用同一个编号，
+  导致同一任务出现两个内容不同的 `#5`。现在每次分配编号都会把 `next_build`
+  （`data/jobs/{pid}/next_build`）写成「下一个编号」，删除目录后编号仍不回退（与 Jenkins
+  `nextBuildNumber` 一致）。保留策略删旧构建不受影响（最大值仍在）。
+- **UI**：任务页构建历史每行「删除」（仅非运行态 + 有 `job.delete`）、构建日志页「删除构建」、
+  全局构建历史行内「删除」，均二次确认并提示不可恢复。
+
+### 6.8 工作区生命周期
 
 - 路径：`data/workspace/{workspace_dir}`，目录名默认取任务名（非法字符替换、重名追加 `-{id}`），重命名任务时同步移动；默认**不清空**，保留上次产物与依赖缓存。
 - 仅当任务显式设置 `delete_workspace_before_build=true` 时构建前删除整个工作区（会重新 clone）。
@@ -431,7 +485,133 @@ sequenceDiagram
 
 ---
 
-## 8. SSH 发布子系统
+### 7.5 构建结果通知（项目 × 人员 / 群 × 事件）
+
+**痛点**：全局收件人只有一份，不同项目的告警会发给所有人（或配置了多个项目的团队互相干扰）。
+因此通知必须**按项目挂人/挂群**。
+
+**数据模型**：
+
+- 用户（`data/rbac.json`）新增联系方式：`email`（邮件）、`wecom_id`（企微 userid，群 @ 用）、
+  `phone`（钉钉 @ 手机号）、`email_verified`（邮箱验证状态）。管理员在「系统管理 → 用户管理」维护，
+  用户也可在「个人资料」页自助维护并验证邮箱（见 §8.3）。
+- 任务（`config.json`）新增 `notify`：`enabled`、`use_global`、`people[]`（用户名，发送时解析联系方式）、
+  `emails[]`（外部邮箱）、`targets[]`（钉钉/企微/Slack 机器人 + 每目标独立事件）、`events`（任务级事件）。
+
+**解析优先级**（`NotifyService.plan`）：
+
+| 任务配置 | 行为 |
+|---|---|
+| `notify.enabled = true` | 只发给任务级人员/群；`use_global` 时再叠加全局默认（去重后合并）|
+| `notify = nil / enabled=false` | 回落「系统配置 → 邮件/Webhook 通知」的全局默认（兼容旧行为）|
+| 邮件未启用（SMTP 关闭）| 不发送邮件（避免反复失败），群通知照常 |
+
+**事件语义**（区别于「一律发成功」的噪音）：
+
+- `failure`：构建失败；`success`：普通成功；**`fixed`：上次失败/取消 → 本次成功**；`aborted`：人为取消。
+- 订阅「成功」也收到「修复」；只订阅「修复」时普通成功不通知——避免每日绿构建刷屏。
+- 群目标可单独订阅事件（如：前端群只看失败，值班群看全部）。
+
+**@ 提醒**：失败/取消事件时，对群内相关人员 @（钉钉用手机号、企微用 `<@userid>`），
+成功/修复不打扰。
+
+**可观测性**：发送结果写入构建日志，如
+`[notify] event=failure；邮件 2 人（a@x, b@x）；群 1 个（wecom#1）；失败 1 个（dingtalk: ...）`，
+便于事后核对「通知了谁、是否成功」。
+
+**密钥安全**：任务级群机器人 URL 中的 `access_token`/`key`/`secret` 等查询参数在 GET 时脱敏为 `***`
+（结构可读）；保存时若检测到脱敏形态与旧值一致则回填真实值（`pkg.MaskTokenQuery` 文本替换，
+不重新编码）；失败日志只打印渠道名。
+
+**测试**：任务配置页「发送测试通知」→ `POST /api/pipelines/{pid}/notify/test`，
+不受事件过滤，用于验证「项目 → 人员/群」绑定是否正确。
+
+**全局测试**：「系统配置 → Webhook 通知 → 发送测试通知」→ `POST /api/system/webhook/test`（管理员）。
+
+#### 7.5.1 值班轮值、升级、抑制与分支路由
+
+四个运维能力都挂在任务级 `notify` 上（全局默认不启用，避免影响既有部署）：
+
+| 能力 | 字段 | 行为 |
+|---|---|---|
+| 值班轮值 on-call | `on_call{enabled, rotation[], start_date, period_days}` | 失败/取消时把「当周值班人」加入收件人并 @ 他；值经由「日期差 / 周期」取模算出（无隐藏状态，重启一致）；未填起点用固定锚点 2024-01-01，而不是「今天」（否则永远停在第一个人）|
+| 升级 escalation | `escalation{enabled, after, people[], emails[], targets[]}` | 连续失败次数 ≥ `after`（默认 3，最小 2）时**追加**上级人员/群；**升级优先于抑制**——已经连败 N 次还静默就失去升级意义 |
+| 抑制 suppression | `suppress_window_min`（0=关闭，最小 2）| 同一任务窗口内的连续失败只发首条，后续合并为「已连续失败 N 次」；抑制期不静默到死：达到升级阈值仍会升级。1 分钟被拒绝（几乎永久静默）|
+| 分支路由 routes | `routes[]{match, people[], emails[], targets[], committer, on_call}` | 构建分支命中 glob 时叠加人员/群；`committer=true` 追加 git author 邮箱（feature/* 只通知提交者）；`*` 不跨 `/`，`**` 跨目录；空 `match`=所有分支。非 Git 任务显式写了 `match` 的路由不生效 |
+
+**连续失败计数**（`failureStreak`）从构建历史倒序往前数，遇到非失败即停止；抑制窗口比较
+「当前构建完成时间 − 上一次失败构建完成时间」，因此重启后判断结果不变（不依赖内存状态）。
+
+**任务级消息模板** `notify.template`：支持 `{{job}} {{build}} {{event}} {{status}} {{branch}} {{commit}}
+{{author}} {{duration}} {{url}} {{oncall}} {{streak}} {{message}}`；未知占位符原样保留（便于发现拼写错误），
+邮件与群消息共用同一模板，**@ 提醒始终追加在末尾**（自定义模板不能吞掉「该 @ 谁」）。
+
+**分支信息从哪来**：签出成功后由 `executor.ReadCheckoutInfo` 直接读 `.git`（go-git，不依赖 PATH），
+把实际分支、短 SHA、提交人姓名/邮箱写进 `build.json`；读取失败不阻塞构建（退化为无分支信息）。
+
+**密钥安全（升级群/路由群）**：`sanitizePipeline` 对基础目标、升级目标、路由目标统一脱敏；
+保存时 `mergeNotifyURLs` 按「渠道 + 脱敏形态」索引一次性回填三处真实 URL。
+注意脱敏时要**整体拷贝** `notify` 结构体，避免把 `***` 反写进内存里正在用于发送的配置。
+
+#### 7.5.2 通知历史（谁漏收了告警）
+
+- **落盘**：`data/notify.log`（JSONL，16MB 轮转），**按收件人/群粒度**一条记录：
+  `{id, time, pipeline_id/name, build_id, event, channel, recipient, status, error, streak, escalated, on_call, branch}`。
+  只有按收件人拆开，才能回答「这条告警谁没收到」；按构建聚合只能回答「发过没」。
+- **状态**：`sent` / `failed`（带错误原因：SMTP 拒绝、机器人 token 失效）/ `suppressed`（命中抑制窗口，
+  附带「连续失败 N 次，10 分钟抑制窗口内已合并」，解释「为什么没收到第二条」）。
+- **ID**：单调递增，启动时从文件尾部恢复（与审计日志同一策略）。
+- **查询**：`GET /api/system/notify?limit=&pipeline=&recipient=&status=`（`system.read`），
+  过滤在服务层完成（先多取后截断，避免为组合加索引）。
+- **UI**：「系统管理 → 通知记录」，可按任务、收件人、状态过滤，直接筛出「某人没收到」。
+
+### 8.1 操作审计日志
+
+- **记录点**：审计中间件（`middleware/audit.go`）拦截全部变更类 API（POST/PUT/DELETE），
+  记录谁（用户）、何时、做了什么（动作+目标路径）、结果（业务码）、来源 IP；
+  查询类请求不记录（量大且无审计价值）。
+- **登录接口单独挂载**（在 Auth 之外）：成功后用户名从响应体解析；
+  密码等请求体绝不落盘。
+- **存储**：`data/audit.log` JSONL 追加写（每行一条 JSON，带文件锁+fsync）；
+  追加型数据用 JSONL 比原子重写全文件更合适，断电最多丢最后一行。
+- **查询**：`GET /api/system/audit?limit=300`（管理员），`Tail` 从文件尾部倒序读取；
+  损坏行跳过。ID 单调递增，重启后从文件恢复最大值。
+- **UI**：「系统管理 → 操作日志」（时间/用户/动作/目标/结果/IP）。
+
+### 8.2 多用户管理
+
+- **用户 CRUD**：`POST /api/security/users`（创建，bcrypt）、`POST /users/delete`、
+  `PUT /users/password`（管理员重置，同时撤销全部登录会话）；接口返回时清空 hash。
+- **登录回退**：管理员凭据不匹配后回退校验平台内用户（`VerifyLogin`）。
+- **邮箱必填**：创建用户、管理员改联系方式、用户自助改资料都要求邮箱非空且形如 `a@b.c`
+  （单一 `@`、域名至少两段）。原因很直接：构建通知按人员解析邮箱，允许留空等于允许
+  「任务里选了人却永远收不到邮件」这种静默故障。旧数据可能没有邮箱：启动时
+  `UsersWithoutEmail` 打 WARN，用户管理页顶部列出待补全名单，通知计划里也会带上
+  `警告：人员 X 未配置邮箱`（写入构建日志），补全后警告自动消失。
+- **账号管理**：独立页面「系统管理 → 用户管理」（对齐 Jenkins *Manage Users*），
+  数据源 `GET /api/security/users`（内置管理员 + 平台用户 + 联系方式 + 角色摘要，
+  密码哈希不出服务层）。新建/删除/重置密码/联系方式都在这里，
+  内置管理员（系统配置里的登录用户）标记 `builtin` 且只读，避免把自己锁在门外。
+### 8.3 个人资料与邮箱验证（用户自助）
+
+- **接口**：`GET /api/profile`、`PUT /api/profile/contact`、`POST /api/profile/email/verify`、
+  `POST /api/profile/email/confirm`；挂在 Auth 之后但**不要求 Administer**（任何登录用户都能改自己的联系方式）。
+- **身份来源**：一律取登录态（`pkg.UserFromContext`），请求体不接受用户名，避免越权改他人资料。
+- **内置管理员只读**：其账号来自系统配置、不在 `rbac.json` 中，返回 `builtin=true`；改联系方式返回 40300，
+  引导到「系统配置」。
+- **邮箱必填**：`PUT /api/profile/contact` 与创建用户同一规则（空邮箱返回 40000），
+  因为这是告警邮件的唯一投递地址。
+- **邮箱验证**：6 位数字码（crypto/rand），10 分钟有效，同一用户 60 秒内不可重复发码（42900）；
+  验证码只对发码时的邮箱有效，**改邮箱会立即清除 `email_verified`**；SMTP 未启用时直接返回可读错误，
+  不发无效请求。发送失败会清掉本次验证码与限流额度（否则用户拿不到码还被限流）。
+- **为什么重要**：通知可靠性依赖邮箱正确，管理员逐个代填成本高且容易过期；自助 + 验证能把
+  「邮箱写错」从「靠猜」变成「用户自己确认过」。
+
+- **授权**：角色/授权矩阵仍在「Manage and Assign Roles」页维护（全局角色 + 任务角色 Pattern）。
+  两页职责分离：用户管理 = 「谁是账号」，Assign Roles = 「账号能做什么」；
+  账号不再兼作授权入口，授权页只保留勾选与「去用户管理」入口。
+
+## 9. SSH 发布子系统
 
 对齐 Jenkins **Publish Over SSH** 的核心行为：上传指定文件到远程目录，可选在远程执行命令。
 
@@ -439,6 +619,13 @@ sequenceDiagram
 
 - **全局 SSH 服务器**：`settings.SshServers`（`data/settings.json`），集中维护 host/port/user/认证/私钥/密码/
   `known_hosts_path`/默认远程目录；接口返回时密码清空并标记 `has_password`，与 auth/SMTP 密码一致。
+- **视图（Views，给任务归类）**：`data/views.json` 存视图；列表视图 = 显式任务 + 任务名正则
+  （忽略大小写），我的视图 = 当前用户有 `job.read` 权限的任务；视图内任务统一按权限过滤，
+  未授权任务一律隐藏；展示列与 Widgets 随视图持久化。
+- **RBAC（Manage and Assign Roles）**：`data/rbac.json` 存角色/授权/用户；全局权限由路由中间件
+  `RequirePerm` 校验，任务级权限由 `RequireJobPerm` 按任务名与角色 Pattern 匹配（忽略大小写、完全匹配，
+  对齐 Jenkins Role Strategy）；Administer 隐含全部权限，系统管理员用户不可被 RBAC 降权（防锁死）；
+  `/auth/me` 返回用户有效权限，前端据此隐藏入口。权限不足返回 `code=40300`。
 - **任务级**：`ssh_publish.server_id` + `source_files` / `remove_prefix` / `exec_command` / 可选远程目录覆盖。
   构建时 `BuildService.resolveSshConfig` 合并为完整配置；旧版内联 host/username 配置继续兼容。
 
@@ -607,15 +794,14 @@ flowchart LR
 | 单机执行 | 无多节点 agent，构建与调度都在同一进程 |
 | 步骤串行 | 无 DAG / 并行步骤 |
 | 前端大包 | Element Plus 全量引入，主 bundle 约 1MB（gzip 350KB），未做按需引入 |
-| 日志文件无轮转 | 超长日志会持续增长（受构建输出量约束） |
+| 日志文件无轮转 | 单次构建日志有 `log_max_mb` 上限（默认 100MB，超限截断并标注）；系统日志为定长环形缓冲，超长日志不再无限增长 |
 
 ### 演进方向（按性价比排序）
 
 1. **SSH 连接测试按钮** —— `known_hosts` 校验已支持，剩余为连接连通性检测。
 2. **Element Plus 按需引入**（`unplugin-vue-components`）—— 主 bundle 可降到约 30%。
-3. **日志按大小切割 + 保留最近 N 次构建** —— 控制磁盘占用。
-4. **构建取消接口**（`POST .../builds/{bid}/cancel`）—— 配合 `ctx` 取消已具备基础。
-5. **多节点 agent** —— 需要引入注册与心跳机制，是当前架构最大的一次扩展。
+3. **日志按大小切割 + 保留最近 N 次构建** —— 已实现（`log_max_mb` 截断 + 保留策略定期扫描 `PruneAll`）。
+4. **多节点 agent** —— 需要引入注册与心跳机制，是当前架构最大的一次扩展。
 
 ---
 

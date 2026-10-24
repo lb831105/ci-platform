@@ -11,6 +11,7 @@ const (
 	CodeOK              = 0
 	CodeBadRequest      = 40000
 	CodeUnauthorized    = 40100
+	CodeForbidden       = 40300
 	CodeNotFound        = 40400
 	CodeConflict        = 40900
 	CodeTooManyRequests = 42900
@@ -43,6 +44,11 @@ func ErrConflict(format string, args ...interface{}) *AppError {
 	return NewError(CodeConflict, format, args...)
 }
 
+// ErrInternal 内部错误（HTTP 500 语义）：用于把底层错误包装成可读提示。
+func ErrInternal(format string, args ...interface{}) *AppError {
+	return NewError(CodeInternal, format, args...)
+}
+
 // Wrap 保留业务错误码并附加上下文。
 func Wrap(err error, format string, args ...interface{}) error {
 	if err == nil {
@@ -62,6 +68,8 @@ func HTTPStatusOf(code int) int {
 		return http.StatusBadRequest
 	case CodeUnauthorized:
 		return http.StatusUnauthorized
+	case CodeForbidden:
+		return http.StatusForbidden
 	case CodeNotFound:
 		return http.StatusNotFound
 	case CodeConflict:

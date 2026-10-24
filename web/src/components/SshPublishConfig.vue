@@ -128,7 +128,7 @@ function updateSourceFiles(value: string[]): void {
               :placeholder="selectedServer?.remote_base_dir || '/opt/app/releases'"
               @update:model-value="(value: string) => patch({ remote_base_dir: value })"
             />
-            <div class="form-tip">留空时使用服务器配置里的默认远程目录。</div>
+            <div class="form-tip">相对服务器「默认远程目录」拼接：填 gomysqldump、服务器默认 /data/projects 时，上传到 /data/projects/gomysqldump；留空时直接使用服务器配置里的默认远程目录。</div>
           </el-form-item>
 
           <el-form-item label="待上传文件">

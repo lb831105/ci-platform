@@ -39,6 +39,7 @@ function defaultForm(): Settings {
     build_retention_max_age_days: 0,
     artifact_max_total_mb: 4096,
     artifact_max_files: 10000,
+    log_max_mb: 100,
     global_env: [],
     git_user_name: '',
     git_user_email: '',
@@ -58,6 +59,13 @@ function defaultForm(): Settings {
       notify_on_failure: true,
       notify_on_success: false,
       subject_template: '',
+    },
+    webhook_notify: {
+      enabled: false,
+      channel: 'dingtalk',
+      url: '',
+      notify_on_failure: true,
+      notify_on_success: false,
     },
     quiet_mode: false,
     auth_enabled: true,
@@ -222,6 +230,20 @@ async function onTestEmail(): Promise<void> {
     testing.value = false
   }
 }
+
+// 发送 Webhook 测试通知。
+const testingWebhook = ref(false)
+async function onTestWebhook(): Promise<void> {
+  testingWebhook.value = true
+  try {
+    await systemApi.testWebhookNotify()
+    ElMessage.success('测试通知已发送')
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    testingWebhook.value = false
+  }
+}
 </script>
 
 <template>
@@ -358,6 +380,11 @@ async function onTestEmail(): Promise<void> {
             </el-form-item>
             <el-form-item label="单次产物文件数上限">
               <el-input-number v-model="form.artifact_max_files" :min="1" :max="100000" />
+              <div class="form-tip">二项上限按匹配文件累计计算；设置过小会导致构建失败（错误信息中会提示当前值与修改位置）。</div>
+            </el-form-item>
+            <el-form-item label="构建日志上限（MB）">
+              <el-input-number v-model="form.log_max_mb" :min="1" :max="10240" />
+              <div class="form-tip">单次构建的日志文件大小上限；超过后日志截断并标注（不影响构建结果），避免超长输出拖慢读取与占用磁盘。在线实时日志不受影响。</div>
             </el-form-item>
           </el-form>
         </el-collapse-item>
@@ -546,6 +573,38 @@ async function onTestEmail(): Promise<void> {
             <el-form-item label="测试邮件">
               <el-input v-model="testTo" placeholder="收件人" style="max-width: 300px" />
               <el-button style="margin-left: 10px" :loading="testing" @click="onTestEmail">发送测试邮件</el-button>
+            </el-form-item>
+          </el-form>
+        </el-collapse-item>
+
+        <el-collapse-item name="webhook-notify">
+          <template #title>Webhook 通知（钉钉 / 企业微信 / Slack）</template>
+          <el-form label-width="200px" label-position="right">
+            <el-form-item label="启用 Webhook 通知">
+              <el-switch v-model="form.webhook_notify.enabled" />
+            </el-form-item>
+            <el-form-item label="通知渠道">
+              <el-radio-group v-model="form.webhook_notify.channel">
+                <el-radio value="dingtalk">钉钉</el-radio>
+                <el-radio value="wecom">企业微信</el-radio>
+                <el-radio value="slack">Slack</el-radio>
+              </el-radio-group>
+            </el-form-item>
+            <el-form-item label="Webhook 地址">
+              <el-input
+                v-model="form.webhook_notify.url"
+                class="mono"
+                placeholder="机器人 Webhook 地址（含 access_token / key）"
+                style="max-width: 560px"
+              />
+              <div class="form-tip">URL 含密钥，保存后不再回传（留空表示沿用旧值）；钉钉机器人需在安全设置中包含关键词「构建」或改用加签方式。</div>
+            </el-form-item>
+            <el-form-item label="通知时机">
+              <el-checkbox v-model="form.webhook_notify.notify_on_failure">失败时通知</el-checkbox>
+              <el-checkbox v-model="form.webhook_notify.notify_on_success">成功时通知</el-checkbox>
+            </el-form-item>
+            <el-form-item label="测试通知">
+              <el-button :loading="testingWebhook" @click="onTestWebhook">发送测试通知</el-button>
             </el-form-item>
           </el-form>
         </el-collapse-item>

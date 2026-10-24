@@ -25,6 +25,7 @@ type SystemService struct {
 	scheduler *Scheduler
 	logbuf    *pkg.LogBuffer
 	build     pkg.BuildInfo
+	audit     *AuditService
 	startedAt time.Time
 }
 
@@ -37,6 +38,7 @@ func NewSystemService(
 	scheduler *Scheduler,
 	logbuf *pkg.LogBuffer,
 	build pkg.BuildInfo,
+	audit *AuditService,
 ) *SystemService {
 	return &SystemService{
 		cfg:       cfg,
@@ -46,8 +48,17 @@ func NewSystemService(
 		scheduler: scheduler,
 		logbuf:    logbuf,
 		build:     build,
+		audit:     audit,
 		startedAt: time.Now(),
 	}
+}
+
+// AuditEntries 返回最近 limit 条操作审计记录（时间倒序）。
+func (s *SystemService) AuditEntries(limit int) ([]model.AuditEntry, error) {
+	if s.audit == nil {
+		return []model.AuditEntry{}, nil
+	}
+	return s.audit.Entries(limit)
 }
 
 // Info 返回系统环境信息。
@@ -192,6 +203,22 @@ func (s *SystemService) SendTestEmail(to string) error {
 		return pkg.ErrBadRequest("请填写测试收件人")
 	}
 	return executor.SendMail(cfg, recipients, "CI Platform 测试邮件", "这是一封来自 CI Platform 的测试邮件。\n")
+}
+
+// SendTestWebhookNotify 使用当前 Webhook 通知配置推送一条测试消息。
+func (s *SystemService) SendTestWebhookNotify() error {
+	cfg := s.settings.Current().WebhookNotify
+	if !cfg.Enabled {
+		return pkg.ErrBadRequest("请先启用 Webhook 通知")
+	}
+	p := &model.Pipeline{ID: "test", Name: "测试任务"}
+	b := &model.Build{ID: "0", PipelineID: "test", Status: model.BuildSuccess, TriggerType: model.TriggerManual, TriggeredBy: "admin"}
+	now := time.Now().UTC()
+	b.StartedAt = &now
+	b.FinishedAt = &now
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return executor.SendWebhookNotify(ctx, cfg, p, b, s.settings.Current().JenkinsURL)
 }
 
 // Features 返回平台内置能力清单（对应「插件管理」中的已安装组件）。
@@ -372,6 +399,8 @@ func hasDataFiles(dir string) bool {
 func copyDataEntries(ctx context.Context, src, dst string) error {
 	for _, name := range []string{
 		"settings.json",
+		"rbac.json",
+		"views.json",
 		"credentials",
 		"jobs",
 		".workspace-reuse-v1",

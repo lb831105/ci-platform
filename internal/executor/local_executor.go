@@ -58,8 +58,9 @@ func (l *LocalExecutor) RunSteps(ctx context.Context, spec RunSpec, out io.Write
 		_, kind := resolveShell(spec.Shell)
 		var cmd *exec.Cmd
 		scriptPath := ""
+		// 注意：不用 exec.CommandContext（原因见下方 Start 处注释）。
 		if kind == "cmd" && !strings.ContainsAny(step.Run, "\r\n") {
-			cmd = exec.CommandContext(ctx, "cmd.exe")
+			cmd = exec.Command("cmd.exe")
 			configureCmd(cmd, step.Run)
 		} else {
 			shell, args, path, err := writeStepScript(tmpDir, i+1, spec.Shell, step.Run)
@@ -67,7 +68,7 @@ func (l *LocalExecutor) RunSteps(ctx context.Context, spec RunSpec, out io.Write
 				return -1, err
 			}
 			scriptPath = path
-			cmd = exec.CommandContext(ctx, shell, args...)
+			cmd = exec.Command(shell, args...)
 		}
 		cmd.Dir = spec.Workspace
 		cmd.Env = mergeEnv(os.Environ(), spec.Env)
@@ -75,21 +76,41 @@ func (l *LocalExecutor) RunSteps(ctx context.Context, spec RunSpec, out io.Write
 		cmd.Stderr = out
 
 		fmt.Fprintf(out, "\n[local] === step %d/%d: %s ===\n$ %s\n", i+1, len(spec.Steps), name, step.Run)
-		err := cmd.Run()
+		prepareProcessGroup(cmd)
+		// 手动 Start：ctx 取消/超时时用 taskkill /T /F 杀整个进程树（cmd.exe
+		// 及其全部子进程），彻底释放管道与文件句柄。不能用 exec.CommandContext——
+		// 它会在 ctx 取消时抢先杀掉 cmd.exe 本身，导致 taskkill /T 找不到进程树，
+		// 而孙进程（sleep/npm）仍持有管道写端，cmd.Wait() 永远阻塞。
+		if err := cmd.Start(); err != nil {
+			return -1, fmt.Errorf("local exec %q: start: %w", name, err)
+		}
+		killDone := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = killProcessTree(context.Background(), cmd)
+			case <-killDone:
+			}
+		}()
+		err := cmd.Wait()
+		close(killDone)
 		if scriptPath != "" {
 			_ = os.Remove(scriptPath)
 		}
 		if err == nil {
 			continue
 		}
+		// 取消/超时：进程被 taskkill 强杀（ExitError），但语义是取消而非失败，
+		// 需在 ExitError 分支之前判断，否则退出码 1 会被当成构建失败。
+		if ctx.Err() != nil {
+			fmt.Fprintf(out, "[local] step %q cancelled: %v\n", name, ctx.Err())
+			return -1, fmt.Errorf("local exec: cancelled: %w", ctx.Err())
+		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			code := exitErr.ExitCode()
 			fmt.Fprintf(out, "[local] step %q failed with exit code %d\n", name, code)
 			return code, nil
-		}
-		if ctx.Err() != nil {
-			return -1, fmt.Errorf("local exec: cancelled: %w", ctx.Err())
 		}
 		return -1, fmt.Errorf("local exec %q: %w", name, err)
 	}

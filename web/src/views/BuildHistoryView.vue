@@ -10,6 +10,7 @@ import { usePipeline } from '@/composables/usePipeline'
 import { usePolling } from '@/composables/usePolling'
 import { useBuildStore } from '@/stores/buildStore'
 import { useOverviewStore } from '@/stores/overviewStore'
+import { useAuthStore } from '@/stores/authStore'
 import type { Build } from '@/types/build'
 import type { Pipeline, PipelinePayload } from '@/types/pipeline'
 import { formatDuration, formatRelativeTime, formatTime } from '@/utils/format'
@@ -18,6 +19,7 @@ const props = defineProps<{ pipelineId: string }>()
 
 const router = useRouter()
 const { fetchOne, save, remove, triggerBuild } = usePipeline()
+const auth = useAuthStore()
 const buildStore = useBuildStore()
 const overview = useOverviewStore()
 
@@ -123,6 +125,9 @@ function causeText(build: Build): string {
       ? `Started by ${build.triggered_by}`
       : 'Started by webhook'
   }
+  if (build.trigger_type === 'timer') {
+    return '定时触发'
+  }
   return `Started by user ${build.triggered_by || 'anonymous'}`
 }
 
@@ -159,6 +164,50 @@ function goEdit(): void {
 
 function goList(): void {
   void router.push({ name: 'pipeline-list' })
+}
+
+// 手动取消运行中/等待中的构建。
+const cancellingId = ref('')
+async function onCancel(build: Build): Promise<void> {
+  cancellingId.value = build.id
+  try {
+    await buildApi.cancel(props.pipelineId, build.id)
+    ElMessage.success(`已发送取消请求（#${build.id}）`)
+    await loadHistory(false)
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    cancellingId.value = ''
+  }
+}
+
+// 删除单次构建（含该构建目录：日志与已归档产物）。
+const deletingId = ref('')
+async function onDeleteBuild(build: Build): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `删除构建 #${build.id} 会同时删除 ${`data/jobs/${props.pipelineId}/builds/${build.id}`} ` +
+        '目录（日志与已归档产物），且不可恢复。确认删除？',
+      '删除构建',
+      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  deletingId.value = build.id
+  try {
+    await buildApi.remove(props.pipelineId, build.id)
+    ElMessage.success(`构建 #${build.id} 已删除`)
+    if (liveBuildId.value === build.id) {
+      liveBuildId.value = ''
+    }
+    await loadHistory(false)
+    await overview.fetch(true)
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    deletingId.value = ''
+  }
 }
 
 async function onBuild(): Promise<void> {
@@ -231,6 +280,8 @@ async function onEditDescription(): Promise<void> {
     webhook_secret: p.webhook_secret,
     build_retention_max_per_job: p.build_retention_max_per_job ?? 0,
     build_retention_max_age_days: p.build_retention_max_age_days ?? 0,
+    cron_spec: p.cron_spec ?? '',
+    notify: p.notify ?? null,
     delete_workspace_before_build: p.delete_workspace_before_build ?? false,
     artifacts: {
       enabled: p.artifacts?.enabled ?? false,
@@ -310,8 +361,8 @@ function showChanges(): void {
       </div>
       <div>
         <el-button @click="goList">返回列表</el-button>
-        <el-button @click="goEdit">配置</el-button>
-        <el-button type="primary" :loading="triggering" @click="onBuild">立即构建</el-button>
+        <el-button v-if="auth.hasPerm('job.configure')" @click="goEdit">配置</el-button>
+        <el-button v-if="auth.hasPerm('job.build')" type="primary" :loading="triggering" @click="onBuild">立即构建</el-button>
       </div>
     </div>
 
@@ -326,10 +377,10 @@ function showChanges(): void {
           <li><a @click="showChanges">状态</a></li>
           <li><a @click="showChanges">修改记录</a></li>
           <li><a @click="showWorkspace">工作空间</a></li>
-          <li><a @click="onBuild">立即构建</a></li>
-          <li><a @click="goEdit">配置</a></li>
-          <li><a @click="onRemove">删除工程</a></li>
-          <li><a @click="onRename">重命名</a></li>
+          <li v-if="auth.hasPerm('job.build')"><a @click="onBuild">立即构建</a></li>
+          <li v-if="auth.hasPerm('job.configure')"><a @click="goEdit">配置</a></li>
+          <li v-if="auth.hasPerm('job.delete')"><a @click="onRemove">删除工程</a></li>
+          <li v-if="auth.hasPerm('job.configure')"><a @click="onRename">重命名</a></li>
           <li>
             <RouterLink :to="{ name: 'system-credentials' }">凭据</RouterLink>
           </li>
@@ -369,6 +420,16 @@ function showChanges(): void {
                 <span class="build-row__num mono">#{{ build.id }}</span>
                 <span class="build-row__cause">{{ causeText(build) }}</span>
                 <span class="build-row__time mono">{{ clockLabel(build.started_at) }}</span>
+                <span
+                  v-if="(build.status === 'running' || build.status === 'pending') && auth.hasPerm('job.build')"
+                  class="build-row__stop"
+                  @click.stop="onCancel(build)"
+                >{{ cancellingId === build.id ? '停止中…' : '停止' }}</span>
+                <span
+                  v-if="build.status !== 'running' && build.status !== 'pending' && auth.hasPerm('job.delete')"
+                  class="build-row__stop"
+                  @click.stop="onDeleteBuild(build)"
+                >{{ deletingId === build.id ? '删除中…' : '删除' }}</span>
               </div>
             </template>
           </template>
@@ -486,6 +547,16 @@ function showChanges(): void {
 .build-row__time {
   color: var(--text-3);
   font-size: 13px;
+}
+.build-row__stop {
+  margin-left: auto;
+  color: var(--danger, #dc2626);
+  font-size: 12.5px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.build-row__stop:hover {
+  text-decoration: underline;
 }
 .related {
   list-style: none;

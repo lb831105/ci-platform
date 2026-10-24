@@ -32,4 +32,14 @@ export const buildApi = {
   republish(pipelineId: string, buildId: string, serverId?: string): Promise<void> {
     return http.post(`/pipelines/${pipelineId}/builds/${buildId}/republish`, { server_id: serverId ?? '' })
   },
+
+  // 取消运行中/等待中的构建（对齐 Jenkins Stop Build）。
+  cancel(pipelineId: string, buildId: string): Promise<null> {
+    return http.post(`/pipelines/${pipelineId}/builds/${buildId}/cancel`)
+  },
+
+  // 删除构建：连同 data/jobs/{pid}/builds/{bid} 目录（日志 + 产物）一起删除。
+  remove(pipelineId: string, buildId: string): Promise<null> {
+    return http.del<null>(`/pipelines/${pipelineId}/builds/${buildId}`)
+  },
 }

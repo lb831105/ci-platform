@@ -1,10 +1,14 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { JOB_TYPES, findJobType } from '@/types/jobType'
+import { usePipeline } from '@/composables/usePipeline'
+import { usePipelineStore } from '@/stores/pipelineStore'
+import type { Pipeline } from '@/types/pipeline'
 
 const route = useRoute()
 const router = useRouter()
+const { fetchList } = usePipeline()
 
 const name = ref(typeof route.query.name === 'string' ? route.query.name : '')
 const selected = ref(
@@ -14,9 +18,38 @@ const selected = ref(
 )
 const errorText = ref('')
 
+// 任务模板：从现有任务复制配置（对齐 Jenkins New Item 的 Copy from）。
+// 选择源任务后忽略任务类型（配置整体来自源任务），进入配置页后仍可修改。
+const copyFrom = ref('')
+const pipelines = ref<Pipeline[]>([])
+const pipelinesLoading = ref(false)
+
+onMounted(async () => {
+  // 加载任务列表供 Copy from 选择；失败不影响手动创建流程。
+  pipelinesLoading.value = true
+  try {
+    await fetchList()
+    // fetchList 已写入 pipelineStore，这里只做快照供下拉使用。
+    pipelines.value = [...usePipelineStore().items]
+  } catch {
+    // 列表加载失败仅导致 Copy from 为空，不阻塞新建。
+  } finally {
+    pipelinesLoading.value = false
+  }
+})
+
 function onConfirm(): void {
   if (!name.value.trim()) {
     errorText.value = '请输入任务名称'
+    return
+  }
+  errorText.value = ''
+  // 模板模式：整体复制源任务配置，任务类型由源任务决定。
+  if (copyFrom.value) {
+    void router.push({
+      name: 'pipeline-create-config',
+      query: { name: name.value.trim(), copy: copyFrom.value },
+    })
     return
   }
   const type = JOB_TYPES.find((item) => item.id === selected.value && item.enabled)
@@ -24,7 +57,6 @@ function onConfirm(): void {
     errorText.value = '请选择一个受支持的任务类型'
     return
   }
-  errorText.value = ''
   void router.push({
     name: 'pipeline-create-config',
     query: { name: name.value.trim(), type: type.id },
@@ -66,6 +98,27 @@ function select(typeId: string, enabled: boolean): void {
         <div class="new-item__hint">任务名称用于列表展示与目录名生成，创建后仍可修改。</div>
       </div>
 
+      <div class="new-item__field">
+        <label class="new-item__label" for="job-copy-from">Copy from（可选）</label>
+        <el-select
+          id="job-copy-from"
+          v-model="copyFrom"
+          class="new-item__input"
+          clearable
+          filterable
+          :loading="pipelinesLoading"
+          placeholder="从现有任务复制配置（选择后忽略任务类型）"
+        >
+          <el-option
+            v-for="p in pipelines"
+            :key="p.id"
+            :label="p.name"
+            :value="p.id"
+          />
+        </el-select>
+        <div class="new-item__hint">选择后，新任务将复制该任务的全部配置（步骤、Git、发布、产物等），名称使用上方输入。</div>
+      </div>
+
       <el-alert
         v-if="errorText"
         type="error"
@@ -75,7 +128,7 @@ function select(typeId: string, enabled: boolean): void {
         style="margin: 6px 0 14px"
       />
 
-      <div class="new-item__types">
+      <div class="new-item__types" :class="{ 'new-item__types--dimmed': !!copyFrom }">
         <div class="new-item__types-title">选择任务类型</div>
         <ul class="type-list">
           <li
@@ -150,6 +203,10 @@ function select(typeId: string, enabled: boolean): void {
 }
 .new-item__types {
   margin-top: 20px;
+}
+.new-item__types--dimmed {
+  opacity: 0.45;
+  pointer-events: none;
 }
 .new-item__types-title {
   font-size: 14px;

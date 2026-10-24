@@ -287,3 +287,83 @@ func TestMigrateArtifactConfig(t *testing.T) {
 		t.Fatalf("second migration = %d, %v; want 0, nil", again, err)
 	}
 }
+
+// 通知配置校验：未知渠道 / 非法邮箱 / 非 http URL 被拒；重复项被去重。
+func TestNormalizeNotify(t *testing.T) {
+	if err := normalizeNotify(nil); err != nil {
+		t.Fatalf("nil notify should be ok: %v", err)
+	}
+	bad := &model.JobNotify{Targets: []model.NotifyTarget{{Channel: "teams", URL: "https://x"}}}
+	if err := normalizeNotify(bad); err == nil {
+		t.Fatal("unknown channel should fail")
+	}
+	badMail := &model.JobNotify{Emails: []string{"not-an-email"}}
+	if err := normalizeNotify(badMail); err == nil {
+		t.Fatal("invalid email should fail")
+	}
+	badURL := &model.JobNotify{Targets: []model.NotifyTarget{{Channel: "dingtalk", URL: "ftp://x"}}}
+	if err := normalizeNotify(badURL); err == nil {
+		t.Fatal("non-http url should fail")
+	}
+	// 去重 + 渠道归一
+	n := &model.JobNotify{
+		People: []string{"dev1", " dev1 ", "dev2"},
+		Emails: []string{"a@x.com", "A@X.COM", " b@x.com "},
+		Targets: []model.NotifyTarget{
+			{Channel: "wechat", URL: "https://h/1?key=v"},
+			{Channel: "wecom", URL: "https://h/1?key=v"}, // 脱敏形态相同 → 去重
+			{Channel: "DingTalk", URL: "https://h/2"},
+		},
+	}
+	if err := normalizeNotify(n); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if len(n.People) != 2 || len(n.Emails) != 2 || len(n.Targets) != 2 {
+		t.Fatalf("dedupe failed: people=%v emails=%v targets=%v", n.People, n.Emails, n.Targets)
+	}
+	if n.Targets[0].Channel != "wecom" || n.Targets[1].Channel != "dingtalk" {
+		t.Fatalf("channel normalization failed: %+v", n.Targets)
+	}
+}
+
+// 保存时用旧配置回填被脱敏的群机器人 URL（保证密钥不被 *** 覆盖）。
+func TestMergeNotifyURLs(t *testing.T) {
+	old := &model.Pipeline{Notify: &model.JobNotify{Targets: []model.NotifyTarget{
+		{Channel: "dingtalk", URL: "https://oapi.dingtalk.com/robot/send?access_token=REAL"},
+		{Channel: "wecom", URL: "https://qyapi.weixin.qq.com/x?key=REALKEY"},
+	}}}
+	in := &model.Pipeline{Notify: &model.JobNotify{Targets: []model.NotifyTarget{
+		{Channel: "dingtalk", URL: "https://oapi.dingtalk.com/robot/send?access_token=***"},
+		{Channel: "wecom", URL: "https://qyapi.weixin.qq.com/x?key=NEWKEY"},
+	}}}
+	mergeNotifyURLs(old, in)
+	if in.Notify.Targets[0].URL != "https://oapi.dingtalk.com/robot/send?access_token=REAL" {
+		t.Fatalf("masked url not restored: %q", in.Notify.Targets[0].URL)
+	}
+	if in.Notify.Targets[1].URL != "https://qyapi.weixin.qq.com/x?key=NEWKEY" {
+		t.Fatalf("changed url should be kept: %q", in.Notify.Targets[1].URL)
+	}
+}
+
+// 渠道别名/大小写不影响脱敏 URL 回填（合并发生在渠道规范化之前）。
+func TestMergeNotifyURLsChannelAlias(t *testing.T) {
+	real := "https://qyapi.weixin.qq.com/x?key=REALKEY"
+	old := &model.Pipeline{Notify: &model.JobNotify{Targets: []model.NotifyTarget{
+		{Channel: "wecom", URL: real},
+	}}}
+	in := &model.Pipeline{Notify: &model.JobNotify{Targets: []model.NotifyTarget{
+		{Channel: "WeChat", URL: "https://qyapi.weixin.qq.com/x?key=***"},
+	}}}
+	mergeNotifyURLs(old, in)
+	if in.Notify.Targets[0].URL != real {
+		t.Fatalf("alias channel lost secret: %q", in.Notify.Targets[0].URL)
+	}
+	// Slack：path 尾段脱敏也能回填
+	slackReal := "https://hooks.slack.com/services/T/B/SECRET"
+	old2 := &model.Pipeline{Notify: &model.JobNotify{Targets: []model.NotifyTarget{{Channel: "slack", URL: slackReal}}}}
+	in2 := &model.Pipeline{Notify: &model.JobNotify{Targets: []model.NotifyTarget{{Channel: "", URL: "https://hooks.slack.com/services/T/B/***"}}}}
+	mergeNotifyURLs(old2, in2)
+	if in2.Notify.Targets[0].URL != slackReal {
+		t.Fatalf("slack masked url not restored: %q", in2.Notify.Targets[0].URL)
+	}
+}

@@ -86,6 +86,16 @@ type EmailSettings struct {
 	SubjectTemplate string `json:"subject_template"`
 }
 
+// WebhookNotifySettings 构建结果 Webhook 通知（钉钉 / 企业微信 / Slack 机器人）。
+// URL 含 access_token 等密钥：读取时脱敏、日志永不打印。
+type WebhookNotifySettings struct {
+	Enabled         bool   `json:"enabled"`
+	Channel         string `json:"channel"` // dingtalk | wecom | slack
+	URL             string `json:"url"`
+	NotifyOnFailure bool   `json:"notify_on_failure"`
+	NotifyOnSuccess bool   `json:"notify_on_success"`
+}
+
 // Settings 是可持久化的系统级配置（data/settings.json），对齐 Jenkins「系统配置」。
 // 启动参数 / 环境变量提供初始默认值，此后以文件为准。
 type Settings struct {
@@ -110,6 +120,11 @@ type Settings struct {
 	// 产物归档保护：避免一次构建把磁盘写满。
 	ArtifactMaxTotalMB int `json:"artifact_max_total_mb"`
 	ArtifactMaxFiles   int `json:"artifact_max_files"`
+	// 构建日志单次上限（MB）：超长日志拖慢读取与前端渲染，超过后截断。0 = 不限制。
+	LogMaxMB int `json:"log_max_mb"`
+
+	// 构建结果 Webhook 通知（钉钉 / 企业微信 / Slack）。
+	WebhookNotify WebhookNotifySettings `json:"webhook_notify"`
 
 	// 全局属性
 	GlobalEnv    []EnvVar `json:"global_env"`

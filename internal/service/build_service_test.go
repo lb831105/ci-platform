@@ -75,8 +75,16 @@ func TestResolveSshConfig(t *testing.T) {
 
 	override := &model.SshPublishConfig{Enabled: true, ServerID: "s1", RemoteBaseDir: "/custom"}
 	got, err = resolveSshConfig(override, settings)
-	if err != nil || got.RemoteBaseDir != "/custom" {
-		t.Fatalf("task remote dir override not applied: %+v, %v", got, err)
+	// 对齐 Jenkins Publish Over SSH：任务级目录相对服务器默认目录拼接。
+	if err != nil || got.RemoteBaseDir != "/srv/app/custom" {
+		t.Fatalf("task remote dir should be joined with server default: %+v, %v", got, err)
+	}
+
+	// 相对目录同样拼接。
+	relative := &model.SshPublishConfig{Enabled: true, ServerID: "s1", RemoteBaseDir: "gomysqldump"}
+	got, err = resolveSshConfig(relative, settings)
+	if err != nil || got.RemoteBaseDir != "/srv/app/gomysqldump" {
+		t.Fatalf("relative remote dir should be joined: %+v, %v", got, err)
 	}
 
 	if _, err = resolveSshConfig(&model.SshPublishConfig{ServerID: "missing"}, settings); err == nil {

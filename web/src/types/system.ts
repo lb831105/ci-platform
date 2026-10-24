@@ -41,6 +41,14 @@ export interface EnvVar {
   value: string
 }
 
+export interface WebhookNotifySettings {
+  enabled: boolean
+  channel: string // dingtalk | wecom | slack
+  url: string
+  notify_on_failure: boolean
+  notify_on_success: boolean
+}
+
 export interface EmailSettings {
   enabled: boolean
   smtp_host: string
@@ -71,6 +79,7 @@ export interface Settings {
   build_retention_max_age_days: number
   artifact_max_total_mb: number
   artifact_max_files: number
+  log_max_mb: number
   global_env: EnvVar[]
   git_user_name: string
   git_user_email: string
@@ -78,6 +87,7 @@ export interface Settings {
   ssh_servers: SshServer[]
   maven: MavenSettings
   email: EmailSettings
+  webhook_notify: WebhookNotifySettings
   quiet_mode: boolean
   auth_enabled: boolean
   auth_user: string
@@ -180,4 +190,40 @@ export interface CredentialPayload {
   username: string
   description: string
   secret: string
+}
+
+// 操作审计日志条目（与 Go model.AuditEntry 对齐）。
+export interface AuditEntry {
+  id: number
+  time: string
+  user: string
+  action: string
+  target: string
+  status: number
+  ip: string
+}
+
+// 通知投递记录（与 Go model.NotifyRecord 对齐）：按收件人/群粒度落盘。
+export interface NotifyRecord {
+  id: number
+  time: string
+  pipeline_id: string
+  pipeline_name: string
+  build_id: string
+  event: string
+  channel: string
+  recipient: string
+  status: 'sent' | 'failed' | 'suppressed'
+  error?: string
+  streak?: number
+  escalated?: boolean
+  on_call?: string
+  branch?: string
+}
+
+export interface NotifyHistoryQuery {
+  limit?: number
+  pipeline?: string
+  recipient?: string
+  status?: string
 }

@@ -34,7 +34,9 @@ const sections: ManageSection[] = [
     entries: [
       { title: '全局安全配置', desc: '开启或关闭登录校验，定义谁可以访问系统', route: 'system-security' },
       { title: '凭据管理', desc: '配置用户名密码、密钥与 SSH 私钥', route: 'system-credentials' },
-      { title: '管理用户', desc: '查看当前管理员账号，修改登录密码', route: 'system-security' },
+      { title: '用户管理', desc: '新建/删除用户、重置密码、维护通知联系方式', route: 'system-users' },
+      { title: 'Manage and Assign Roles', desc: '定义全局/任务角色并授权给用户（角色决定每个任务可用的功能）', route: 'system-roles-manage' },
+      { title: 'Assign Roles', desc: '把用户/组授权到全局角色与任务角色', route: 'system-roles-assign' },
     ],
   },
   {
@@ -42,6 +44,8 @@ const sections: ManageSection[] = [
     entries: [
       { title: '系统信息', desc: '显示系统环境与运行时信息以帮助解决问题', route: 'system-info' },
       { title: '系统日志', desc: '查看平台最近输出的运行日志', route: 'system-log' },
+      { title: '操作日志', desc: '谁在何时做了什么：登录、构建触发、任务与配置变更', route: 'system-audit' },
+      { title: '通知记录', desc: '每次告警的投递结果：谁收到了、谁失败了、哪些被合并', route: 'system-notify-history' },
       { title: '负载统计', desc: '检查构建、队列与磁盘资源利用情况', route: 'system-load' },
       { title: '关于', desc: '查看版本、构建信息与证书说明', route: 'system-about' },
     ],

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import BuildStatusTag from '@/components/BuildStatusTag.vue'
 import LogTerminal from '@/components/LogTerminal.vue'
 import { buildApi } from '@/api/build'
@@ -9,6 +9,7 @@ import { pipelineApi } from '@/api/pipeline'
 import { describeError } from '@/api/request'
 import { useBuildLog } from '@/composables/useBuildLog'
 import { usePolling } from '@/composables/usePolling'
+import { useAuthStore } from '@/stores/authStore'
 import { useSettingsStore } from '@/stores/settingsStore'
 import type { ArtifactFile } from '@/types/build'
 import type { Pipeline } from '@/types/pipeline'
@@ -19,6 +20,46 @@ const props = defineProps<{ pipelineId: string; buildId: string }>()
 const router = useRouter()
 const log = useBuildLog(props.pipelineId, props.buildId)
 const settingsStore = useSettingsStore()
+const authStore = useAuthStore()
+
+// 手动取消运行中/等待中的构建（对齐 Jenkins Stop Build）。
+const cancelling = ref(false)
+async function onCancel(): Promise<void> {
+  cancelling.value = true
+  try {
+    await buildApi.cancel(props.pipelineId, props.buildId)
+    ElMessage.success('已发送取消请求')
+    await log.refreshStatus()
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    cancelling.value = false
+  }
+}
+
+// 删除本次构建（含 data/jobs/{pid}/builds/{bid} 目录），删除后回到构建历史。
+const deleting = ref(false)
+async function onDeleteBuild(): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `删除构建 #${props.buildId} 会连同日志与已归档产物一起删除，且不可恢复。确认删除？`,
+      '删除构建',
+      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  deleting.value = true
+  try {
+    await buildApi.remove(props.pipelineId, props.buildId)
+    ElMessage.success(`构建 #${props.buildId} 已删除`)
+    goHistory()
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    deleting.value = false
+  }
+}
 
 // 构建成功后归档的产物（data/jobs/{pid}/builds/{bid}/artifacts/）。
 const artifacts = ref<ArtifactFile[]>([])
@@ -177,6 +218,20 @@ async function submitRepublish(): Promise<void> {
       <div class="build-log__actions">
         <BuildStatusTag :status="log.status.value" />
         <el-tag :type="connectionType" effect="plain" disable-transitions>{{ connectionText }}</el-tag>
+        <el-button
+          v-if="!log.finished.value && authStore.hasPerm('job.build')"
+          type="danger"
+          plain
+          :loading="cancelling"
+          @click="onCancel"
+        >停止构建</el-button>
+        <el-button
+          v-if="log.finished.value && authStore.hasPerm('job.delete')"
+          type="danger"
+          plain
+          :loading="deleting"
+          @click="onDeleteBuild"
+        >删除构建</el-button>
         <el-button @click="goHistory">构建历史</el-button>
         <el-button @click="goList">返回列表</el-button>
       </div>
@@ -204,7 +259,7 @@ async function submitRepublish(): Promise<void> {
           </div>
           <div class="artifact-card__buttons">
             <el-button size="small" @click="downloadAll">下载全部（ZIP）</el-button>
-            <el-button v-if="canRepublish" size="small" type="primary" plain @click="openRepublish">
+            <el-button v-if="canRepublish && authStore.hasPerm('job.replay')" size="small" type="primary" plain @click="openRepublish">
               重新发布
             </el-button>
           </div>

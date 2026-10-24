@@ -20,6 +20,12 @@ type session struct {
 	expiresAt time.Time
 }
 
+// UserVerifier 校验平台内管理的用户（由 RBACService 实现），
+// 登录时在管理员凭据不匹配后回退调用。
+type UserVerifier interface {
+	VerifyLogin(name, password string) bool
+}
+
 // AuthService 负责管理员凭据校验与会话签发/校验。
 // 凭据与开关可在运行时通过「全局安全配置」修改。
 type AuthService struct {
@@ -29,6 +35,7 @@ type AuthService struct {
 	enabled      bool
 	user         string
 	passwordHash string // bcrypt hash；绝不保存明文
+	userVerifier UserVerifier
 	sessions     map[string]session
 }
 
@@ -83,6 +90,31 @@ func normalizePasswordHash(value string) (string, error) {
 		return "", err
 	}
 	return string(hash), nil
+}
+
+// SetUserVerifier 注入平台内用户校验（多用户登录）。
+func (a *AuthService) SetUserVerifier(v UserVerifier) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.userVerifier = v
+}
+
+// AdminUser 返回系统管理员用户名（RBAC 据此保证管理员始终 Administer）。
+func (a *AuthService) AdminUser() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.user
+}
+
+// RevokeUserSessions 撤销指定用户的全部会话（删除用户/重置密码后调用）。
+func (a *AuthService) RevokeUserSessions(username string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for token, s := range a.sessions {
+		if s.username == username {
+			delete(a.sessions, token)
+		}
+	}
 }
 
 // Enabled 返回是否开启认证。
@@ -165,7 +197,13 @@ func (a *AuthService) Login(username, password string) (string, string, time.Tim
 		return "anonymous", "anonymous", expiresAt, nil
 	}
 	ok := a.credentialsMatchLocked(username, password)
-	user := a.user
+	if !ok {
+		// 管理员凭据不匹配时回退到平台内用户（Manage and Assign Roles 中创建）。
+		if a.userVerifier != nil {
+			ok = a.userVerifier.VerifyLogin(username, password)
+		}
+	}
+	user := username
 	if !ok {
 		a.mu.Unlock()
 		return "", "", time.Time{}, pkg.NewError(pkg.CodeUnauthorized, "用户名或密码错误")

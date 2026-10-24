@@ -1,0 +1,1 @@
+const t=[{id:"status",title:"状态"},{id:"weather",title:"气象"},{id:"name",title:"名称"},{id:"lastSuccess",title:"上次成功"},{id:"lastFailure",title:"上次失败"},{id:"lastDuration",title:"上次花费时间"},{id:"buildButton",title:"构建按钮"}],i=[{value:"list",title:"列表视图",desc:"显示简单列表。你可以从中选择任务来显示在某个视图中"},{value:"my",title:"我的视图",desc:"该视图自动显示当前用户有权限访问的任务"}];export{i as V,t as a};

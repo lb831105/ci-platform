@@ -41,17 +41,21 @@ type Step struct {
 
 // Pipeline 对应 Jenkins Job，持久化为 data/jobs/{id}/config.json。
 type Pipeline struct {
-	ID            string            `json:"id"`
-	Name          string            `json:"name"`
-	Description   string            `json:"description"`
-	Image         string            `json:"image"`
-	Steps         []Step            `json:"steps"`
-	GitURL        string            `json:"git_url"`
-	GitBranch     string            `json:"git_branch"`
-	GitCredential string            `json:"git_credential_id"` // 引用的凭据 ID（账号密码 / 令牌）
-	WebhookSecret string            `json:"webhook_secret"`
-	SshPublish    *SshPublishConfig `json:"ssh_publish,omitempty"`
-	Artifacts     ArtifactConfig    `json:"artifacts"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Description   string `json:"description"`
+	Image         string `json:"image"`
+	Steps         []Step `json:"steps"`
+	GitURL        string `json:"git_url"`
+	GitBranch     string `json:"git_branch"`
+	GitCredential string `json:"git_credential_id"` // 引用的凭据 ID（账号密码 / 令牌）
+	WebhookSecret string `json:"webhook_secret"`
+
+	// 定时构建（对齐 Jenkins Build periodically）：5 字段 cron 规格，
+	// 支持 H 散列均衡；为空表示不定时触发。
+	CronSpec   string            `json:"cron_spec,omitempty"`
+	SshPublish *SshPublishConfig `json:"ssh_publish,omitempty"`
+	Artifacts  ArtifactConfig    `json:"artifacts"`
 
 	// 丢弃旧的构建（per-job 覆盖全局 Build Discarders）。
 	BuildRetentionMaxPerJob  int `json:"build_retention_max_per_job"`
@@ -62,6 +66,10 @@ type Pipeline struct {
 
 	// 执行方式：已统一为 local（服务器本地执行）。字段保留仅为兼容旧数据。
 	Executor string `json:"executor,omitempty"`
+
+	// 通知：把该任务与人员（用户名，解析邮箱/企微 ID）或群机器人绑定。
+	// 为 nil 时沿用「系统配置 → 邮件通知 / Webhook 通知」的全局设置。
+	Notify *JobNotify `json:"notify,omitempty"`
 
 	// WorkspaceDir 是 data/workspace 下的目录名，默认由任务名生成。
 	// 单独存储以支持重命名、重名后缀与旧数据迁移。

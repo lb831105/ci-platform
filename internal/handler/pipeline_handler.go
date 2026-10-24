@@ -25,10 +25,45 @@ func NewPipelineHandler(pipelines *service.PipelineService, builds *service.Buil
 // sanitizePipeline 清除对外响应中的敏感字段（SSH 发布密码）。
 // 密码只用于构建时连接目标机，任何读取接口（列表/详情/概览）都不得回显。
 func sanitizePipeline(p *model.Pipeline) *model.Pipeline {
-	if p != nil && p.SshPublish != nil {
+	if p == nil {
+		return p
+	}
+	if p.SshPublish != nil {
 		p.SshPublish.Password = ""
 	}
+	// 任务级通知的群机器人 URL 含 access_token（Slack 还在 path 尾段）：
+	// 返回时按渠道脱敏（保留结构，值置 ***）。
+	// 升级群与分支路由的群同样含密钥，必须一并脱敏，否则等于把 token 直接吐给前端。
+	// 这里整体拷贝一层，避免脱敏结果反写进共享的 Pipeline 对象（通知发送仍需真实 URL）。
+	if p.Notify != nil {
+		n := *p.Notify
+		n.Targets = maskNotifyTargets(p.Notify.Targets)
+		if p.Notify.Escalation != nil {
+			esc := *p.Notify.Escalation
+			esc.Targets = maskNotifyTargets(p.Notify.Escalation.Targets)
+			n.Escalation = &esc
+		}
+		if len(p.Notify.Routes) > 0 {
+			routes := make([]model.NotifyRoute, len(p.Notify.Routes))
+			copy(routes, p.Notify.Routes)
+			for i := range routes {
+				routes[i].Targets = maskNotifyTargets(routes[i].Targets)
+			}
+			n.Routes = routes
+		}
+		p.Notify = &n
+	}
 	return p
+}
+
+// maskNotifyTargets 返回脱敏副本（不改动传入切片元素指向的原数据）。
+func maskNotifyTargets(in []model.NotifyTarget) []model.NotifyTarget {
+	out := make([]model.NotifyTarget, len(in))
+	copy(out, in)
+	for i := range out {
+		out[i].URL = pkg.MaskWebhookURL(out[i].Channel, out[i].URL)
+	}
+	return out
 }
 
 // List GET /api/pipelines

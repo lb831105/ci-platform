@@ -1,6 +1,6 @@
 import { http } from './request'
 import type { Build } from '@/types/build'
-import type { Pipeline, PipelinePayload } from '@/types/pipeline'
+import type { NotifyContact, NotifyTestResult, Pipeline, PipelinePayload } from '@/types/pipeline'
 import type { BuildListItem, PipelineSummary } from '@/types/summary'
 
 export const pipelineApi = {
@@ -40,5 +40,15 @@ export const pipelineApi = {
 
   rename(id: string, name: string): Promise<Pipeline> {
     return http.post<Pipeline>(`/pipelines/${id}/rename`, { name })
+  },
+
+  // 通知选人：平台用户及其联系方式（需任务配置权限）。
+  notifyContacts(): Promise<NotifyContact[]> {
+    return http.get<NotifyContact[]>('/notify/contacts')
+  },
+
+  // 向该任务当前配置的收件人/群发送测试通知。
+  testNotify(id: string): Promise<NotifyTestResult> {
+    return http.post<NotifyTestResult>(`/pipelines/${id}/notify/test`)
   },
 }

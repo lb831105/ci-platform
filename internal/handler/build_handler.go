@@ -54,6 +54,18 @@ func (h *BuildHandler) Log(w http.ResponseWriter, r *http.Request) {
 	pkg.OK(w, map[string]string{"log": text})
 }
 
+// Delete DELETE /api/pipelines/{pid}/builds/{bid}
+// 删除构建及其目录（包含日志与已归档产物）；运行中的构建拒绝删除。
+func (h *BuildHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	err := h.builds.DeleteBuild(r.Context(),
+		chi.URLParam(r, "pid"), chi.URLParam(r, "bid"))
+	if err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	pkg.OK(w, nil)
+}
+
 // Artifacts GET /api/pipelines/{pid}/builds/{bid}/artifacts 返回产物清单。
 func (h *BuildHandler) Artifacts(w http.ResponseWriter, r *http.Request) {
 	manifest, err := h.artifacts.Manifest(r.Context(), chi.URLParam(r, "pid"), chi.URLParam(r, "bid"))
@@ -124,6 +136,16 @@ func (h *BuildHandler) Republish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.builds.Republish(r.Context(), chi.URLParam(r, "pid"), chi.URLParam(r, "bid"), in.ServerID); err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	pkg.OK(w, nil)
+}
+
+// Cancel POST /api/pipelines/{pid}/builds/{bid}/cancel
+// 手动取消运行中/等待中的构建（对齐 Jenkins Stop Build）。
+func (h *BuildHandler) Cancel(w http.ResponseWriter, r *http.Request) {
+	if err := h.builds.Cancel(chi.URLParam(r, "pid"), chi.URLParam(r, "bid")); err != nil {
 		pkg.Fail(w, err)
 		return
 	}

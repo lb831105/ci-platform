@@ -4,6 +4,7 @@ import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import AppIcon from '@/components/AppIcon.vue'
 import JobStatusIcon from '@/components/JobStatusIcon.vue'
 import { useAuthStore } from '@/stores/authStore'
+import { useViewStore } from '@/stores/viewStore'
 import { useOverviewStore } from '@/stores/overviewStore'
 import { usePipelineStore } from '@/stores/pipelineStore'
 import { useSettingsStore } from '@/stores/settingsStore'
@@ -11,6 +12,7 @@ import { useSettingsStore } from '@/stores/settingsStore'
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
+const viewStore = useViewStore()
 const overview = useOverviewStore()
 const pipelineStore = usePipelineStore()
 const settings = useSettingsStore()
@@ -28,6 +30,7 @@ const jobs = computed(() => {
 
 const runningCount = computed(() => overview.items.filter((job) => job.running).length)
 const activePipelineId = computed(() => (typeof route.params.pipelineId === 'string' ? route.params.pipelineId : ''))
+const activeViewName = computed(() => (typeof route.params.viewName === 'string' ? route.params.viewName : ''))
 const initials = computed(() => (auth.username || 'admin').slice(0, 1).toUpperCase())
 
 const isSystemActive = computed(() => route.path.startsWith('/system'))
@@ -37,9 +40,16 @@ const isBuildsActive = computed(() => route.name === 'global-build-history')
 onMounted(() => {
   void overview.fetch()
   void settings.fetch()
+  if (auth.hasPerm('view.read')) {
+    void viewStore.fetch()
+  }
 })
 
 async function onUserCommand(command: string): Promise<void> {
+  if (command === 'profile') {
+    void router.push({ name: 'profile' })
+    return
+  }
   if (command !== 'logout') {
     return
   }
@@ -81,7 +91,11 @@ async function onUserCommand(command: string): Promise<void> {
           </div>
           <template #dropdown>
             <el-dropdown-menu>
-              <el-dropdown-item command="logout">
+              <el-dropdown-item command="profile">
+                <AppIcon name="user" :size="15" />
+                <span style="margin-left: 8px">个人资料</span>
+              </el-dropdown-item>
+              <el-dropdown-item command="logout" divided>
                 <AppIcon name="logout" :size="15" />
                 <span style="margin-left: 8px">退出登录</span>
               </el-dropdown-item>
@@ -94,19 +108,40 @@ async function onUserCommand(command: string): Promise<void> {
     <div class="layout__body">
       <aside v-show="!collapsed" class="sidebar">
         <nav class="sidebar__menu">
-          <RouterLink class="menu-item" :class="{ 'menu-item--active': isCreateActive }" :to="{ name: 'pipeline-create' }">
+          <RouterLink v-if="auth.hasPerm('job.create')" class="menu-item" :class="{ 'menu-item--active': isCreateActive }" :to="{ name: 'pipeline-create' }">
             <AppIcon name="plus" />
             <span>新建任务</span>
           </RouterLink>
-          <RouterLink class="menu-item" :class="{ 'menu-item--active': isSystemActive }" :to="{ name: 'system-config' }">
+          <RouterLink v-if="auth.hasPerm('system.read')" class="menu-item" :class="{ 'menu-item--active': isSystemActive }" :to="{ name: 'system-config' }">
             <AppIcon name="settings" />
             <span>系统管理</span>
           </RouterLink>
-          <RouterLink class="menu-item" :class="{ 'menu-item--active': isBuildsActive }" :to="{ name: 'global-build-history' }">
+          <RouterLink v-if="auth.hasPerm('overall.read')" class="menu-item" :class="{ 'menu-item--active': isBuildsActive }" :to="{ name: 'global-build-history' }">
             <AppIcon name="history" />
             <span>构建历史</span>
           </RouterLink>
         </nav>
+
+        <!-- 视图：给任务归类（列表视图 + 我的视图），对齐 Jenkins 侧边栏视图列表 -->
+        <div v-if="auth.hasPerm('view.read')" class="sidebar__views">
+          <div class="sidebar__sidebar-head sidebar__views-head">
+            <span class="sidebar__section-title"><AppIcon name="grid" :size="13" /> 视图</span>
+            <RouterLink v-if="auth.hasPerm('view.create')" class="sidebar__new-view" :to="{ name: 'view-create' }">+ 新建</RouterLink>
+          </div>
+          <ul class="job-list">
+            <li v-for="v in viewStore.items" :key="v.name">
+              <RouterLink
+                class="job-item"
+                :class="{ 'job-item--active': v.name === activeViewName }"
+                :to="{ name: 'view-page', params: { viewName: v.name } }"
+              >
+                <AppIcon name="cube" :size="15" />
+                <span class="job-item__name">{{ v.name }}</span>
+              </RouterLink>
+            </li>
+            <li v-if="viewStore.items.length === 0" class="sidebar__empty">还没有视图</li>
+          </ul>
+        </div>
 
         <div class="sidebar__jobs">
           <div class="sidebar__jobs-head">
@@ -386,6 +421,28 @@ async function onUserCommand(command: string): Promise<void> {
   padding: 8px 18px;
   color: var(--text-4);
   font-size: 12.5px;
+}
+.sidebar__views {
+  border-top: 1px solid var(--border-2, #eef2f7);
+  flex-shrink: 0;
+}
+.sidebar__views .job-list {
+  flex: none;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.sidebar__new-view {
+  display: block;
+  margin: 0 18px 14px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--text-3);
+  text-decoration: none;
+  font-size: 12.5px;
+}
+.sidebar__new-view:hover {
+  color: var(--brand-700);
+  background: var(--bg-hover);
 }
 
 .content {

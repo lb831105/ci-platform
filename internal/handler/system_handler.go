@@ -23,7 +23,8 @@ func NewSystemHandler(system *service.SystemService, auth *service.AuthService) 
 // settingsView 是系统配置的对外视图：绝不回传密码明文，只告知是否已设置。
 type settingsView struct {
 	model.Settings
-	HasPassword bool `json:"has_password"`
+	HasPassword   bool `json:"has_password"`
+	HasWebhookURL bool `json:"has_webhook_url"`
 }
 
 func toSettingsView(s model.Settings) settingsView {
@@ -42,7 +43,10 @@ func toSettingsView(s model.Settings) settingsView {
 		}
 		s.SshServers = servers
 	}
-	return settingsView{Settings: s, HasPassword: has}
+	// Webhook 通知 URL 含 access_token，同样不回传；has_webhook_url 告知是否已设置。
+	hasWebhook := s.WebhookNotify.URL != ""
+	s.WebhookNotify.URL = ""
+	return settingsView{Settings: s, HasPassword: has, HasWebhookURL: hasWebhook}
 }
 
 // Info GET /api/system/info
@@ -92,7 +96,8 @@ func (h *SystemHandler) Features(w http.ResponseWriter, r *http.Request) {
 // 避免前端把 GET 的响应原样回传时被 DisallowUnknownFields 拒绝。
 type settingsRequest struct {
 	model.Settings
-	HasPassword *bool `json:"has_password"`
+	HasPassword   *bool `json:"has_password"`
+	HasWebhookURL *bool `json:"has_webhook_url"`
 }
 
 // GetSettings GET /api/system/settings
@@ -160,6 +165,31 @@ func (h *SystemHandler) TestEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pkg.OK(w, nil)
+}
+
+// TestWebhookNotify POST /api/system/webhook/test
+func (h *SystemHandler) TestWebhookNotify(w http.ResponseWriter, r *http.Request) {
+	if err := h.system.SendTestWebhookNotify(); err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	pkg.OK(w, nil)
+}
+
+// Audit GET /api/system/audit?limit=200 — 操作审计日志（管理员）。
+func (h *SystemHandler) Audit(w http.ResponseWriter, r *http.Request) {
+	limit := 200
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+	entries, err := h.system.AuditEntries(limit)
+	if err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	pkg.OK(w, entries)
 }
 
 // GetDataHome GET /api/system/data-home

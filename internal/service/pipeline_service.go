@@ -51,6 +51,15 @@ func (s *PipelineService) Get(ctx context.Context, id string) (*model.Pipeline, 
 	return s.store.Get(ctx, id)
 }
 
+// JobName 返回任务名（供权限中间件做角色 Pattern 匹配）。
+func (s *PipelineService) JobName(ctx context.Context, id string) (string, error) {
+	p, err := s.store.Get(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	return p.Name, nil
+}
+
 // MigrateWorkspacePolicy 一次性把旧版本默认的“构建前清空工作区”改为复用。
 // 只处理带 Git 仓库的任务，避免升级后仍然每次重新 clone 源代码。
 func (s *PipelineService) MigrateWorkspacePolicy(ctx context.Context) (int, error) {
@@ -121,6 +130,7 @@ func (s *PipelineService) Update(ctx context.Context, id string, in *model.Pipel
 	// 先合并敏感字段再校验：编辑时前端不回显密码，需用旧值补齐，
 	// 否则 auth_type=password 的任务保存会被“密码必填”误拦截。
 	mergeSensitive(old, in)
+	mergeNotifyURLs(old, in)
 	if err = normalizeAndValidate(in, s.nameRegex()); err != nil {
 		return nil, err
 	}
@@ -141,10 +151,23 @@ func (s *PipelineService) Update(ctx context.Context, id string, in *model.Pipel
 	return in, nil
 }
 
-// Delete 删除 pipeline 及其全部构建记录（递归删目录）。
+// Delete 删除任务（连同其全部构建记录与工作区目录，递归删目录）。
+// 工作区目录一并删除，避免同名任务重建时残留旧构建产物；
+// 正在执行的构建会因工作区消失而失败（删除是罕见操作，可接受）。
 func (s *PipelineService) Delete(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	p, err := s.store.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	// 先删工作区目录（尽力而为；失败不阻塞任务删除）。
+	if s.workspace != nil {
+		ws := s.workspace.Path(Job{PipelineID: id, WorkspaceDir: p.WorkspaceDir})
+		if err := pkg.RemoveAll(ws); err != nil {
+			return pkg.ErrInternal("删除工作区目录失败: %v", err)
+		}
+	}
 	return s.store.Delete(ctx, id)
 }
 
@@ -342,6 +365,17 @@ func normalizeAndValidate(p *model.Pipeline, nameRegex string) error {
 	p.WebhookSecret = strings.TrimSpace(p.WebhookSecret)
 	// 平台已改为纯本地构建；executor/image 字段保留仅为兼容旧数据，不再参与调度。
 	p.Executor = model.ExecutorLocal
+	// 定时构建：保存前校验 cron 语法，避免任务保存成功但永不触发。
+	p.CronSpec = strings.TrimSpace(p.CronSpec)
+	if p.CronSpec != "" {
+		if _, err := NextCron(p.CronSpec, p.Name, time.Now()); err != nil {
+			return pkg.ErrBadRequest("定时构建规格非法: %v", err)
+		}
+	}
+	// 通知配置：校验渠道、邮箱与数量上限（防误配置导致漏告警或刷屏）。
+	if err := normalizeNotify(p.Notify); err != nil {
+		return err
+	}
 
 	if p.Name == "" {
 		return pkg.ErrBadRequest("name is required")
@@ -474,6 +508,272 @@ func validateSshPublish(c *model.SshPublishConfig) error {
 }
 
 // mergeSensitive 编辑时前端不回显敏感字段，为空则沿用旧值。
+// normalizeNotify 清洗并校验任务级通知配置：
+// 去重人员/邮箱、校验渠道合法性与邮箱格式、限制数量（防刷屏）。
+func normalizeNotify(n *model.JobNotify) error {
+	if n == nil {
+		return nil
+	}
+	people := dedupeNames(n.People)
+	if len(people) > 50 {
+		return pkg.ErrBadRequest("通知人员最多 50 人（当前 %d）", len(people))
+	}
+	n.People = people
+
+	emails, err := normalizeEmailList(n.Emails, "通知邮箱")
+	if err != nil {
+		return err
+	}
+	n.Emails = emails
+
+	targets, err := normalizeNotifyTargets(n.Targets, "群机器人")
+	if err != nil {
+		return err
+	}
+	n.Targets = targets
+
+	// ---- 值班轮值 ----
+	if n.OnCall != nil {
+		if err = normalizeOnCall(n.OnCall); err != nil {
+			return err
+		}
+	}
+
+	// ---- 升级策略 ----
+	if n.Escalation != nil {
+		if err = normalizeEscalation(n.Escalation); err != nil {
+			return err
+		}
+	}
+
+	// ---- 抑制窗口 ----
+	switch {
+	case n.SuppressWindowMin < 0:
+		return pkg.ErrBadRequest("抑制窗口不能为负数")
+	case n.SuppressWindowMin > 1440:
+		return pkg.ErrBadRequest("抑制窗口最多 1440 分钟（24 小时），当前 %d", n.SuppressWindowMin)
+	case n.SuppressWindowMin == 1:
+		// 1 分钟窗口几乎总在窗口内，等于永久静默；提示改用 0（关闭）或 >=2。
+		return pkg.ErrBadRequest("抑制窗口最小 2 分钟（1 分钟会几乎永久静默），0 表示关闭")
+	}
+
+	// ---- 分支路由 ----
+	routes := make([]model.NotifyRoute, 0, len(n.Routes))
+	for _, r := range n.Routes {
+		r.Match = strings.TrimSpace(r.Match)
+		r.People = dedupeNames(r.People)
+		emails, eerr := normalizeEmailList(r.Emails, "路由邮箱")
+		if eerr != nil {
+			return eerr
+		}
+		r.Emails = emails
+		rt, terr := normalizeNotifyTargets(r.Targets, "路由群机器人")
+		if terr != nil {
+			return terr
+		}
+		r.Targets = rt
+		if r.Match == "" && len(r.People) == 0 && len(r.Emails) == 0 && len(r.Targets) == 0 && !r.Committer && !r.OnCall {
+			continue // 空路由：忽略而不是报错（前端新增行后未填）
+		}
+		routes = append(routes, r)
+	}
+	if len(routes) > 20 {
+		return pkg.ErrBadRequest("分支路由最多 20 条（当前 %d）", len(routes))
+	}
+	n.Routes = routes
+
+	// ---- 消息模板 ----
+	n.Template = strings.TrimSpace(n.Template)
+	if len(n.Template) > 4000 {
+		return pkg.ErrBadRequest("消息模板最多 4000 字符（当前 %d）", len(n.Template))
+	}
+	return nil
+}
+
+// normalizeNotifyTargets 校验并去重群机器人：按「渠道 + 脱敏 URL」去重，
+// 避免同一条告警重复推送；渠道统一为 dingtalk / wecom / slack。
+func normalizeNotifyTargets(in []model.NotifyTarget, label string) ([]model.NotifyTarget, error) {
+	seen := map[string]bool{}
+	out := make([]model.NotifyTarget, 0, len(in))
+	for _, t := range in {
+		t.URL = strings.TrimSpace(t.URL)
+		if t.URL == "" {
+			continue
+		}
+		raw := t.Channel
+		t.Channel = normalizeNotifyChannel(raw)
+		switch t.Channel {
+		case "slack", "wecom", "dingtalk":
+		default:
+			return nil, pkg.ErrBadRequest("不支持的通知渠道 %q（可选 dingtalk / wecom / slack）", raw)
+		}
+		if !strings.HasPrefix(t.URL, "http://") && !strings.HasPrefix(t.URL, "https://") {
+			return nil, pkg.ErrBadRequest("%s URL 必须以 http:// 或 https:// 开头", label)
+		}
+		key := t.Channel + "|" + pkg.MaskWebhookURL(t.Channel, t.URL)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, t)
+	}
+	if len(out) > 20 {
+		return nil, pkg.ErrBadRequest("%s最多 20 个（当前 %d）", label, len(out))
+	}
+	return out, nil
+}
+
+// normalizeOnCall 校验值班轮值表：启用人必须非空，起始日期可解析，周期 1~90 天。
+func normalizeOnCall(c *model.OnCallConfig) error {
+	c.Rotation = dedupeNames(c.Rotation)
+	if len(c.Rotation) > 50 {
+		return pkg.ErrBadRequest("值班轮值最多 50 人（当前 %d）", len(c.Rotation))
+	}
+	if c.Enabled && len(c.Rotation) == 0 {
+		return pkg.ErrBadRequest("启用值班轮值需要至少填写 1 个值班人")
+	}
+	c.StartDate = strings.TrimSpace(c.StartDate)
+	if c.StartDate != "" {
+		if _, err := time.ParseInLocation("2006-01-02", c.StartDate, time.Local); err != nil {
+			return pkg.ErrBadRequest("值班起始日期格式应为 YYYY-MM-DD（收到 %q）", c.StartDate)
+		}
+	}
+	switch {
+	case c.PeriodDays == 0:
+		c.PeriodDays = 7
+	case c.PeriodDays < 1 || c.PeriodDays > 90:
+		return pkg.ErrBadRequest("每人值班天数应在 1~90 之间（当前 %d）", c.PeriodDays)
+	}
+	return nil
+}
+
+// normalizeEscalation 校验升级策略：启用时阈值 2~20、且至少要有一个升级目标。
+func normalizeEscalation(c *model.EscalationConfig) error {
+	c.People = dedupeNames(c.People)
+	emails, err := normalizeEmailList(c.Emails, "升级邮箱")
+	if err != nil {
+		return err
+	}
+	c.Emails = emails
+	targets, err := normalizeNotifyTargets(c.Targets, "升级群机器人")
+	if err != nil {
+		return err
+	}
+	c.Targets = targets
+	if !c.Enabled {
+		return nil
+	}
+	if c.After == 0 {
+		c.After = 3
+	}
+	if c.After < 2 || c.After > 20 {
+		return pkg.ErrBadRequest("升级阈值应在 2~20 次连续失败之间（当前 %d）", c.After)
+	}
+	if len(c.People) == 0 && len(c.Emails) == 0 && len(c.Targets) == 0 {
+		return pkg.ErrBadRequest("启用升级策略需要至少配置 1 个升级人员、邮箱或群机器人")
+	}
+	return nil
+}
+
+// dedupeNames 去重（忽略大小写）并裁剪空白，保持顺序。
+func dedupeNames(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, name := range in {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[strings.ToLower(name)] {
+			continue
+		}
+		seen[strings.ToLower(name)] = true
+		out = append(out, name)
+	}
+	return out
+}
+
+// normalizeEmailList 去重并校验邮箱格式（允许空列表）。
+func normalizeEmailList(in []string, label string) ([]string, error) {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, e := range in {
+		e = strings.TrimSpace(e)
+		if e == "" || seen[strings.ToLower(e)] {
+			continue
+		}
+		if !strings.Contains(e, "@") {
+			return nil, pkg.ErrBadRequest("%s %q 格式不正确", label, e)
+		}
+		seen[strings.ToLower(e)] = true
+		out = append(out, e)
+	}
+	if len(out) > 50 {
+		return nil, pkg.ErrBadRequest("%s最多 50 个（当前 %d）", label, len(out))
+	}
+	return out, nil
+}
+
+// mergeNotifyURLs 用旧配置回填任务级通知群机器人的真实 URL：
+// 接口返回时 URL 中的 access_token 等被脱敏为 ***，前端原样提交时
+// 需要还原，否则保存会把真实密钥覆盖成 ***。
+//
+// 匹配键 = 规范化渠道 + 脱敏形态。先规范化渠道（大小写/别名）再建索引：
+// 本函数在校验（normalizeNotify）之前执行，若用原始渠道字符串，
+// "WeChat"/""/"dingtalk " 等写法会造成键不一致，导致真实密钥被 *** 覆盖。
+func mergeNotifyURLs(old, in *model.Pipeline) {
+	if old.Notify == nil || in.Notify == nil {
+		return
+	}
+	// 按脱敏形态建立旧 URL 索引，避免同渠道多群时张冠李戴。
+	index := map[string]string{}
+	addIndex := func(targets []model.NotifyTarget) {
+		for _, t := range targets {
+			ch := normalizeNotifyChannel(t.Channel)
+			index[ch+"|"+pkg.MaskWebhookURL(ch, t.URL)] = t.URL
+		}
+	}
+	addIndex(old.Notify.Targets)
+	// 升级目标与分支路由的群同样会被脱敏返回，一并回填，
+	// 否则「打开配置直接保存」会把它们的 *** 存成真实地址。
+	if old.Notify.Escalation != nil {
+		addIndex(old.Notify.Escalation.Targets)
+	}
+	for _, r := range old.Notify.Routes {
+		addIndex(r.Targets)
+	}
+
+	restore := func(targets []model.NotifyTarget) {
+		for i := range targets {
+			t := &targets[i]
+			if !strings.Contains(t.URL, "***") {
+				continue
+			}
+			ch := normalizeNotifyChannel(t.Channel)
+			if real, ok := index[ch+"|"+t.URL]; ok {
+				t.URL = real
+			}
+		}
+	}
+	restore(in.Notify.Targets)
+	if in.Notify.Escalation != nil {
+		restore(in.Notify.Escalation.Targets)
+	}
+	for i := range in.Notify.Routes {
+		restore(in.Notify.Routes[i].Targets)
+	}
+}
+
+// normalizeNotifyChannel 统一渠道名：小写、常见别名归一、空值视为 slack。
+func normalizeNotifyChannel(channel string) string {
+	ch := strings.ToLower(strings.TrimSpace(channel))
+	switch ch {
+	case "", "slack":
+		return "slack"
+	case "wechat", "weixin", "qyweixin", "wecom":
+		return "wecom"
+	default:
+		return ch
+	}
+}
+
 func mergeSensitive(old, in *model.Pipeline) {
 	if old.SshPublish == nil || in.SshPublish == nil {
 		return

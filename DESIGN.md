@@ -14,11 +14,14 @@
 - 构建执行引擎（状态机、并发模型、本地步骤执行）
 - 日志子系统（双写、广播、背压、WebSocket 生命周期）
 - SSH 发布子系统
+- 定时构建（cron）、构建取消、构建与产物删除
+- 构建结果通知（项目 × 人员/群/事件、值班轮值、升级、抑制、分支路由、消息模板、投递记录）
+- 操作审计、多用户与角色授权、个人资料与邮箱验证
 - 前端架构（状态、轮询、重连）
 - 前端内嵌与单文件交付
 - 构建与发布流水线
 
-不在范围内：权限体系、多节点 agent、DAG 并行、定时触发、插件系统（见第 12 节非目标）。
+不在范围内：多节点 agent、DAG 并行、插件系统、multibranch / pipeline-as-code（见 §14）。
 
 ---
 
@@ -43,7 +46,7 @@
 ```mermaid
 flowchart TB
     subgraph L1["接口层"]
-        H1[handler<br/>pipeline / build / webhook / ws]
+        H1[handler<br/>pipeline / build / webhook / ws<br/>system / credential / rbac / view / notify / profile]
         MW[middleware<br/>RealIP / RequestID / SecurityHeaders / CORS / Recover / Logger]
         RT[router]
     end
@@ -51,14 +54,17 @@ flowchart TB
         S1[pipeline_service]
         S2[build_service]
         S3[scheduler]
+        S4[cron_trigger / notify / audit / rbac / view / profile]
     end
     subgraph L3["基础设施层"]
         ST1[pipeline_store]
         ST2[build_store]
+        ST3[settings / credential / rbac / view / audit / notify store]
         EX1[local_executor]
         EX2[ssh_publisher]
         EX3[git_client]
         EX4[log_streamer]
+        EX5[artifact_collector / webhook_notifier / checkout_info]
     end
     subgraph L4["领域层"]
         M1[model]
@@ -77,6 +83,8 @@ flowchart TB
     S2 --> EX3
     S2 --> EX4
     S3 --> S2
+    S4 --> ST3
+    S4 --> EX5
     ST1 --> M1
     ST2 --> M1
     EX1 --> M1
@@ -183,14 +191,26 @@ sequenceDiagram
 采用 **「目录名即 ID」** 的设计，对齐 `JENKINS_HOME/jobs/{jobname}/builds/{id}/`：
 
 ```
-data/jobs/{pipeline_id}/
-├── config.json
-└── builds/{build_id}/
-    ├── build.json
-    ├── log.txt
-    ├── artifacts.json          # 产物清单（路径 / 大小 / SHA-256）
-    └── artifacts/              # 每次构建独立保留的编译产物
+data/                                    # DATA_HOME
+├── settings.json                        # 系统配置（含邮件 / Webhook / SSH 服务器 / 工具 / 保留策略）
+├── rbac.json                            # 角色、授权与平台内用户（密码 bcrypt，联系方式 + 邮箱验证状态）
+├── views.json                           # 视图（列表视图 / 我的视图）
+├── audit.log                            # 操作审计（JSONL，16MB 轮转为 audit.log.1）
+├── notify.log                           # 通知投递记录（JSONL，16MB 轮转为 notify.log.1）
+├── credentials/{credential_id}.json     # 凭据（密钥不回传）
+├── jobs/{pipeline_id}/
+│   ├── config.json                      # Pipeline 定义（含 notify：人员/群/轮值/升级/抑制/路由/模板）
+│   ├── next_build                       # 下一个构建编号（单调递增，删除构建后不回退）
+│   └── builds/{build_id}/
+│       ├── build.json                   # 构建元数据（含分支/提交人，供分支路由与通知）
+│       ├── log.txt                      # 控制台输出（受 log_max_mb 截断保护）
+│       ├── artifacts.json               # 产物清单（路径 / 大小 / SHA-256）
+│       └── artifacts/                   # 每次构建独立保留的编译产物
+└── workspace/{workspace_dir}/           # 工作区（按任务名复用，默认不清空）
 ```
+
+删除粒度：删任务 → 整个 `jobs/{pipeline_id}/`；删单次构建 → 仅 `builds/{build_id}/`
+（日志 + 产物一起消失，见 §6.9）。
 
 **数据目录可迁移**：数据根目录默认 `./data`，可由引导配置 `ci-platform.json`（`-config` / `CI_CONFIG_FILE`）记录，
 也可用 `-data-home` / `CI_DATA_HOME` 覆盖（优先级更高）。系统配置页可修改该目录并把
@@ -234,6 +254,11 @@ pkg.WriteJSONAtomic(..., b)
 ```
 
 由于结果对外表现为「编号连续、单调递增、不重号」，语义与 Jenkins 的 `#1`、`#2` 一致。
+
+**编号不会因删除而回退**：仅在目录里取最大值 +1 时，删除最新的 `#5` 会让下一次构建又变成 `#5`，
+同一任务出现两个内容不同的 `#5`，历史、产物与通知都会对不上。因此每次分配编号都会把
+`jobs/{pipeline_id}/next_build` 写成「下一个编号」，读取时取 `max(目录最大值, next_build-1) + 1`。
+这与 Jenkins 的 `nextBuildNumber` 文件是同一思路（见 §6.9）。
 
 ### 5.5 一致性边界与故障恢复
 
@@ -348,7 +373,7 @@ jobs chan Job (容量 100)  +  N 个 worker goroutine（默认 3，CI_WORKERS �
   `SshPublisher.PublishArtifacts` 只上传不编译；要求任务/请求提供 `server_id`，远程目录为空或 `/` 直接拒绝。
 - 读取侧只允许下载 `artifacts.json` 清单中的相对路径，拒绝 `../`、绝对路径与符号链接。
 
-### 6.7 构建产物清理
+### 6.8 构建产物清理
 
 - **构建后清理**：每次构建结束后应用保留策略（任务级配置优先，否则回落全局
   Build Discarders：`build_retention_max_per_job` / `build_retention_max_age_days`），
@@ -360,7 +385,7 @@ jobs chan Job (容量 100)  +  N 个 worker goroutine（默认 3，CI_WORKERS �
 - **产物限制**：`artifact_max_total_mb` / `artifact_max_files` 超限时构建失败（防假绿）。
 - 启动时清理孤儿工作区（TTL 之外），删除任务时连工作区一并删除。
 
-### 6.7.1 手动删除单次构建
+### 6.9 手动删除单次构建
 
 - **接口**：`DELETE /api/pipelines/{pid}/builds/{bid}`，权限 `job.delete`（与删除任务同权限点）。
 - **删除范围**：整个构建目录 `data/jobs/{pid}/builds/{bid}`——`build.json`、`log.txt`、
@@ -375,7 +400,7 @@ jobs chan Job (容量 100)  +  N 个 worker goroutine（默认 3，CI_WORKERS �
 - **UI**：任务页构建历史每行「删除」（仅非运行态 + 有 `job.delete`）、构建日志页「删除构建」、
   全局构建历史行内「删除」，均二次确认并提示不可恢复。
 
-### 6.8 工作区生命周期
+### 6.10 工作区生命周期
 
 - 路径：`data/workspace/{workspace_dir}`，目录名默认取任务名（非法字符替换、重名追加 `-{id}`），重命名任务时同步移动；默认**不清空**，保留上次产物与依赖缓存。
 - 仅当任务显式设置 `delete_workspace_before_build=true` 时构建前删除整个工作区（会重新 clone）。
@@ -485,7 +510,7 @@ sequenceDiagram
 
 ---
 
-### 7.5 构建结果通知（项目 × 人员 / 群 × 事件）
+### 7.7 构建结果通知（项目 × 人员 / 群 × 事件）
 
 **痛点**：全局收件人只有一份，不同项目的告警会发给所有人（或配置了多个项目的团队互相干扰）。
 因此通知必须**按项目挂人/挂群**。
@@ -528,7 +553,7 @@ sequenceDiagram
 
 **全局测试**：「系统配置 → Webhook 通知 → 发送测试通知」→ `POST /api/system/webhook/test`（管理员）。
 
-#### 7.5.1 值班轮值、升级、抑制与分支路由
+#### 7.7.1 值班轮值、升级、抑制与分支路由
 
 四个运维能力都挂在任务级 `notify` 上（全局默认不启用，避免影响既有部署）：
 
@@ -553,7 +578,7 @@ sequenceDiagram
 保存时 `mergeNotifyURLs` 按「渠道 + 脱敏形态」索引一次性回填三处真实 URL。
 注意脱敏时要**整体拷贝** `notify` 结构体，避免把 `***` 反写进内存里正在用于发送的配置。
 
-#### 7.5.2 通知历史（谁漏收了告警）
+#### 7.7.2 通知历史（谁漏收了告警）
 
 - **落盘**：`data/notify.log`（JSONL，16MB 轮转），**按收件人/群粒度**一条记录：
   `{id, time, pipeline_id/name, build_id, event, channel, recipient, status, error, streak, escalated, on_call, branch}`。
@@ -564,6 +589,8 @@ sequenceDiagram
 - **查询**：`GET /api/system/notify?limit=&pipeline=&recipient=&status=`（`system.read`），
   过滤在服务层完成（先多取后截断，避免为组合加索引）。
 - **UI**：「系统管理 → 通知记录」，可按任务、收件人、状态过滤，直接筛出「某人没收到」。
+
+## 8. 审计、用户与个人资料
 
 ### 8.1 操作审计日志
 
@@ -592,6 +619,10 @@ sequenceDiagram
   数据源 `GET /api/security/users`（内置管理员 + 平台用户 + 联系方式 + 角色摘要，
   密码哈希不出服务层）。新建/删除/重置密码/联系方式都在这里，
   内置管理员（系统配置里的登录用户）标记 `builtin` 且只读，避免把自己锁在门外。
+- **授权**：角色/授权矩阵仍在「Manage and Assign Roles」页维护（全局角色 + 任务角色 Pattern）。
+  两页职责分离：用户管理 = 「谁是账号」，Assign Roles = 「账号能做什么」；
+  账号不再兼作授权入口，授权页只保留勾选与「去用户管理」入口。
+
 ### 8.3 个人资料与邮箱验证（用户自助）
 
 - **接口**：`GET /api/profile`、`PUT /api/profile/contact`、`POST /api/profile/email/verify`、
@@ -606,10 +637,6 @@ sequenceDiagram
   不发无效请求。发送失败会清掉本次验证码与限流额度（否则用户拿不到码还被限流）。
 - **为什么重要**：通知可靠性依赖邮箱正确，管理员逐个代填成本高且容易过期；自助 + 验证能把
   「邮箱写错」从「靠猜」变成「用户自己确认过」。
-
-- **授权**：角色/授权矩阵仍在「Manage and Assign Roles」页维护（全局角色 + 任务角色 Pattern）。
-  两页职责分离：用户管理 = 「谁是账号」，Assign Roles = 「账号能做什么」；
-  账号不再兼作授权入口，授权页只保留勾选与「去用户管理」入口。
 
 ## 9. SSH 发布子系统
 
@@ -647,7 +674,7 @@ sequenceDiagram
 
 ---
 
-## 9. 前端架构
+## 10. 前端架构
 
 ```
 view ──uses──> composable ──uses──> api / store
@@ -676,9 +703,9 @@ component：props 进、emit 出（不调 api、不写 store）
 
 ---
 
-## 10. 前端内嵌与单文件交付
+## 11. 前端内嵌与单文件交付
 
-### 10.1 为什么 `assets.go` 必须在项目根
+### 11.1 为什么 `assets.go` 必须在项目根
 
 Go 的 `//go:embed` 指令**只能嵌入当前包目录及其子目录**下的文件，路径中不允许出现 `..`。
 前端产物位于 `web/dist`，因此承载 embed 指令的包必须与 `web/` 同级 —— 即项目根目录。
@@ -691,7 +718,7 @@ var embeddedWeb embed.FS
 
 `all:` 前缀确保连以 `.` / `_` 开头的文件也一并纳入（默认会跳过）。
 
-### 10.2 用 `fs.FS` 抹平「内嵌 / 磁盘」差异
+### 11.2 用 `fs.FS` 抹平「内嵌 / 磁盘」差异
 
 ```go
 func Resolve(diskFallback string) (fs.FS, string) {
@@ -707,7 +734,7 @@ func Resolve(diskFallback string) (fs.FS, string) {
 - 开发/调试：把 `web/dist` 换掉即可，无需重新编译后端（显示 `disk:./web/dist`）。
 - 资源缺失：返回 503 + 明确的中文修复指引，而不是 404 空白页。
 
-### 10.3 SPA 深链回退
+### 11.3 SPA 深链回退
 
 ```
 请求路径 → 去掉前导 / → path.Clean → 拒绝 .. 与 "." → fs.Stat 存在？→ FileServer 直出
@@ -717,7 +744,7 @@ func Resolve(diskFallback string) (fs.FS, string) {
 `path.Clean` + 前缀校验承担了路径穿越防护（`fs.FS` 本身也会拒绝非法路径，属双重保险）。
 因此 `/pipelines/123/builds/1` 这类 history 模式深链刷新不会 404。
 
-### 10.4 交付形态收益
+### 11.4 交付形态收益
 
 | 收益 | 说明 |
 |---|---|
@@ -727,7 +754,7 @@ func Resolve(diskFallback string) (fs.FS, string) {
 
 ---
 
-## 11. 构建与发布流水线
+## 12. 构建与发布流水线
 
 ```mermaid
 flowchart LR
@@ -768,7 +795,7 @@ flowchart LR
 
 ---
 
-## 12. 关键权衡记录
+## 13. 关键权衡记录
 
 | 决策 | 选择 | 被放弃的方案 | 理由 |
 |---|---|---|---|
@@ -781,10 +808,20 @@ flowchart LR
 | 前端托管 | `go:embed` + `fs.FS` | 纯磁盘目录 | 单文件交付；`fs.FS` 让两种来源代码统一 |
 | 构建入口包位置 | 项目根 `assets.go` | 放进 `internal/` | `go:embed` 不能使用 `..`，必须与 `web/` 同级 |
 | 依赖版本 | `go mod tidy` 维护 | 手工钉版 | 已移除 Docker SDK，依赖面显著缩小 |
+| 构建编号 | `next_build` 标记 + 目录最大值 | 只取目录最大值 +1 | 删除最新构建后编号不回退，避免同号不同内容（对齐 Jenkins `nextBuildNumber`）|
+| 删除构建 | 整目录删除 + 幂等 | 软删除 / 只删元数据 | 目录即真相：删干净才不会留下「有记录无产物」或占用磁盘的孤儿 |
+| 抑制窗口 | 由构建历史推导（跨重启一致） | 进程内「上次通知时间」 | 无隐藏状态，重启/多实例行为一致；代价是多一次历史列表读取 |
+| 升级优先级 | 升级覆盖抑制 | 抑制优先 | 已连续失败 N 次还静默，升级就失去意义 |
+| 轮值基准 | 固定锚点 + 周期取模 | 以「今天」为第 0 天 | 后者会让轮值永远停在第一个人 |
+| 分支信息来源 | 读工作区 `.git`（go-git） | 解析 Webhook payload | 手动/定时/Webhook 三种触发统一；不依赖远端 payload 结构 |
+| 通知记录粒度 | 每个收件人一条 | 每次构建一条 | 才能回答「谁漏收了告警」，构建级只能回答「发过没」|
+| 邮箱必填 | 创建/改资料强制 | 允许为空 | 空邮箱等于「选了人却静默收不到」，属不可观测故障 |
+| 邮箱验证 | 6 位码 + 60s 限流 + 改邮箱失效 | 验证链接 | 无需额外路由与签名，且改地址后旧验证状态不会误用 |
+| 消息模板 | 单遍占位符替换 | `text/template` | 配置者只需排版，不需要控制流；未知占位符原样保留便于发现拼写错误 |
 
 ---
 
-## 13. 已知限制与演进方向
+## 14. 已知限制与演进方向
 
 ### 当前限制
 
@@ -795,13 +832,20 @@ flowchart LR
 | 步骤串行 | 无 DAG / 并行步骤 |
 | 前端大包 | Element Plus 全量引入，主 bundle 约 1MB（gzip 350KB），未做按需引入 |
 | 日志文件无轮转 | 单次构建日志有 `log_max_mb` 上限（默认 100MB，超限截断并标注）；系统日志为定长环形缓冲，超长日志不再无限增长 |
+| 通知只有单级升级 | `escalation` 是「连败 N 次 → 追加一组上级」，没有多级链路与升级确认/回执 |
+| 抑制不跨任务 | 抑制窗口按任务计算；同一批任务同时失败仍会各发一条（跨任务聚合需要额外的事件总线）|
+| 轮值只支持固定周期 | 按「每人 N 天」顺序轮转，不支持工作日/节假日日历、换班与代班 |
+| 分支路由依赖任务粒度 | 一个任务签出一个分支；多分支需要建多个任务（未引入 multibranch/pipeline-as-code）|
+| 邮箱验证依赖 SMTP | SMTP 未启用时无法发码；此时用户可保存邮箱（标「未验证」），但无法确认可达 |
 
 ### 演进方向（按性价比排序）
 
 1. **SSH 连接测试按钮** —— `known_hosts` 校验已支持，剩余为连接连通性检测。
 2. **Element Plus 按需引入**（`unplugin-vue-components`）—— 主 bundle 可降到约 30%。
 3. **日志按大小切割 + 保留最近 N 次构建** —— 已实现（`log_max_mb` 截断 + 保留策略定期扫描 `PruneAll`）。
-4. **多节点 agent** —— 需要引入注册与心跳机制，是当前架构最大的一次扩展。
+4. **通知多级升级与确认回执** —— 在现有 escalation 之上加「升级链 + 值班确认（ack）后停止升级」。
+5. **跨任务告警聚合** —— 同一时间窗内多任务失败合并为一条「本次发布 3 个任务失败」，需要按发布批次打标。
+6. **多节点 agent** —— 需要引入注册与心跳机制，是当前架构最大的一次扩展。
 
 ---
 
@@ -820,3 +864,13 @@ flowchart LR
 | **UPX 产物可运行** | 压缩后的 Windows 产物实测启动并完整提供 Web 界面 | ✅ |
 | 交叉编译格式 | 文件头校验：Linux `ELF`(`7f454c46`) / Windows `MZ`(`4d5a9000`) | ✅ |
 | 本地构建 | Go 编译可执行文件、javac + jar、npm 构建（Maven 使用同一执行路径） | ✅ |
+| 构建取消 | 单测 + e2e：运行中取消落 `aborted`（非 failed）、进程树被终止、排队期取消直接 aborted | ✅ |
+| 定时构建 | 8 个单测（解析 / `H` 散列 / 非法 / 并集 / 一年窗口）+ e2e `* * * * *` 30s 内触发、清空后不再触发 | ✅ |
+| 通知（项目 × 人员/群/事件）| 11 个单测 + e2e：事件过滤、按人员解析联系方式、群 @、脱敏与回填 | ✅ |
+| 值班 / 升级 / 抑制 / 路由 | 单测（轮值取模、glob、连败计数、抑制窗口、升级优先、提交者路由）+ e2e：3 次失败仅 1 条、连败 2 次起升级 | ✅ |
+| 通知历史 | 单测（过滤/ID 单调/轮转）+ e2e：`sent`/`suppressed` 记录与按收件人过滤 | ✅ |
+| 消息模板 | 单测：占位符替换、未知占位符保留；e2e：群消息渲染出连败与值班人 | ✅ |
+| 个人资料与邮箱验证 | e2e（迷你 SMTP）：发码 → 错误码 40000 → 正确码已验证 → 重复确认拒绝 → 改邮箱失效 → 60s 限流 42900 | ✅ |
+| 邮箱必填 | 单测 + e2e：无邮箱创建/改资料 40000；历史空邮箱启动告警 + 构建日志警告 | ✅ |
+| 删除单次构建 | 单测（目录/产物一并删除、其它构建保留、运行态拒绝、幂等、编号不回退）+ e2e | ✅ |
+| 操作审计 | 单测（中间件捕获业务码、JSONL 轮转、Tail 倒序）+ e2e：重启后 ID 单调 | ✅ |

@@ -205,11 +205,11 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | GET | `/api/pipelines/{pid}/builds/{bid}/artifacts.zip` | 下载全部产物 ZIP |
 | POST | `/api/pipelines/{pid}/builds/{bid}/republish` | 把该次构建的产物直接重新发布到 SSH（不重新编译） |
 | POST | `/api/pipelines/{pid}/builds/{bid}/cancel` | 取消运行中/等待中的构建（状态落 `aborted`） |
+| GET | `/api/views` | 视图列表（列表视图 / 我的视图） |
+| GET | `/api/views/{name}/jobs` | 视图内任务（按当前用户权限过滤） |
+| POST/PUT/DELETE | `/api/views` `/api/views/{name}` | 新建 / 编辑 / 删除视图（`data/views.json`） |
 | DELETE | `/api/pipelines/{pid}/builds/{bid}` | 删除单次构建（连 `builds/{bid}` 目录：日志 + 产物，权限 `job.delete`） |
-
-**任务配置扩展**：新建任务支持 **Copy from**（从现有任务复制全部配置，对齐 Jenkins New Item）；
-`cron_spec` 字段支持 5 字段 cron 定时构建（含 `H` 散列均衡），触发记录显示「定时触发」。
-| WS | `/ws/pipelines/{pid}/builds/{bid}/logs` | 实时日志流 |
+| WS | `/ws/pipelines/{pid}/builds/{bid}/logs` | 实时日志流（token 查询参数鉴权） |
 | GET/PUT | `/api/system/settings` | 系统配置读取 / 更新（含 `log_max_mb` 日志上限、保留策略定期扫描） |
 | POST | `/api/system/email/test` | 发送测试邮件（管理员） |
 | POST | `/api/system/webhook/test` | 发送 Webhook 测试通知（钉钉/企微/Slack，管理员） |
@@ -233,9 +233,10 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | GET | `/api/security/rbac` | 角色与授权数据（Manage and Assign Roles，仅 Administer） |
 | PUT | `/api/security/rbac/roles` | 替换全部角色（全局/任务角色 + 权限矩阵） |
 | PUT | `/api/security/rbac/assignments` | 替换全部授权（用户/组 → 角色） |
-| POST | `/api/security/users` | 创建平台内用户（bcrypt 落盘） |
-| POST | `/api/security/users/delete` | 删除用户（同时清理授权与会话） |
-| PUT | `/api/security/users/password` | 管理员重置用户密码 |
+
+**任务配置扩展**：新建任务支持 **Copy from**（从现有任务复制全部配置，对齐 Jenkins New Item）；
+`cron_spec` 字段支持 5 字段 cron 定时构建（含 `H` 散列均衡），触发记录显示「定时触发」；
+`notify` 支持人员/群/事件、值班轮值、升级、抑制窗口、分支路由与消息模板（详见 §十一）。
 
 ```bash
 # 手动触发
@@ -259,24 +260,31 @@ curl -X POST http://[IP]:8080/api/webhook/1703123456
 ```
 ci-platform.json                      # 引导配置：记录 DATA_HOME 位置（已 gitignore，可用 -config 改路径）
 data/                                  # DATA_HOME，运行时创建，已 gitignore
-├── settings.json                      # 系统配置（应用名 / 默认参数 / 认证 / 静默模式）
+├── settings.json                      # 系统配置（应用名 / 默认参数 / 认证 / 静默模式 / 邮件 / Webhook / SSH）
+├── rbac.json                          # 角色、授权与平台内用户（bcrypt、联系方式、邮箱验证状态）
+├── views.json                         # 视图（列表视图 / 我的视图）
+├── audit.log                          # 操作审计（JSONL；16MB 轮转为 audit.log.1）
+├── notify.log                         # 通知投递记录（JSONL；16MB 轮转为 notify.log.1）
 ├── credentials/
 │   └── {credential_id}.json           # 凭据（用户名密码 / 密钥 / SSH 私钥）
 ├── jobs/
 │   └── {pipeline_id}/                 # 目录名即 ID（时间戳字符串），无额外索引
-│       ├── config.json                # Pipeline 定义
+│       ├── config.json                # Pipeline 定义（含 notify：人员/群/轮值/升级/抑制/路由/模板）
+│       ├── next_build                 # 下一个构建编号（单调递增，删除构建后不回退）
 │       └── builds/
 │           └── {build_id}/            # 自增编号，对应 Jenkins #N
-│               ├── build.json         # 构建元数据
-│               ├── log.txt            # 控制台输出（构建步骤 + 归档 + SSH 合并写入）
+│               ├── build.json         # 构建元数据（含分支/提交人，供分支路由与通知）
+│               ├── log.txt            # 控制台输出（超 log_max_mb 截断并标注）
 │               ├── artifacts.json     # 产物清单（路径 / 大小 / SHA-256）
 │               └── artifacts/         # 每次构建独立保留的编译产物
 └── workspace/                         # 工作区，按任务名 {workspace_dir} 复用；仅已删除任务的孤儿目录超过 TTL 自动清理
 ```
 
 - **原子写入**：先写同目录临时文件 → `fsync` → `rename`，避免并发写坏文件。
-- **编号分配**：`CreateNext` 在锁内完成「扫描最大编号 + 1 → 创建目录」，避免并发触发撞号。
-- 删除 Pipeline 时递归删除整个 `data/jobs/{id}/`，构建记录随之清空。
+- **编号分配**：`CreateNext` 在锁内完成「取 `max(目录最大编号, next_build-1) + 1` → 创建目录」，
+  既避免并发触发撞号，也保证删除最新构建后编号不回退（对齐 Jenkins `nextBuildNumber`）。
+- **删除粒度**：删任务 → 递归删除整个 `data/jobs/{id}/`（构建记录随之清空）；
+  删单次构建 → 只删 `data/jobs/{id}/builds/{bid}/`（日志 + 产物），任务与其它构建保留。
 
 ---
 
@@ -290,7 +298,11 @@ data/                                  # DATA_HOME，运行时创建，已 gitig
 6. 命令 stdout/stderr **同时**写 `log.txt` 与广播 WebSocket。
 7. 全部成功后若 `artifacts.enabled=true`，按 glob 把产物复制到 `data/jobs/{pid}/builds/{bid}/artifacts/`，并写 `artifacts.json`。
 8. 然后若 `ssh_publish.enabled=true` 执行 SSH 发布；发布失败不影响已归档的产物。
-9. 结束写 `status` / `finished_at` / `exit_code`；工作区持续保留（产物如 `app` / `target/*.jar` / `dist/` 可用于后续 SSH 发布）。
+9. 签出成功后记录 SCM 现场（实际分支、短 SHA、提交人姓名/邮箱）到 `build.json`，供分支路由与「通知提交者」使用。
+10. 结束写 `status` / `finished_at` / `exit_code`（用户取消落 `aborted`，与代码失败的 `failed` 区分）；
+   工作区持续保留（产物如 `app` / `target/*.jar` / `dist/` 可用于后续 SSH 发布）。
+11. 按任务/全局通知配置发送结果通知（值班 @、连败升级、抑制合并、分支路由、消息模板），
+   投递结果按收件人写入 `data/notify.log`，并在构建日志写一行 `[notify] ...`。
 
 > 同一任务的构建由调度器**串行执行**（不同任务并行），避免并发写同一工作区；
 > **工作区目录使用任务名**：`workspace_dir` 由任务名生成（非法字符替换为 `_`，重名追加 `-{id}`），重命名任务会同步移动目录。
@@ -382,6 +394,15 @@ bash ./build.sh         # ✅ 双平台产物 + UPX 压缩
 | 交叉编译产物格式 | ✅ Linux `ELF` / Windows `MZ` |
 | Git 工作区复用 | ✅ 第二次构建不 clone；远端无更新时跳过 reset，有新提交时保留未跟踪产物与依赖缓存 |
 | 本地构建阶段 | ✅ Go 编译可执行文件、javac + jar 打包、`npm ci \|\| npm install` + `npm run build`；无需 Docker |
+| 构建取消 | ✅ 运行中取消落 `aborted`（与 failed 区分），Windows 进程树被 `taskkill /T` 终止，排队期取消直接 aborted |
+| 定时构建 | ✅ `* * * * *` 30s 内触发（`timer`）；清空 cron 后 75s 内不再触发；4 字段非法被拒绝 |
+| 通知（项目 × 人员/群/事件）| ✅ 事件过滤、按人员解析联系方式、群 @ 提醒、URL 脱敏与「脱敏回写」保留真实 token |
+| 值班 / 升级 / 抑制 / 分支路由 | ✅ 3 次快速失败仅发 1 条（后两条合并）；连败达阈值追加升级（升级优先于抑制）；feature/* 只通知提交者；模板渲染出连败与值班人 |
+| 通知记录 | ✅ 按收件人粒度落盘，可过滤 `sent` / `failed` / `suppressed`，失败带错误原因 |
+| 个人资料与邮箱验证 | ✅ 迷你 SMTP 实测：发码 → 错误码拒绝 → 正确码标记已验证 → 改邮箱失效 → 60s 限流 `42900` |
+| 邮箱必填 | ✅ 无邮箱创建/改资料 `40000`；历史空邮箱启动 WARN + 构建日志警告 |
+| 删除单次构建 | ✅ 目录（含产物）一并删除、其它构建保留、运行中 `40900`、重复删除幂等、编号不回退 |
+| 操作审计 | ✅ 变更类请求落 `data/audit.log`，重启后 ID 单调；与通知记录共用倒序读取实现 |
 
 ---
 
@@ -394,11 +415,14 @@ ci-platform/
 ├── cmd/server/main.go               # 只做装配 + 优雅退出
 ├── internal/
 │   ├── config/  router/  middleware/
-│   ├── handler/                     # pipeline / build / webhook / ws / auth / system / credential
-│   ├── service/                     # pipeline / build / scheduler / auth / settings / credential / system
-│   ├── store/                       # pipeline / build / settings / credential（替代 repository）
-│   ├── executor/                    # local_executor / ssh_publisher / git_client / log_streamer
-│   ├── model/  pkg/
+│   ├── handler/                     # pipeline / build / webhook / ws / auth / system / credential /
+│   │                                #   rbac / view / notify / profile
+│   ├── service/                     # pipeline / build / scheduler / cron(+trigger) / auth / settings /
+│   │                                #   credential / system / rbac / view / notify / audit / profile
+│   ├── store/                       # pipeline / build / settings / credential / rbac / view / audit / notify
+│   ├── executor/                    # local_executor / ssh_publisher / git_client / log_streamer /
+│   │                                #   artifact_collector / webhook_notifier / checkout_info
+│   ├── model/  pkg/                 # pkg: response / mask / limitedwriter / notifytemplate / ...
 ├── web/
 │   ├── src/                         # api / composables / stores / views / components / router / types / utils
 │   └── dist/                        # 前端产物（入库，保证 go build 可用；会被 go:embed 内嵌）
@@ -426,17 +450,20 @@ ci-platform/
 | 系统配置 | 节点和云管理 | 执行器数量、构建队列、工作区 |
 | 安全 | 全局安全配置 | 登录开关、管理员账号、修改密码 |
 | 安全 | 凭据管理 | 用户名密码 / 密钥文本 / SSH 私钥的增删改查（密钥不回传） |
-| 安全 | Manage and Assign Roles | 全局角色 + 任务角色（Pattern 匹配任务名、Template 模板继承）与用户/组授权；**权限真实生效**：未授权用户访问 API 返回 `code=40300`，前端隐藏对应入口 |
-| 安全 | Manage Roles / Assign Roles | 角色数据存 `data/rbac.json`（用户密码 bcrypt）；内置主体 `anonymous` / `authenticated`；代理/SCM/Metrics 列展示为禁用（平台不支持） |
+| 安全 | 用户管理 | 账号本身：新建（**邮箱必填**）/ 删除 / 重置密码（撤销会话）/ 联系方式；列表显示角色摘要与邮箱验证状态；内置管理员只读 |
+| 安全 | Manage and Assign Roles | 全局角色 + 任务角色（Pattern 匹配任务名、Template 模板继承）与用户/组授权；**权限真实生效**：未授权用户访问 API 返回 `code=40300`，前端隐藏对应入口；数据存 `data/rbac.json`，内置主体 `anonymous` / `authenticated`，代理/SCM/Metrics 列禁用（平台不支持） |
 | 视图 | 新建视图 / 编辑视图 | 列表视图（显式任务 + 任务名正则）与我的视图（自动显示当前用户有权限访问的任务）；数据存 `data/views.json`；展示列与 Widgets（过滤构建队列/执行器）可配置 |
 | 状态信息 | 系统信息 / 系统日志 / 负载统计 / 关于 | 运行时信息、内存环形日志、队列与磁盘占用、版本 |
+| 状态信息 | 操作日志 | 变更类操作审计（登录/登出/触发/增删改），数据存 `data/audit.log` |
+| 状态信息 | 通知记录 | 每次告警按收件人/群的投递结果（已送达/失败/已合并），数据存 `data/notify.log`；按任务、收件人、状态过滤 |
 | 问题排查 | 管理旧数据 | 扫描并清理无主工作区与孤儿任务目录（仍存在任务的工作区保留） |
 | 工具和动作 | 读取设置 / 准备关机 / REST API | 重载 settings.json、进入静默模式、接口说明 |
 
 说明：
 - 系统配置持久化到 `data/settings.json`；启动参数 / 环境变量仅在文件缺失或字段为空时提供默认值。
 - `workers`、`queue_size`、TTL 等属启动期参数，界面只读，修改需重启。
-- 认证默认单管理员账号；密码以 bcrypt hash 落盘，修改会同步落盘，重启后仍生效；新密码至少 8 个字符。
+- 认证默认只有系统配置里的单管理员账号（密码 bcrypt 落盘，改后重启仍生效，至少 8 个字符）；
+  需要多人协作时在「系统管理 → 用户管理」创建平台用户，并在「Assign Roles」分配角色（邮箱必填）。
 - 系统配置中的「单次产物大小上限（MB）」「单次产物文件数上限」会在归档时强制执行，防止异常产物写满磁盘。
 - 「准备关机（静默模式）」只拒绝**新的**构建入队，不影响正在运行的构建。
 - 以下配置会**直接作用于构建**：静默期（开始前等待）、SCM 重试次数、Shell、Global Time Out、构建保留策略、全局环境变量（含 Maven / Git 相关变量）、邮件通知、Webhook 通知（钉钉/企微/Slack）。
@@ -465,7 +492,12 @@ ci-platform/
 
 ## 十二、明确的非目标
 
-不实现：多节点 agent、DAG 并行、定时触发、插件系统。权限体系已实现（对齐 Jenkins Role Strategy 的精简版，见「系统管理 → Manage and Assign Roles」）；构建执行使用**服务器本地串行步骤**，发布固定走 **SSH/SFTP**。
+不实现：多节点 agent、DAG 并行、插件系统、multibranch / pipeline-as-code、构建触发器链（upstream/downstream）。
+
+已实现（曾列为非目标，后补齐）：定时构建（5 字段 cron + `H` 散列）、视图（列表视图 / 我的视图）、
+权限体系（对齐 Jenkins Role Strategy 的精简版，见「系统管理 → Manage and Assign Roles」）、
+按项目挂人/挂群的告警（含值班轮值、升级、抑制、分支路由与通知记录）。
+构建执行仍为**服务器本地串行步骤**，发布固定走 **SSH/SFTP**。
 
 详细设计（架构分层、时序、日志背压、内嵌方案权衡等）见 [DESIGN.md](./DESIGN.md)。
 
@@ -474,7 +506,8 @@ ci-platform/
 点击左侧 jobs 或作业列表进入任务页，包含：
 - 左侧动作：系统管理 / 状态 / 修改记录 / 工作空间 / 立即构建 / 配置 / 删除工程 / 重命名 / 凭据
 - 任务描述（支持 `Edit description` 内联编辑）
-- Builds 列表：按日期分组，每行显示状态球、`#N`、触发原因（`Started by user X` / `Started by webhook`）与时间
+- Builds 列表：按日期分组，每行显示状态球、`#N`、触发原因（`Started by user X` / `Started by webhook`）与时间；
+  运行中的构建可「停止」（落 `aborted`），已结束的构建可「删除」（连带 `builds/{bid}` 目录，需 `job.delete` 权限）
 - 相关链接：最近一次 / 稳定 / 成功 / 失败 / 未成功 / 完成的构建
 
 数据层：`Pipeline` 新增 `description`，`Build` 新增 `triggered_by`（手动触发记录登录用户名，Webhook 记为 `webhook`）；新增 `POST /api/pipelines/{pid}/rename`。
@@ -487,10 +520,10 @@ ci-platform/
 |---|---|
 | General | 任务名称、描述、丢弃旧的构建（任务级保留策略）、参数化/并发（说明） |
 | 源码管理 | 无 / Git、Repository URL、Credentials（选择已保存的账号密码 / 令牌，支持现场新增）、指定分支、额外行为（说明） |
-| Triggers | 远程触发 Webhook 地址（可复制）+ 密钥；其余触发器说明 |
+| Triggers | 远程触发 Webhook 地址（可复制）+ 密钥；**定时构建**（5 字段 cron，支持 Jenkins `H` 散列）；其余触发器说明 |
 | 构建环境 | Delete workspace before build starts |
 | Build Steps | 执行方式（本地服务器）、执行 shell（步骤编辑器） |
-| 构建后操作 | 归档构建产物（每次构建独立保留，可下载回滚）、SSH 发布（选择系统配置中的 SSH 服务器 + 上传文件/前缀/远程命令） |
+| 构建后操作 | 归档构建产物（每次构建独立保留，可下载回滚）、SSH 发布（选择系统配置中的 SSH 服务器 + 上传文件/前缀/远程命令）、构建通知（人员 / 群 / 事件 / 值班轮值 / 升级 / 抑制窗口 / 分支路由 / 消息模板，可发测试通知） |
 
 新增任务级字段：`build_retention_max_per_job`、`build_retention_max_age_days`（覆盖全局丢弃策略）、`delete_workspace_before_build`（默认 **false**；升级后旧 Git 任务会一次性迁移为复用，避免每次重新 clone）。
 

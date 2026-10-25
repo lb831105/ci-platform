@@ -73,7 +73,7 @@ func TestRepublishPublishesArchivedArtifacts(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	err := svc.Republish(context.Background(), "p1", "1", "s2")
+	err := svc.Republish(context.Background(), "p1", "1", "s2", "")
 	if err != nil {
 		t.Fatalf("republish: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestRepublishRejectsFailedBuildAndNoArtifacts(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.Republish(context.Background(), "p1", "1", ""); err == nil {
+	if err := svc.Republish(context.Background(), "p1", "1", "", ""); err == nil {
 		t.Fatal("failed build must not be republished")
 	}
 	if publisher.called {
@@ -113,7 +113,7 @@ func TestRepublishRejectsFailedBuildAndNoArtifacts(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.Republish(context.Background(), "p1", "1", ""); err == nil {
+	if err := svc.Republish(context.Background(), "p1", "1", "", ""); err == nil {
 		t.Fatal("empty manifest must not be republished")
 	}
 }

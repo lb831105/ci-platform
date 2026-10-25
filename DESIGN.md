@@ -21,7 +21,7 @@
 - 前端内嵌与单文件交付
 - 构建与发布流水线
 
-不在范围内：多节点 agent、DAG 并行、插件系统、multibranch / pipeline-as-code（见 §14）。
+不在范围内：多节点 agent、DAG 并行、插件系统、multibranch / pipeline-as-code（见 §15）。
 
 ---
 
@@ -326,7 +326,7 @@ jobs chan Job (容量 100)  +  N 个 worker goroutine（默认 3，CI_WORKERS �
 |---|---|
 | 精确退出码 | `cmd.Wait()` 返回每步独立退出码 |
 | 实时输出 | stdout/stderr 直接写入 `io.Writer`，日志与 WebSocket 同步可见 |
-| 明确边界 | 失败时立即停止后续步骤并打印 `step %q failed with exit code %d` |
+| 明确边界 | 未被允许的失败会中止后续 `when=success` 步骤并打印 `step %q failed with exit code %d`（细节见 6.11） |
 | 环境一致 | 每步继承同一份环境变量（全局变量 + 工具主目录 + PATH） |
 
 构建被取消时的进程树处理（`local_executor.go`）：
@@ -414,6 +414,67 @@ jobs chan Job (容量 100)  +  N 个 worker goroutine（默认 3，CI_WORKERS �
 - 孤儿目录按 `CI_CLEAN_INTERVAL_MINUTES` 周期扫描，删除 mtime 早于 `CI_WORKSPACE_TTL_MINUTES`（默认 1h）的目录。
 - **为什么用 mtime 而不是「创建时间文件」**：少一个元数据文件，且构建期间的写入天然刷新 mtime；
   构建结束时显式 touch 一次，即可让「TTL 从构建结束算起」这一语义成立。
+
+---
+
+### 6.11 参数化构建
+
+参数定义存 `config.json` 的 `params`，值在**触发时**解析并快照进 `build.json` 的 `params`。
+
+```
+POST /pipelines/{id}/build  {"params":{"VERSION":"1.2.3"}}
+   → ResolveBuildParams(defs, in)  // 校验 + 归一 + 取默认值
+   → Build{Params: resolved}       // 快照，之后改默认值不影响历史
+   → 执行时 env["VERSION"] = v; env["CI_PARAM_VERSION"] = v
+```
+
+**为什么在触发时快照**：构建记录要能回答「这次用的哪个版本/环境」。若执行时才去读
+`pipeline.params.default`，用户改了默认值后历史构建就无法复盘。
+
+**为什么提供两个环境变量名**：`VERSION` 对齐 Jenkins（脚本里 `$VERSION` 最自然），
+`CI_PARAM_VERSION` 是平台命名空间下的稳定别名——任务参数与「全局属性」重名时，
+全局属性会覆盖前者，但后者仍保留本次参数值。
+
+**为什么拒绝 `CI_` 前缀**：平台内置变量（`CI_BUILD_ID` 等）由服务端注入，
+允许任务定义同名参数等于允许篡改审计信息。
+
+**为什么 Webhook 只认已定义的查询键**：Webhook URL 常被拼上 `?token=...` 之类参数，
+把未知键一律报错会让既有集成全部失效，因此只按定义挑值、其余忽略。
+
+**校验放在 service**：参数名/类型/默认值/数量上限都是业务规则，handler 不做判断
+（`normalizeParams` 在 `normalizeAndValidate` 中调用）。
+
+### 6.12 步骤级执行控制
+
+步骤字段：`timeout_sec` / `retry` / `retry_delay_sec` / `allow_failure` / `when`。
+执行器用一个 `stepState` 记录失败情况，逐步骤决策：
+
+```
+for step in steps:
+    if !shouldRun(step.when, state): log("skipped ..."); continue
+    code = runWithRetry(step)            # 每次尝试独立 context + 进程树杀灭
+    if code == 0: continue
+    state.anyFailed = true
+    if step.allow_failure: log("allow_failure"); continue
+    state.fatalFailed = true; state.fatalCode = first code
+    # 不 return：让 when=always/failure 的收尾步骤继续跑
+```
+
+**为什么致命失败后不立即 return**：清理临时文件、收集诊断信息、通知外部系统这类步骤
+恰恰最需要在失败后执行。若直接 return，它们永远拿不到执行机会，而这正是用户配置
+`when: always` 的意图。最终仍返回第一个致命失败的退出码，构建结果不受影响。
+
+**超时为什么用 124**：与 GNU `timeout` 一致，脚本里可以用 `if [ $? -eq 124 ]` 区分
+「超时」和「普通失败」；同时它仍是「失败」，自然参与 retry / allow_failure。
+
+**为什么父 ctx 取消优先于超时**：用户点「停止构建」时必须落 `aborted`，
+不能被步骤超时抢先判成 `failed`（`aborted` 与 `failed` 的语义区分见 6.4）。
+
+**重试为什么有上限**：`retry<=5`、`timeout<=24h`、`retry_delay<=60s` 都在服务端硬校验。
+没有上限时一个 `retry=1000` 的笔误会让单次构建卡几小时，而且日志里只表现为"一直在跑"。
+
+**`when=failure` 与 `allow_failure` 互斥**：前者表示「只在有失败时执行」，
+后者表示「失败也无所谓」，同时配置是自相矛盾的，保存时直接拒绝而不是猜用户意图。
 
 ---
 
@@ -653,8 +714,14 @@ sequenceDiagram
   `RequirePerm` 校验，任务级权限由 `RequireJobPerm` 按任务名与角色 Pattern 匹配（忽略大小写、完全匹配，
   对齐 Jenkins Role Strategy）；Administer 隐含全部权限，系统管理员用户不可被 RBAC 降权（防锁死）；
   `/auth/me` 返回用户有效权限，前端据此隐藏入口。权限不足返回 `code=40300`。
-- **任务级**：`ssh_publish.server_id` + `source_files` / `remove_prefix` / `exec_command` / 可选远程目录覆盖。
-  构建时 `BuildService.resolveSshConfig` 合并为完整配置；旧版内联 host/username 配置继续兼容。
+- **任务级**：`ssh_publishes[]`（多目标，每项含 `name` + `server_id` + `source_files` / `remove_prefix` /
+  `exec_command` / 可选远程目录覆盖）；上限 10 个，名称唯一（自动补「发布 N」与 `(2)` 后缀）。
+  构建时 `BuildService.resolveSshConfig` 逐目标合并为完整配置；旧版单目标 `ssh_publish`
+  与内联 host/username 配置在保存时自动迁移为列表里的「默认发布」。
+
+**多目标为什么「失败不阻断其余目标」**：发布到生产 + 备份两台机器时，生产失败不应该让备份也不发；
+用户需要的是「尽可能完成所有目标，然后告诉我哪些失败了」，日志里每个目标一行
+`[ssh] target "名称" ...`，最终错误汇总为 `ssh publish failed (N/M targets): ...`。
 
 ```
 1. dial  → 密钥(读 private_key_path，支持 `~/`) 或 密码认证；配置 `known_hosts_path` 时用
@@ -669,12 +736,108 @@ sequenceDiagram
 - **路径映射**：`applyRemovePrefix` 对 `target/` 与 `target` 两种写法都做兼容，
   并保证剥离后为空时回退原路径（避免上传到基础目录根导致文件名丢失）。
 - **目录过滤**：`matchFiles` 只保留普通文件，遇到匹配到目录时跳过，避免 `Create` 失败。
+- **transfer 选项**：`clean_remote` 在上传前 `RemoveAll(remote_base_dir)`（对齐 Jenkins cleanRemote，
+  校验阶段强制要求非空且非 `/`）；`flatten` 只保留 `path.Base(rel)`；`exec_timeout_sec` 用独立
+  context 约束远程命令（超时关闭会话），与构建级超时互不干扰。
 - **安全**：`known_hosts_path` 配置后可抵御中间人攻击；未配置时保持兼容并输出 WARN，
   生产环境建议在「系统配置 → SSH 服务器」中填写。
 
 ---
 
-## 10. 前端架构
+## 10. 从 Jenkins 导入任务
+
+Jenkins 没有「迁移任务」的标准 REST API：`config.xml` + `createItem` 只能搬配置，
+带构建历史只能停服拷 `jobs/{name}` 目录。本平台把它做成服务端内建的一键导入：
+
+```
+POST /api/system/import/jenkins?name=order&mode=create&dry_run=false
+Content-Type: application/xml
+<project>…config.xml…</project>
+        │
+        ├─ importer.FromJenkinsXML(xml, servers)  // XML → model.Pipeline + warnings
+        ├─ PipelineService.Validate(p)            // 复用 Create 的校验（cron/参数/SSH）
+        └─ Create / Update / skip                 // 重名策略
+```
+
+### 10.1 为什么「翻译语义」而不是「复制结构」
+
+- Jenkins 的 XML 是「插件类名 + 字段名」的序列化结果，标签名随插件版本变化
+  （`hudson.tasks.Shell`、`jenkins.plugins.publish__over__ssh.BapSshPublisher`…），
+  用固定 struct tag 解析会被插件差异击穿。因此 importer 先把 XML 解析成**通用节点树**，
+  再按「类名后缀」匹配（`node.matches("shell")`），对插件版本不敏感。
+- 我们的 `config.json` 是执行器的真实输入，前端与校验都基于它。若照搬 Jenkins 结构，
+  等于让执行器去理解插件模型，复杂度会扩散到所有层，而迁移仍然需要转换层——
+  只是把转换从「一个入口」挪到了「处处」。
+- 结论：**入口做翻译，存储保持自己的语义模型**。原始 `config.xml` 另存为
+  `data/jobs/{id}/jenkins-config.xml`，需要时可重导或人工核对。
+
+### 10.2 告警分级（迁移的核心风险控制）
+
+迁移最容易出的事故不是「报错」，而是「导进去了但配置悄悄丢了」。因此 importer 返回
+`warnings[]`，分三级：
+
+| 级别 | 含义 | 例子 |
+|---|---|---|
+| `error` | 不处理就用不了 | 密码型参数（平台不脱敏）、SSH 服务器不存在（目标已停用）、无法识别的 builder（占位步骤） |
+| `warn` | 已降级，需要知晓 | 多分支只取第一个、凭据无法迁移、Disable 状态无对应字段、构建包装器被忽略 |
+| `info` | 语义不同但无需操作 | Timestamper 已内置、SCM 轮询改用 Webhook、Maven 安装名改用全局工具配置 |
+
+`dry_run=true` 先返回 `pipeline + warnings` 但不落盘：用户看完告警再决定是否导入，
+避免「先建出错的任务，再删掉重来」。
+
+### 10.3 关键映射决策
+
+| 决策 | 理由 |
+|---|---|
+| Publish Over SSH 按 **服务器名/host** 自动匹配 `server_id` | Jenkins 的 `configName` 就是服务器名；匹配不到时**保存为停用**而不是启用空主机——启用空主机等于下次构建必定失败 |
+| 每个 `transfer` 变成一个发布目标 | 平台的目标粒度是「服务器 + 文件 + 远程目录 + 命令」，正好等于一个 transfer |
+| `PasswordParameterDefinition` 降级为字符串 + `error` 告警 | 平台参数值会进环境变量与构建记录，没有遮罩能力；静默保留会让用户以为密码是安全的 |
+| 非法参数名自动改名（`my.param` → `my_param`） | 参数要当环境变量用，非法字符会让步骤读不到；改名有告警，用户可自行调整 |
+| `TZ=` 前缀丢弃、`@daily` 展开为 `H H * * *` | 平台按服务器本地时区执行；`H` 保留 Jenkins 的散列语义，避免所有任务同一分钟触发 |
+| `mode=create` 重名自动 `-2` | 批量导入时个别重名不应让整批失败；需要覆盖时显式 `mode=update` |
+| 校验复用 `PipelineService.Validate` | 预览必须和真正导入走同一条校验路径，否则会出现「预览通过、导入 400」 |
+| XML 声明改写 1.1 → 1.0 | Jenkins 2.x 导出的声明是 1.1，Go 的 `encoding/xml` 只认 1.0，不预处理则整份文件无法解析；内容不依赖 1.1 独有语义 |
+| Publish Over SSH 无论出现在 `builders` 还是 `publishers` 都识别 | 它既是构建后操作也是构建步骤（`BapSshBuilderPlugin`）；只扫 `publishers` 会把这类任务最常见的发布配置静默丢掉 |
+| transfer 选项只实现 cleanRemote / flatten / execTimeout | 这三项直接改变部署结果；`usePty`/`keepFilePermissions`/`remoteDirectorySDF` 等属插件特有行为，逐条告警比「假装支持」更安全 |
+| 配置页展示「当前生效的工具版本」，不做 per-job JDK/Node 选择 | 平台把版本收在全局工具配置：单机场景下 per-job 版本选择会引入「任务 A 要 JDK8、任务 B 要 JDK17」的并存问题，收益远低于复杂度 |
+
+### 10.4 导出文档与跨实例导入（对应 Jenkins 的 config.xml）
+
+Jenkins 用 `job/{name}/config.xml` 做「任务配置的点对点搬运」。本平台提供等价能力，但用 JSON，
+并且**刻意不直接暴露 `config.json`**：
+
+```
+GET  /api/pipelines/{pid}/config.json      → 裸 JSON 文档（不套 {code,msg,data}）
+POST /api/system/import/config?dry_run=1   → 预览/导入，返回 warnings 与 action
+```
+
+**为什么单独造一份「导出文档」而不是直接吐 config.json**
+
+| 原因 | 说明 |
+|---|---|
+| 密钥 | `config.json` 里有内联 SSH 密码、`webhook_secret`、群机器人 token；导出文件会被转发/提交仓库，导出即泄密 |
+| ID 不可移植 | `server_id` / `git_credential_id` 是实例内 ID，跨实例无意义；导出改带 `server_name` / `git_credential_name`，导入端按名字（再退化到 host）对齐 |
+| 版本演进 | 顶部 `export_version`，导入端可判断「文档比服务新」并明确拒绝，而不是解析出半份配置 |
+| 可审计的差异 | `warnings[]` 说明导出时清空了哪些内容（如「群机器人地址不会导出」），导入端原样透传给用户 |
+
+**语义对齐 Jenkins 的两点**
+
+1. `config.xml` 本身也不含凭据（只有 `credentialsId` 引用），所以「导出不含密钥」不是妥协，而是同一种设计。
+2. 导出是**裸文档**、不是统一响应包装：`curl -o` 得到的文件要能直接作为导入输入，
+   这与 `config.xml` 可用 `createItem` 直接回灌是同一种可用性诉求。错误分支仍走统一包装（带 `code`），
+   前端按 `code` 提示、不会把错误 JSON 当成配置文件保存。
+
+**导入端的安全默认值**
+
+- 空地址或 `***` 的群目标直接丢弃并告警：把脱敏占位当真实地址写进配置，
+  会造成「通知发不出去但没人知道」——这类静默失败比报错更难查。
+- 找不到同名服务器/凭据时：**目标保存为停用** + `error` 告警，而不是让导入失败或埋一个必定失败的启用目标。
+- 原生 `config.json` 也接受（`id`/时间戳等实例字段忽略），便于「拷目录」式迁移；
+  未知字段以 `warn` 告警列出，保证旧实例也能导入新实例导出的文档。
+
+---
+
+## 11. 前端架构
 
 ```
 view ──uses──> composable ──uses──> api / store
@@ -703,9 +866,9 @@ component：props 进、emit 出（不调 api、不写 store）
 
 ---
 
-## 11. 前端内嵌与单文件交付
+## 12. 前端内嵌与单文件交付
 
-### 11.1 为什么 `assets.go` 必须在项目根
+### 12.1 为什么 `assets.go` 必须在项目根
 
 Go 的 `//go:embed` 指令**只能嵌入当前包目录及其子目录**下的文件，路径中不允许出现 `..`。
 前端产物位于 `web/dist`，因此承载 embed 指令的包必须与 `web/` 同级 —— 即项目根目录。
@@ -718,7 +881,7 @@ var embeddedWeb embed.FS
 
 `all:` 前缀确保连以 `.` / `_` 开头的文件也一并纳入（默认会跳过）。
 
-### 11.2 用 `fs.FS` 抹平「内嵌 / 磁盘」差异
+### 12.2 用 `fs.FS` 抹平「内嵌 / 磁盘」差异
 
 ```go
 func Resolve(diskFallback string) (fs.FS, string) {
@@ -734,7 +897,7 @@ func Resolve(diskFallback string) (fs.FS, string) {
 - 开发/调试：把 `web/dist` 换掉即可，无需重新编译后端（显示 `disk:./web/dist`）。
 - 资源缺失：返回 503 + 明确的中文修复指引，而不是 404 空白页。
 
-### 11.3 SPA 深链回退
+### 12.3 SPA 深链回退
 
 ```
 请求路径 → 去掉前导 / → path.Clean → 拒绝 .. 与 "." → fs.Stat 存在？→ FileServer 直出
@@ -744,7 +907,7 @@ func Resolve(diskFallback string) (fs.FS, string) {
 `path.Clean` + 前缀校验承担了路径穿越防护（`fs.FS` 本身也会拒绝非法路径，属双重保险）。
 因此 `/pipelines/123/builds/1` 这类 history 模式深链刷新不会 404。
 
-### 11.4 交付形态收益
+### 12.4 交付形态收益
 
 | 收益 | 说明 |
 |---|---|
@@ -754,7 +917,7 @@ func Resolve(diskFallback string) (fs.FS, string) {
 
 ---
 
-## 12. 构建与发布流水线
+## 13. 构建与发布流水线
 
 ```mermaid
 flowchart LR
@@ -790,12 +953,12 @@ flowchart LR
 
 | 产物 | 压缩前 | 压缩后 | 压缩率 |
 |---|---|---|---|
-| `ci-platform-linux-amd64` | 11.54 MB | 3.32 MB | 71.2% |
-| `ci-platform-windows-amd64.exe` | 12.01 MB | 3.40 MB | 71.7% |
+| `ci-platform-linux-amd64` | 11.62 MB | 3.37 MB | 71.0% |
+| `ci-platform-windows-amd64.exe` | 12.10 MB | 3.61 MB | 70.2% |
 
 ---
 
-## 13. 关键权衡记录
+## 14. 关键权衡记录
 
 | 决策 | 选择 | 被放弃的方案 | 理由 |
 |---|---|---|---|
@@ -818,10 +981,16 @@ flowchart LR
 | 邮箱必填 | 创建/改资料强制 | 允许为空 | 空邮箱等于「选了人却静默收不到」，属不可观测故障 |
 | 邮箱验证 | 6 位码 + 60s 限流 + 改邮箱失效 | 验证链接 | 无需额外路由与签名，且改地址后旧验证状态不会误用 |
 | 消息模板 | 单遍占位符替换 | `text/template` | 配置者只需排版，不需要控制流；未知占位符原样保留便于发现拼写错误 |
+| 多目标发布 | 逐目标继续，汇总失败 | 首个失败即中止 | 生产 + 备份这类场景不应互相拖累；用户要的是「尽力发完并报告哪些失败」|
+| 参数快照 | 触发时写入 `build.json` | 执行时读任务默认值 | 改默认值后历史构建必须仍能复盘「当时用的什么」 |
+| 步骤失败后续执行 | 仅 `when=always/failure` | 全部跳过 | 清理与诊断收集恰恰最需要在失败后跑；其余步骤仍按原语义中止 |
+| Jenkins 迁移 | XML → 平台 JSON 语义翻译 + 告警 | 照搬 Jenkins 存储结构 | 插件 XML 不是稳定契约；迁移仍需转换层，照搬只会把复杂度扩散到执行器与前端 |
+| 配置导出 | 单独的脱敏导出文档（含名称提示） | 直接返回 config.json | 导出文件会被转发；ID 跨实例无意义，密钥更不能随文件走 |
+| 导出响应 | 裸 JSON 文档 | `{code,msg,data}` 包装 | 与 config.xml 同构：`curl -o` 拿到的文件可直接回灌导入接口 |
 
 ---
 
-## 14. 已知限制与演进方向
+## 15. 已知限制与演进方向
 
 ### 当前限制
 
@@ -829,16 +998,23 @@ flowchart LR
 |---|---|
 | SSH host key 默认未校验 | 未配置 `known_hosts_path` 时使用 `InsecureIgnoreHostKey`（日志 WARN）；配置后校验 |
 | 单机执行 | 无多节点 agent，构建与调度都在同一进程 |
-| 步骤串行 | 无 DAG / 并行步骤 |
+| 步骤串行 | 无 DAG / 并行步骤；步骤级只有 timeout/retry/allow_failure/when，没有矩阵构建与依赖图 |
+| 参数数量与类型固定 | 最多 30 个参数，类型限于 string/bool/choice/text；不支持文件参数与动态级联选项 |
 | 前端大包 | Element Plus 全量引入，主 bundle 约 1MB（gzip 350KB），未做按需引入 |
 | 日志文件无轮转 | 单次构建日志有 `log_max_mb` 上限（默认 100MB，超限截断并标注）；系统日志为定长环形缓冲，超长日志不再无限增长 |
 | 通知只有单级升级 | `escalation` 是「连败 N 次 → 追加一组上级」，没有多级链路与升级确认/回执 |
 | 抑制不跨任务 | 抑制窗口按任务计算；同一批任务同时失败仍会各发一条（跨任务聚合需要额外的事件总线）|
 | 轮值只支持固定周期 | 按「每人 N 天」顺序轮转，不支持工作日/节假日日历、换班与代班 |
 | 分支路由依赖任务粒度 | 一个任务签出一个分支；多分支需要建多个任务（未引入 multibranch/pipeline-as-code）|
+| SSH transfer 选项不全 | 已支持 `clean_remote` / `flatten` / `exec_timeout_sec`；`remoteDirectorySDF`（按日期建目录）、`usePty`、`keepFilePermissions`、`makeEmptyDirs` 等未实现（导入时逐条告警）|
+| Jenkins 构建历史不自动迁移 | 配置可一键导入；`builds/` 目录需离线翻译（build.xml → build.json、archive → artifacts + sha256、写 next_build）|
+| Jenkinsfile 无法导入 | 平台不是 pipeline-as-code，`flow-definition` 会被明确拒绝；需人工拆成 shell 步骤 |
 | 邮箱验证依赖 SMTP | SMTP 未启用时无法发码；此时用户可保存邮箱（标「未验证」），但无法确认可达 |
 
 ### 演进方向（按性价比排序）
+
+> 逐项差距、对标工具与工作量估算见 [COMPARISON.md](./COMPARISON.md)（P0/P1/P2 清单）；
+> 下面只保留架构层面的方向。
 
 1. **SSH 连接测试按钮** —— `known_hosts` 校验已支持，剩余为连接连通性检测。
 2. **Element Plus 按需引入**（`unplugin-vue-components`）—— 主 bundle 可降到约 30%。
@@ -874,3 +1050,9 @@ flowchart LR
 | 邮箱必填 | 单测 + e2e：无邮箱创建/改资料 40000；历史空邮箱启动告警 + 构建日志警告 | ✅ |
 | 删除单次构建 | 单测（目录/产物一并删除、其它构建保留、运行态拒绝、幂等、编号不回退）+ e2e | ✅ |
 | 操作审计 | 单测（中间件捕获业务码、JSONL 轮转、Tail 倒序）+ e2e：重启后 ID 单调 | ✅ |
+| 多目标 SSH 发布 | 单测（旧配置迁移、重名去重、上限、逐目标继续、按名重发布）+ e2e：2 目标发布、密码不回显、未知目标报错 | ✅ |
+| 从 Jenkins 导入 | 单测（完整 config.xml 翻译、真实 Jenkins 2.x 样本、XML 1.1 声明改写、builders 内 SSH 发布、cron 别名/TZ、不支持任务类型、占位步骤、参数名清洗、重名策略、multipart、校验失败）+ e2e：预览不落盘、导入后带参数真实构建成功 | ✅ |
+| 配置导出 / 导入 | 单测（导出脱敏、内联 SSH 停用、往返等价、按名对齐、缺资源告警、`***` 丢弃、原生 config.json、版本/坏文档拒绝、三种重名策略）+ e2e：36 项（裸文档、无密钥、跨实例 server_id 重对齐、update 覆盖） | ✅ |
+| SSH transfer 选项 | 单测（`applyFlatten`、clean_remote 无目录拒绝、exec_timeout 上限）+ e2e：cleanRemote/flatten/execTimeout(ms→s) 导入→落盘→导出→再导入一致，usePty 告警 | ✅ |
+| 参数化构建 | 单测（名称/类型/默认值/数量校验、大小写去重、默认值解析、未知参数拒绝、环境变量注入、快照）+ e2e：参数注入、默认值、Webhook 查询串 | ✅ |
+| 步骤级控制 | 单测（重试次数、超时杀进程记 124、allow_failure 继续、when=always/failure、取消优先）+ e2e：5 步骤组合场景 | ✅ |

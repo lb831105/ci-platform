@@ -2,7 +2,25 @@
 
 export type SshAuthType = 'key' | 'password'
 
+// 构建参数（对齐 Jenkins Parameters）：值会注入同名环境变量与 CI_PARAM_<大写名>。
+export type ParamType = 'string' | 'bool' | 'choice' | 'text'
+
+export interface ParamDef {
+  name: string
+  type: ParamType
+  default: string
+  options?: string[]
+  required: boolean
+  description?: string
+}
+
+export function emptyParam(): ParamDef {
+  return { name: '', type: 'string', default: '', options: [], required: false, description: '' }
+}
+
 export interface SshPublishConfig {
+  // 发布目标名称：多目标时用于日志区分与「重新发布」选择
+  name?: string
   enabled: boolean
   // 引用系统配置中的 SSH 服务器；为空时使用下方的旧版内联配置。
   server_id: string
@@ -16,6 +34,10 @@ export interface SshPublishConfig {
   source_files: string[]
   remove_prefix: string
   exec_command: string
+  // 对齐 Jenkins Publish Over SSH 的 transfer 选项
+  clean_remote?: boolean
+  flatten?: boolean
+  exec_timeout_sec?: number
 }
 
 export type PipelineExecutor = 'docker' | 'local'
@@ -26,9 +48,35 @@ export interface ArtifactConfig {
   files: string[]
 }
 
+// 步骤级执行控制（与 Go model.Step 对齐）：
+// timeoutSec=0 不限；retry 是额外重试次数；when 控制是否执行。
+export type StepWhen = 'success' | 'failure' | 'always'
+
 export interface BuildStep {
   name: string
   run: string
+  timeout_sec: number
+  retry: number
+  retry_delay_sec: number
+  allow_failure: boolean
+  when: StepWhen
+}
+
+// step 是构造步骤的简写：旧预设只需名称与命令，其余控制项取默认值。
+export function step(name: string, run: string): BuildStep {
+  return { ...emptyStep(name), run }
+}
+
+export function emptyStep(name: string): BuildStep {
+  return {
+    name,
+    run: '',
+    timeout_sec: 0,
+    retry: 0,
+    retry_delay_sec: 0,
+    allow_failure: false,
+    when: 'success',
+  }
 }
 
 // ---- 通知（项目 × 人员/群 × 事件）----
@@ -174,7 +222,12 @@ export interface Pipeline {
   webhook_secret: string
   // 定时构建（对齐 Jenkins Build periodically）：5 字段 cron 规格，空表示不启用
   cron_spec: string
+  // 构建参数定义；为空则是普通「立即构建」，不弹参数表单
+  params: ParamDef[]
+  // 旧版单目标配置（仅旧数据会返回，读取时归一进 ssh_publishes）
   ssh_publish: SshPublishConfig | null
+  // 多目标发布：一次构建可依次发布到多台服务器/多个目录
+  ssh_publishes: SshPublishConfig[]
   artifacts: ArtifactConfig
   // 任务级通知配置；null 表示沿用全局默认（系统配置 → 邮件 / Webhook 通知）
   notify: JobNotify | null
@@ -207,6 +260,9 @@ export function emptySshPublish(): SshPublishConfig {
     source_files: [],
     remove_prefix: '',
     exec_command: '',
+    clean_remote: false,
+    flatten: false,
+    exec_timeout_sec: 0,
   }
 }
 
@@ -219,13 +275,15 @@ export function emptyPipeline(): PipelinePayload {
     name: '',
     description: '',
     image: '',
-    steps: [{ name: 'build', run: '' }],
+    steps: [emptyStep('build')],
     git_url: '',
     git_branch: 'main',
     git_credential_id: '',
     webhook_secret: '',
     cron_spec: '',
-    ssh_publish: emptySshPublish(),
+    params: [],
+    ssh_publish: null,
+    ssh_publishes: [emptySshPublish()],
     artifacts: emptyArtifacts(),
     notify: emptyJobNotify(),
     build_retention_max_per_job: 0,

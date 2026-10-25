@@ -54,6 +54,12 @@ function goLog(job: PipelineSummary, ref: BuildRef | null): void {
 }
 
 async function onBuild(job: PipelineSummary): Promise<void> {
+  // 参数化任务必须由用户填参数：直接一键构建会悄悄用默认值，容易发错版本。
+  if ((job.params ?? []).length > 0) {
+    ElMessage.info('该任务是参数化构建，请在任务页填写参数后构建')
+    void router.push({ name: 'build-history', params: { pipelineId: job.id } })
+    return
+  }
   try {
     const build = await triggerBuild(job.id)
     ElMessage.success(`已触发构建 #${build.id}`)

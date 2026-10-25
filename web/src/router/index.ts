@@ -114,6 +114,11 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/manage/ManageUsersView.vue'),
       },
       {
+        path: 'system/import',
+        name: 'system-import',
+        component: () => import('@/views/manage/ImportJobView.vue'),
+      },
+      {
         path: 'system/roles-manage',
         name: 'system-roles-manage',
         component: () => import('@/views/manage/ManageRolesView.vue'),

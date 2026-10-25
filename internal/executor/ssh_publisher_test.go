@@ -170,3 +170,22 @@ func TestPublishArtifactsDisabledIsNoop(t *testing.T) {
 		t.Fatalf("disabled publish must be a noop: %v", err)
 	}
 }
+
+// flatten 只保留文件名（对齐 Jenkins Flatten files），关闭时保持相对路径。
+func TestApplyFlatten(t *testing.T) {
+	cases := []struct {
+		rel     string
+		flatten bool
+		want    string
+	}{
+		{"dist/assets/app.js", false, "dist/assets/app.js"},
+		{"dist/assets/app.js", true, "app.js"},
+		{"app", true, "app"},
+		{"target/", true, "target"}, // 目录项在 matchFiles 阶段会被过滤，这里只验证函数本身
+	}
+	for _, tc := range cases {
+		if got := applyFlatten(tc.rel, tc.flatten); got != tc.want {
+			t.Fatalf("applyFlatten(%q, %v) = %q, want %q", tc.rel, tc.flatten, got, tc.want)
+		}
+	}
+}

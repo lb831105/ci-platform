@@ -230,7 +230,9 @@ if [ "$USE_UPX" -eq 1 ]; then
 	for TARGET in "${BUILD_TARGETS[@]}"; do
 		BEFORE="$(file_size "$TARGET")"
 		info "压缩 $(basename "$TARGET") ..."
-		if upx $UPX_LEVEL --quiet "$TARGET"; then
+		# --no-backup：默认会留下 <file>~ 备份，dist/ 里多一份近 4MB 的冗余文件，
+		# 也会让「产物清单」看上去多了一个可疑文件。
+		if upx $UPX_LEVEL --no-backup --quiet "$TARGET"; then
 			AFTER="$(file_size "$TARGET")"
 			SAVED=$(( BEFORE - AFTER ))
 			PCT="$(awk -v a="$BEFORE" -v b="$AFTER" 'BEGIN { printf "%.1f", (a>0 ? (a-b)*100/a : 0) }')"

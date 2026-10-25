@@ -29,8 +29,17 @@ export const buildApi = {
   },
 
   // 把该次构建已归档的产物直接发布到 SSH 服务器（不重新编译）。
-  republish(pipelineId: string, buildId: string, serverId?: string): Promise<void> {
-    return http.post(`/pipelines/${pipelineId}/builds/${buildId}/republish`, { server_id: serverId ?? '' })
+  // publish 指定任务里的哪个发布目标（名称）；为空时用第一个启用的目标。
+  republish(
+    pipelineId: string,
+    buildId: string,
+    serverId?: string,
+    publish?: string,
+  ): Promise<void> {
+    return http.post(`/pipelines/${pipelineId}/builds/${buildId}/republish`, {
+      server_id: serverId ?? '',
+      publish: publish ?? '',
+    })
   },
 
   // 取消运行中/等待中的构建（对齐 Jenkins Stop Build）。

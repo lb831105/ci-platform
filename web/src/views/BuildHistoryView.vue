@@ -7,6 +7,7 @@ import { buildApi } from '@/api/build'
 import { pipelineApi } from '@/api/pipeline'
 import { describeError } from '@/api/request'
 import { usePipeline } from '@/composables/usePipeline'
+import { downloadText } from '@/utils/download'
 import { usePolling } from '@/composables/usePolling'
 import { useBuildStore } from '@/stores/buildStore'
 import { useOverviewStore } from '@/stores/overviewStore'
@@ -162,6 +163,23 @@ function goEdit(): void {
   void router.push({ name: 'pipeline-edit', params: { pipelineId: props.pipelineId } })
 }
 
+// 导出配置：与 Jenkins 的 config.xml 对应，但用 JSON。
+// 导出文档不含任何密钥（SSH 密码/Webhook secret/群机器人 token），可直接转发或提交到仓库。
+const exporting = ref(false)
+async function onExport(): Promise<void> {
+  exporting.value = true
+  try {
+    const text = await pipelineApi.exportConfig(props.pipelineId)
+    const base = job.value?.name || props.pipelineId
+    downloadText(`${base}-config.json`, text)
+    ElMessage.success('配置已导出（不含密钥）')
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    exporting.value = false
+  }
+}
+
 function goList(): void {
   void router.push({ name: 'pipeline-list' })
 }
@@ -210,17 +228,52 @@ async function onDeleteBuild(build: Build): Promise<void> {
   }
 }
 
-async function onBuild(): Promise<void> {
+// 参数化构建：有参数定义时先弹表单，无定义时保持「立即构建」的一键体验。
+const paramDialog = ref(false)
+const paramValues = ref<Record<string, string>>({})
+const paramDefs = computed(() => job.value?.params ?? [])
+const hasParams = computed(() => paramDefs.value.length > 0)
+
+function onBuild(): void {
+  if (!hasParams.value) {
+    void startBuild()
+    return
+  }
+  const values: Record<string, string> = {}
+  for (const def of paramDefs.value) {
+    // bool 用 'true'/'false' 字符串与后端契约保持一致（统一走环境变量）。
+    values[def.name] = def.type === 'bool' ? (def.default === 'true' ? 'true' : 'false') : def.default
+  }
+  paramValues.value = values
+  paramDialog.value = true
+}
+
+async function submitParams(): Promise<void> {
+  for (const def of paramDefs.value) {
+    if (def.required && (paramValues.value[def.name] ?? '').trim() === '') {
+      ElMessage.warning(`参数「${def.name}」为必填项`)
+      return
+    }
+  }
+  const ok = await startBuild({ ...paramValues.value })
+  if (ok) {
+    paramDialog.value = false
+  }
+}
+
+async function startBuild(params?: Record<string, string>): Promise<boolean> {
   triggering.value = true
   try {
-    const build = await triggerBuild(props.pipelineId)
+    const build = await triggerBuild(props.pipelineId, params)
     liveBuildId.value = build.id
     ElMessage.success(`已触发构建 #${build.id}`)
     await Promise.all([loadHistory(false), overview.fetch(true)])
     polling.start()
     goLog(build)
+    return true
   } catch (e) {
     ElMessage.error(describeError(e))
+    return false
   } finally {
     triggering.value = false
   }
@@ -290,6 +343,14 @@ async function onEditDescription(): Promise<void> {
     ssh_publish: p.ssh_publish
       ? { ...p.ssh_publish, password: '', source_files: [...p.ssh_publish.source_files] }
       : null,
+    // 只改描述也要带回参数定义，否则后端会把参数化构建「清空」。
+    params: (p.params ?? []).map((def) => ({ ...def, options: [...(def.options ?? [])] })),
+    // 只改描述也要带回发布配置，否则后端会把多目标当成「全部删除」。
+    ssh_publishes: (p.ssh_publishes ?? []).map((item) => ({
+      ...item,
+      password: '',
+      source_files: [...(item.source_files ?? [])],
+    })),
   }
   try {
     job.value = await save(props.pipelineId, payload)
@@ -362,7 +423,10 @@ function showChanges(): void {
       <div>
         <el-button @click="goList">返回列表</el-button>
         <el-button v-if="auth.hasPerm('job.configure')" @click="goEdit">配置</el-button>
-        <el-button v-if="auth.hasPerm('job.build')" type="primary" :loading="triggering" @click="onBuild">立即构建</el-button>
+        <el-button v-if="auth.hasPerm('job.read')" :loading="exporting" @click="onExport">导出配置</el-button>
+        <el-button v-if="auth.hasPerm('job.build')" type="primary" :loading="triggering" @click="onBuild">
+          {{ hasParams ? '参数化构建' : '立即构建' }}
+        </el-button>
       </div>
     </div>
 
@@ -377,8 +441,11 @@ function showChanges(): void {
           <li><a @click="showChanges">状态</a></li>
           <li><a @click="showChanges">修改记录</a></li>
           <li><a @click="showWorkspace">工作空间</a></li>
-          <li v-if="auth.hasPerm('job.build')"><a @click="onBuild">立即构建</a></li>
+          <li v-if="auth.hasPerm('job.build')">
+            <a @click="onBuild">{{ hasParams ? '参数化构建' : '立即构建' }}</a>
+          </li>
           <li v-if="auth.hasPerm('job.configure')"><a @click="goEdit">配置</a></li>
+          <li v-if="auth.hasPerm('job.read')"><a @click="onExport">导出配置</a></li>
           <li v-if="auth.hasPerm('job.delete')"><a @click="onRemove">删除工程</a></li>
           <li v-if="auth.hasPerm('job.configure')"><a @click="onRename">重命名</a></li>
           <li>
@@ -455,9 +522,52 @@ function showChanges(): void {
       </main>
     </div>
   </div>
+
+    <el-dialog v-model="paramDialog" title="构建参数" width="560px">
+      <el-form label-width="150px" label-position="right">
+        <el-form-item v-for="def in paramDefs" :key="def.name" :required="def.required">
+          <template #label>
+            <span class="mono">{{ def.name }}</span>
+            <el-tooltip v-if="def.description" :content="def.description" placement="top">
+              <span class="param-help">?</span>
+            </el-tooltip>
+          </template>
+          <el-switch
+            v-if="def.type === 'bool'"
+            :model-value="paramValues[def.name] === 'true'"
+            @update:model-value="(value: boolean) => (paramValues[def.name] = value ? 'true' : 'false')"
+          />
+          <el-select
+            v-else-if="def.type === 'choice'"
+            v-model="paramValues[def.name]"
+            style="width: 100%"
+          >
+            <el-option v-for="opt in def.options ?? []" :key="opt" :label="opt" :value="opt" />
+          </el-select>
+          <el-input
+            v-else-if="def.type === 'text'"
+            v-model="paramValues[def.name]"
+            type="textarea"
+            :rows="3"
+          />
+          <el-input v-else v-model="paramValues[def.name]" />
+        </el-form-item>
+        <el-empty v-if="paramDefs.length === 0" description="该任务没有定义构建参数" :image-size="60" />
+      </el-form>
+      <template #footer>
+        <el-button @click="paramDialog = false">取消</el-button>
+        <el-button type="primary" :loading="triggering" @click="submitParams">开始构建</el-button>
+      </template>
+    </el-dialog>
 </template>
 
 <style scoped>
+.param-help {
+  margin-left: 4px;
+  color: var(--text-3, #909399);
+  cursor: help;
+}
+
 .job__body {
   display: flex;
   gap: 20px;

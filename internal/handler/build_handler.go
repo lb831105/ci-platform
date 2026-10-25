@@ -125,6 +125,8 @@ func (h *BuildHandler) DownloadArtifactsZip(w http.ResponseWriter, r *http.Reque
 // republishRequest 是重新发布请求体；server_id 留空时使用任务配置的服务器。
 type republishRequest struct {
 	ServerID string `json:"server_id"`
+	// Publish 选择任务里的哪个发布目标（名称）；为空时取第一个启用的目标。
+	Publish string `json:"publish"`
 }
 
 // Republish POST /api/pipelines/{pid}/builds/{bid}/republish
@@ -135,7 +137,8 @@ func (h *BuildHandler) Republish(w http.ResponseWriter, r *http.Request) {
 		pkg.Fail(w, err)
 		return
 	}
-	if err := h.builds.Republish(r.Context(), chi.URLParam(r, "pid"), chi.URLParam(r, "bid"), in.ServerID); err != nil {
+	if err := h.builds.Republish(r.Context(), chi.URLParam(r, "pid"),
+		chi.URLParam(r, "bid"), in.ServerID, in.Publish); err != nil {
 		pkg.Fail(w, err)
 		return
 	}

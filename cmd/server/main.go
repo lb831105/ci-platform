@@ -200,6 +200,11 @@ func main() {
 	// 视图：给任务归类（列表视图 + 我的视图），data/views.json。
 	viewSvc := service.NewViewService(store.NewViewStore(cfg.DataHome), pipelineSvc, rbacSvc)
 	viewHandler := handler.NewViewHandler(viewSvc, pipelineSvc, buildSvc)
+	// 从 Jenkins 导入任务：XML → 平台任务定义，SSH 服务器名自动映射到 server_id。
+	importHandler := handler.NewImportHandler(pipelineSvc, settingsSvc)
+	// 任务配置导出/导入（平台自有 JSON）：导出脱敏，导入按服务器/凭据名称对齐。
+	portabilitySvc := service.NewPortabilityService(pipelineSvc, settingsSvc, credentialSvc, buildVersion)
+	portabilityHandler := handler.NewPortabilityHandler(portabilitySvc)
 
 	handlerRouter := router.New(router.Deps{
 		Config:          cfg,
@@ -214,6 +219,8 @@ func main() {
 		View:            viewHandler,
 		Notify:          notifyHandler,
 		Profile:         profileHandler,
+		Import:          importHandler,
+		Portability:     portabilityHandler,
 		AuthService:     authSvc,
 		RBACService:     rbacSvc,
 		PipelineService: pipelineSvc,

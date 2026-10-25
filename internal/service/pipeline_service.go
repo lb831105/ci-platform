@@ -116,6 +116,29 @@ func (s *PipelineService) Create(ctx context.Context, in *model.Pipeline) (*mode
 	return in, nil
 }
 
+// Validate 只做归一化与校验，不落盘（供「导入预览 / dry-run」使用）。
+// 与 Create 走同一条校验路径，避免预览通过、真正导入却失败。
+func (s *PipelineService) Validate(_ context.Context, in *model.Pipeline) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := normalizeAndValidate(in, s.nameRegex()); err != nil {
+		return err
+	}
+	return s.validateSshServer(in)
+}
+
+// SaveJenkinsSource 把导入来源的 config.xml 存到任务目录，便于审计与「导入器改进后重导」。
+// 存储层没实现辅助文件写入时静默跳过（测试用的内存 store 即如此）。
+func (s *PipelineService) SaveJenkinsSource(_ context.Context, id string, data []byte) error {
+	writer, ok := s.store.(interface {
+		WriteAuxFile(id, name string, data []byte) error
+	})
+	if !ok {
+		return nil
+	}
+	return writer.WriteAuxFile(id, "jenkins-config.xml", data)
+}
+
 // Update 更新 pipeline，保留创建时间；SSH 敏感字段不回显时沿用旧值。
 func (s *PipelineService) Update(ctx context.Context, id string, in *model.Pipeline) (*model.Pipeline, error) {
 	s.mu.Lock()
@@ -324,17 +347,30 @@ func (s *PipelineService) MigrateWorkspaceDirs(ctx context.Context) (int, error)
 	return migrated, firstErr
 }
 
-// validateSshServer 确保任务引用的 SSH 服务器在系统配置中存在。
+// validateSshServer 确保每个启用的发布目标引用的 SSH 服务器都存在于系统配置中。
+// 逐个目标校验：老实现只看单目标 p.SshPublish，多目标任务在归一化后该字段为 nil。
 func (s *PipelineService) validateSshServer(p *model.Pipeline) error {
-	if !p.SSHEnabled() || p.SshPublish.ServerID == "" || s.settings == nil {
+	if s.settings == nil {
 		return nil
 	}
-	for _, server := range s.settings.Current().SshServers {
-		if server.ID == p.SshPublish.ServerID {
-			return nil
+	servers := s.settings.Current().SshServers
+	for _, cfg := range p.EffectiveSshPublishes() {
+		serverID := strings.TrimSpace(cfg.ServerID)
+		if serverID == "" {
+			continue
+		}
+		found := false
+		for _, server := range servers {
+			if server.ID == serverID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return pkg.ErrBadRequest("发布目标 %q 引用的 SSH 服务器 %q 不存在，请先在系统配置中添加", cfg.Name, serverID)
 		}
 	}
-	return pkg.ErrBadRequest("SSH 服务器 %q 不存在，请先在系统配置中添加", p.SshPublish.ServerID)
+	return nil
 }
 
 // allocateID 以秒级时间戳为基线分配目录名，冲突则递增，保证目录名唯一且可读。
@@ -401,6 +437,9 @@ func normalizeAndValidate(p *model.Pipeline, nameRegex string) error {
 		if p.Steps[i].Run == "" {
 			return pkg.ErrBadRequest("step %q: run is required", p.Steps[i].Name)
 		}
+		if err := normalizeStepControls(&p.Steps[i]); err != nil {
+			return err
+		}
 	}
 	if p.GitBranch == "" {
 		p.GitBranch = "main"
@@ -418,8 +457,57 @@ func normalizeAndValidate(p *model.Pipeline, nameRegex string) error {
 	if err := normalizeArtifacts(&p.Artifacts); err != nil {
 		return err
 	}
-	return validateSshPublish(p.SshPublish)
+	if err := normalizeParams(p); err != nil {
+		return err
+	}
+	return normalizeSshPublishes(p)
 }
+
+// normalizeSshPublishes 归一化并校验多目标 SSH 发布配置。
+//
+// 存储形态只有一种：ssh_publishes 列表。旧任务的 ssh_publish（单目标）在这里
+// 迁移进列表并清空旧字段，避免「两个字段都可能生效」的歧义。
+func normalizeSshPublishes(p *model.Pipeline) error {
+	list := p.SshPublishes
+	if len(list) == 0 && p.SshPublish != nil {
+		legacy := *p.SshPublish
+		if strings.TrimSpace(legacy.Name) == "" {
+			legacy.Name = "默认发布"
+		}
+		list = []model.SshPublishConfig{legacy}
+	}
+	p.SshPublish = nil
+
+	if len(list) > maxSshPublishes {
+		return pkg.ErrBadRequest("SSH 发布目标最多 %d 个（当前 %d）", maxSshPublishes, len(list))
+	}
+	used := map[string]bool{}
+	out := make([]model.SshPublishConfig, 0, len(list))
+	for i := range list {
+		item := list[i]
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			name = fmt.Sprintf("发布 %d", i+1)
+		}
+		// 重名会让日志与「重新发布」无法区分：自动加后缀而不是报错
+		// （前端新增一行时名称通常还是空的）。
+		unique := name
+		for n := 2; used[strings.ToLower(unique)]; n++ {
+			unique = fmt.Sprintf("%s (%d)", name, n)
+		}
+		used[strings.ToLower(unique)] = true
+		item.Name = unique
+		if err := validateSshPublish(&item); err != nil {
+			return err
+		}
+		out = append(out, item)
+	}
+	p.SshPublishes = out
+	return nil
+}
+
+// maxSshPublishes 限制单次构建的发布目标数量，避免误配导致构建卡在大量 SSH 连接上。
+const maxSshPublishes = 10
 
 // normalizeArtifacts 去重/归一化产物匹配模式，并在启用时提前做安全校验。
 // 禁用时保留模式，方便用户下次重新启用而不用重填。
@@ -457,6 +545,13 @@ func validateSshPublish(c *model.SshPublishConfig) error {
 	c.RemoteBaseDir = strings.TrimSpace(c.RemoteBaseDir)
 	c.RemovePrefix = strings.TrimSpace(c.RemovePrefix)
 	c.ExecCommand = strings.TrimSpace(c.ExecCommand)
+	if c.ExecTimeoutSec < 0 || c.ExecTimeoutSec > model.MaxStepTimeoutSec {
+		return pkg.ErrBadRequest("ssh_publish.exec_timeout_sec 需在 0~%d 秒之间", model.MaxStepTimeoutSec)
+	}
+	if c.CleanRemote && (c.RemoteBaseDir == "" || c.RemoteBaseDir == "/") {
+		// 清空远程目录是不可逆操作：没有明确目录时直接拒绝，避免误删根目录。
+		return pkg.ErrBadRequest("发布目标 %q 勾选了「清空远程目录」，必须填写明确的远程目录", c.Name)
+	}
 
 	files := make([]string, 0, len(c.SourceFiles))
 	for _, f := range c.SourceFiles {
@@ -859,4 +954,229 @@ func (s *PipelineService) MigrateArtifactConfig(ctx context.Context) (int, error
 		migrated++
 	}
 	return migrated, nil
+}
+
+const (
+	maxBuildParams  = 30
+	maxParamNameLen = 64
+	maxParamValLen  = 4096
+)
+
+// paramNamePattern 限制参数名只能是合法的标识符：
+// 参数会被写成环境变量（NAME 与 CI_PARAM_NAME），非法字符会让 shell 无法读取。
+var paramNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// normalizeParams 归一化并校验参数定义（对齐 Jenkins Parameters 的常用能力）。
+func normalizeParams(p *model.Pipeline) error {
+	if len(p.Params) == 0 {
+		p.Params = nil
+		return nil
+	}
+	if len(p.Params) > maxBuildParams {
+		return pkg.ErrBadRequest("最多支持 %d 个构建参数", maxBuildParams)
+	}
+	seen := make(map[string]bool, len(p.Params))
+	out := make([]model.ParamDef, 0, len(p.Params))
+	for _, def := range p.Params {
+		def.Name = strings.TrimSpace(def.Name)
+		if def.Name == "" {
+			return pkg.ErrBadRequest("构建参数名不能为空")
+		}
+		if len(def.Name) > maxParamNameLen || !paramNamePattern.MatchString(def.Name) {
+			return pkg.ErrBadRequest("参数名 %q 非法：只能用字母、数字、下划线，且不能以数字开头", def.Name)
+		}
+		// CI_ 前缀是平台保留命名空间，避免任务覆盖 CI_BUILD_ID 等内置变量。
+		if strings.HasPrefix(strings.ToUpper(def.Name), "CI_") {
+			return pkg.ErrBadRequest("参数名 %q 非法：CI_ 前缀为平台保留", def.Name)
+		}
+		key := strings.ToUpper(def.Name)
+		if seen[key] {
+			// 环境变量在 Windows 上大小写不敏感，version 与 VERSION 会互相覆盖。
+			return pkg.ErrBadRequest("参数名 %q 重复（环境变量大小写不敏感）", def.Name)
+		}
+		seen[key] = true
+
+		def.Type = strings.ToLower(strings.TrimSpace(def.Type))
+		if def.Type == "" {
+			def.Type = model.ParamString
+		}
+		switch def.Type {
+		case model.ParamString, model.ParamBool, model.ParamText, model.ParamChoice:
+		default:
+			return pkg.ErrBadRequest("参数 %q 的类型 %q 不支持（string/bool/choice/text）", def.Name, def.Type)
+		}
+		def.Description = strings.TrimSpace(def.Description)
+		options := make([]string, 0, len(def.Options))
+		for _, opt := range def.Options {
+			opt = strings.TrimSpace(opt)
+			if opt != "" {
+				options = append(options, opt)
+			}
+		}
+		def.Options = options
+		if def.Type == model.ParamChoice {
+			if len(options) == 0 {
+				return pkg.ErrBadRequest("参数 %q 是 choice 类型，至少需要一个可选值", def.Name)
+			}
+		} else {
+			def.Options = nil
+		}
+
+		def.Default = strings.TrimSpace(def.Default)
+		switch def.Type {
+		case model.ParamChoice:
+			if def.Default == "" {
+				def.Default = options[0]
+			} else if !containsString(options, def.Default) {
+				return pkg.ErrBadRequest("参数 %q 的默认值 %q 不在可选值中", def.Name, def.Default)
+			}
+		case model.ParamBool:
+			if def.Default == "" {
+				def.Default = "false"
+			}
+			if def.Default != "true" && def.Default != "false" {
+				return pkg.ErrBadRequest("参数 %q 是 bool 类型，默认值只能是 true/false", def.Name)
+			}
+		}
+		if len(def.Default) > maxParamValLen {
+			return pkg.ErrBadRequest("参数 %q 的默认值过长", def.Name)
+		}
+		if def.Required && def.Default == "" && def.Type != model.ParamBool {
+			// 必填但无默认值：触发时必须由用户填写，这本身是合法配置。
+			def.Required = true
+		}
+		out = append(out, def)
+	}
+	p.Params = out
+	return nil
+}
+
+// ResolveBuildParams 把用户传入的参数值按定义解析成最终值：
+// 未传的参数取默认值，未知参数视为错误（多半是前端契约不一致或拼写错误）。
+func ResolveBuildParams(defs []model.ParamDef, in map[string]string) (map[string]string, error) {
+	if len(defs) == 0 {
+		if len(in) > 0 {
+			return nil, pkg.ErrBadRequest("该任务没有定义构建参数")
+		}
+		return nil, nil
+	}
+	known := make(map[string]bool, len(defs))
+	resolved := make(map[string]string, len(defs))
+	for _, def := range defs {
+		known[def.Name] = true
+		raw, ok := in[def.Name]
+		if !ok {
+			// 兼容大小写不一致（CI 命令行里 VERSION=1 与 version=1 应等价）。
+			for k, v := range in {
+				if strings.EqualFold(k, def.Name) {
+					raw, ok = v, true
+					break
+				}
+			}
+		}
+		value := def.Default
+		if ok {
+			value = strings.TrimSpace(raw)
+		}
+		switch def.Type {
+		case model.ParamBool:
+			switch strings.ToLower(value) {
+			case "", "false", "0", "no":
+				value = "false"
+			case "true", "1", "yes":
+				value = "true"
+			default:
+				return nil, pkg.ErrBadRequest("参数 %q 只能是 true 或 false", def.Name)
+			}
+		case model.ParamChoice:
+			if value == "" {
+				value = def.Default
+			}
+			if !containsString(def.Options, value) {
+				return nil, pkg.ErrBadRequest("参数 %q 的值 %q 不在可选值中", def.Name, value)
+			}
+		default:
+			if value == "" && def.Required {
+				return nil, pkg.ErrBadRequest("参数 %q 为必填项", def.Name)
+			}
+			// string 类型是单行值，换行会破坏 shell 变量；text 保留换行。
+			if def.Type == model.ParamString {
+				value = singleLine(value)
+			}
+			if len(value) > maxParamValLen {
+				return nil, pkg.ErrBadRequest("参数 %q 的值过长（上限 %d 字节）", def.Name, maxParamValLen)
+			}
+		}
+		resolved[def.Name] = value
+	}
+	for k := range in {
+		if known[k] {
+			continue
+		}
+		matched := false
+		for name := range known {
+			if strings.EqualFold(k, name) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return nil, pkg.ErrBadRequest("未知的构建参数 %q", k)
+		}
+	}
+	return resolved, nil
+}
+
+// singleLine 把多行值压成单行：string 参数是单行值，换行会破坏 shell 变量赋值。
+func singleLine(s string) string {
+	const (
+		lf = rune(10)
+		cr = rune(13)
+	)
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r == lf || r == cr {
+			r = ' '
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func containsString(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeStepControls 归一化并校验步骤级控制项（超时/重试/失败处理/when）。
+// 上限在这里硬性拦截：误填 retry=1000 会让构建卡几小时，且难以及时发现。
+func normalizeStepControls(step *model.Step) error {
+	if step.TimeoutSec < 0 || step.TimeoutSec > model.MaxStepTimeoutSec {
+		return pkg.ErrBadRequest("step %q: timeout_sec 需在 0~%d 秒之间", step.Name, model.MaxStepTimeoutSec)
+	}
+	if step.Retry < 0 || step.Retry > model.MaxStepRetry {
+		return pkg.ErrBadRequest("step %q: retry 需在 0~%d 次之间", step.Name, model.MaxStepRetry)
+	}
+	if step.RetryDelaySec < 0 || step.RetryDelaySec > model.MaxStepRetryDelay {
+		return pkg.ErrBadRequest("step %q: retry_delay_sec 需在 0~%d 秒之间", step.Name, model.MaxStepRetryDelay)
+	}
+	when := strings.ToLower(strings.TrimSpace(step.When))
+	switch when {
+	case "", model.StepWhenSuccess:
+		step.When = model.StepWhenSuccess
+	case model.StepWhenFailure, model.StepWhenAlways:
+		step.When = when
+	default:
+		return pkg.ErrBadRequest("step %q: when 只能是 success / failure / always", step.Name)
+	}
+	if step.AllowFailure && step.When == model.StepWhenFailure {
+		// 「只在失败时执行」又「允许失败」是自相矛盾的配置，直接提示改配置。
+		return pkg.ErrBadRequest("step %q: when=failure 的步骤不能同时设置 allow_failure", step.Name)
+	}
+	return nil
 }

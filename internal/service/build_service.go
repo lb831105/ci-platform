@@ -184,7 +184,7 @@ func (s *BuildService) Recover(ctx context.Context) {
 }
 
 // Trigger 创建构建记录并入队，返回 pending 状态的构建。
-func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger model.TriggerType, triggeredBy string) (*model.Build, error) {
+func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger model.TriggerType, triggeredBy string, params map[string]string) (*model.Build, error) {
 	p, err := s.pipelines.Get(ctx, pipelineID)
 	if err != nil {
 		return nil, err
@@ -192,12 +192,19 @@ func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger m
 	if s.enqueuer == nil {
 		return nil, pkg.NewError(pkg.CodeInternal, "scheduler is not initialized")
 	}
+	// 参数在触发时就解析成最终值并快照进构建记录：
+	// 后续有人改了参数默认值，历史构建仍能还原「当时用的什么」。
+	resolved, err := ResolveBuildParams(p.Params, params)
+	if err != nil {
+		return nil, err
+	}
 
 	b := &model.Build{
 		PipelineID:  pipelineID,
 		Status:      model.BuildPending,
 		TriggerType: trigger,
 		TriggeredBy: strings.TrimSpace(triggeredBy),
+		Params:      resolved,
 	}
 	if err := s.builds.CreateNext(ctx, b); err != nil {
 		return nil, err
@@ -544,6 +551,12 @@ func (s *BuildService) executeStages(ctx context.Context, p *model.Pipeline, b *
 		"CI_BUILD_NUMBER":  job.BuildID,
 		"CI_PIPELINE_NAME": p.Name,
 	}
+	// 构建参数 → 环境变量。同时提供原名与 CI_PARAM_<大写名>：
+	// 原名对齐 Jenkins（$VERSION），带前缀的别名避免与全局属性重名时被覆盖。
+	for name, value := range b.Params {
+		env[name] = value
+		env[model.ParamDef{Name: name}.EnvName()] = value
+	}
 	// 全局属性 → 环境变量；Maven / Git 全局配置同样以环境变量注入。
 	for _, kv := range settings.GlobalEnv {
 		if kv.Key != "" {
@@ -600,14 +613,33 @@ func (s *BuildService) executeStages(ctx context.Context, p *model.Pipeline, b *
 		}
 	}
 
-	// 仅当 ssh_publish.enabled=true 时才发起 SSH 连接。
-	if p.SSHEnabled() {
-		sshCfg, resolveErr := resolveSshConfig(p.SshPublish, settings)
-		if resolveErr != nil {
-			return 1, resolveErr
+	// SSH 发布：支持多个目标（不同服务器/不同目录）。
+	// 单个目标失败不打断其余目标——一次构建把能发的都发出去，
+	// 否则「修好第一个才发现第二个也坏」会白白多跑一轮构建。
+	targets := p.EffectiveSshPublishes()
+	if len(targets) > 0 {
+		failures := make([]string, 0, len(targets))
+		fmt.Fprintf(out, "[ssh] %d publish target(s) configured\n", len(targets))
+		for i := range targets {
+			target := targets[i]
+			sshCfg, resolveErr := resolveSshConfig(&target, settings)
+			if resolveErr != nil {
+				failures = append(failures, fmt.Sprintf("%s: %v", target.Name, resolveErr))
+				fmt.Fprintf(out, "[ssh] target %q resolve FAILED: %v\n", target.Name, resolveErr)
+				continue
+			}
+			fmt.Fprintf(out, "[ssh] target %q -> server %q (remote=%s)\n",
+				sshCfg.Name, sshCfg.ServerID, sshCfg.RemoteBaseDir)
+			if err = s.publisher.Publish(ctx, sshCfg, absWorkspace, out); err != nil {
+				failures = append(failures, fmt.Sprintf("%s: %v", sshCfg.Name, err))
+				fmt.Fprintf(out, "[ssh] target %q FAILED: %v\n", sshCfg.Name, err)
+				continue
+			}
+			fmt.Fprintf(out, "[ssh] target %q done\n", sshCfg.Name)
 		}
-		if err = s.publisher.Publish(ctx, sshCfg, absWorkspace, out); err != nil {
-			return 1, fmt.Errorf("ssh publish failed: %w", err)
+		if len(failures) > 0 {
+			return 1, fmt.Errorf("ssh publish failed (%d/%d targets): %s",
+				len(failures), len(targets), strings.Join(failures, "; "))
 		}
 	}
 	return 0, nil
@@ -758,7 +790,7 @@ func (s *BuildService) resolveGitAuth(ctx context.Context, p *model.Pipeline) (*
 
 // Republish 把某次成功构建已归档的产物直接重新发布到 SSH 服务器（不重新编译），
 // 用于「发布失败」或「需要回滚到历史版本」的场景。日志写入该构建的 log.txt。
-func (s *BuildService) Republish(ctx context.Context, pipelineID, buildID, serverID string) error {
+func (s *BuildService) Republish(ctx context.Context, pipelineID, buildID, serverID, publishName string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -783,10 +815,26 @@ func (s *BuildService) Republish(ctx context.Context, pipelineID, buildID, serve
 	if len(manifest.Files) == 0 {
 		return pkg.ErrNotFound("该构建没有归档产物，无法重新发布")
 	}
-	if p.SshPublish == nil {
-		return pkg.ErrBadRequest("任务未配置 SSH 发布")
+	targets := p.EffectiveSshPublishes()
+	if len(targets) == 0 {
+		return pkg.ErrBadRequest("任务未配置 SSH 发布（或所有目标都未启用）")
 	}
-	spec := *p.SshPublish
+	// 选择发布目标：按名称精确匹配（忽略大小写）；未指定时用第一个启用的目标。
+	spec := targets[0]
+	publishName = strings.TrimSpace(publishName)
+	if publishName != "" {
+		found := false
+		for _, t := range targets {
+			if strings.EqualFold(t.Name, publishName) {
+				spec = t
+				found = true
+				break
+			}
+		}
+		if !found {
+			return pkg.ErrBadRequest("发布目标 %q 不存在或未启用", publishName)
+		}
+	}
 	spec.Enabled = true
 	if serverID = strings.TrimSpace(serverID); serverID != "" {
 		spec.ServerID = serverID

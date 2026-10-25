@@ -34,8 +34,14 @@ export const pipelineApi = {
     return http.del<null>(`/pipelines/${id}`)
   },
 
-  build(id: string): Promise<Build> {
-    return http.post<Build>(`/pipelines/${id}/build`)
+  // 导出任务配置：与 Jenkins 的 job/{name}/config.xml 对应，返回裸 JSON 文档。
+  exportConfig(id: string): Promise<string> {
+    return http.getText(`/pipelines/${id}/config.json`)
+  },
+
+  // 触发构建：params 仅对「参数化构建」任务有效，未传的参数由后端取默认值。
+  build(id: string, params?: Record<string, string>): Promise<Build> {
+    return http.post<Build>(`/pipelines/${id}/build`, params ? { params } : {})
   },
 
   rename(id: string, name: string): Promise<Pipeline> {

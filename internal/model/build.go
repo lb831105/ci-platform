@@ -59,6 +59,9 @@ type Build struct {
 	FinishedAt  *time.Time  `json:"finished_at"`
 	ExitCode    int         `json:"exit_code"`
 
+	// Params 是本次构建实际使用的参数值（触发时快照，便于复盘「这次用的是什么版本号」）。
+	Params map[string]string `json:"params,omitempty"`
+
 	// SCM 现场信息：从实际签出的工作区读取，供「按分支路由」与「通知提交者」使用。
 	// 非 Git 任务为空。
 	Branch       string `json:"branch,omitempty"`

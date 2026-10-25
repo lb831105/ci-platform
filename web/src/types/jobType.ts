@@ -5,7 +5,7 @@
 // 这里的类型只负责为配置表单提供预设；不支持的 Jenkins 原生类型
 // 明确置灰并标注原因，而不是伪装成可用。
 
-import { emptyPipeline, type PipelinePayload } from './pipeline'
+import { emptyPipeline, step, type PipelinePayload } from './pipeline'
 
 export interface JobTypePreset {
   id: string
@@ -37,8 +37,8 @@ export const JOB_TYPES: JobTypePreset[] = [
     enabled: true,
     preset: {
       steps: [
-        { name: 'build', run: 'go build -o app .' },
-        { name: 'test', run: 'go test ./...' },
+        step('build', 'go build -o app .'),
+        step('test', 'go test ./...'),
       ],
       artifacts: { enabled: true, files: ['app', 'app.exe'] },
     },
@@ -52,8 +52,8 @@ export const JOB_TYPES: JobTypePreset[] = [
     enabled: true,
     preset: {
       steps: [
-        { name: 'install', run: 'npm ci || npm install' },
-        { name: 'build', run: 'npm run build' },
+        step('install', 'npm ci || npm install'),
+        step('build', 'npm run build'),
       ],
       // 常见前端输出目录；默认不启用，避免项目输出到 build/ 等目录时误报。
       artifacts: { enabled: false, files: ['dist/**'] },
@@ -67,7 +67,7 @@ export const JOB_TYPES: JobTypePreset[] = [
     color: '#c71a36',
     enabled: true,
     preset: {
-      steps: [{ name: 'package', run: 'mvn -B -DskipTests clean package' }],
+      steps: [step('package', 'mvn -B -DskipTests clean package')],
       artifacts: { enabled: true, files: ['target/*.jar'] },
     },
   },
@@ -80,8 +80,8 @@ export const JOB_TYPES: JobTypePreset[] = [
     enabled: true,
     preset: {
       steps: [
-        { name: 'build', run: '' },
-        { name: 'test', run: '' },
+        step('build', ''),
+        step('test', ''),
       ],
     },
   },

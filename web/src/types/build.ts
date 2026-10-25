@@ -13,6 +13,8 @@ export interface Build {
   started_at: string | null
   finished_at: string | null
   exit_code: number
+  // 本次构建实际使用的参数值（触发时快照）；非参数化任务为空。
+  params?: Record<string, string>
 }
 
 export interface BuildLogPayload {

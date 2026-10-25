@@ -27,6 +27,7 @@ const sections: ManageSection[] = [
       { title: '全局工具配置', desc: '维护服务器上的工具主目录（JAVA_HOME / GOROOT 等）', route: 'system-tools' },
       { title: '插件管理', desc: '查看平台内置能力与运行状态', route: 'system-plugins' },
       { title: '节点和云管理', desc: '查看执行器、构建队列与工作区', route: 'system-nodes' },
+      { title: '导入任务', desc: '从 Jenkins config.xml 或平台导出的 config.json 导入任务配置', route: 'system-import' },
     ],
   },
   {

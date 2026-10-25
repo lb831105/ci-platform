@@ -65,7 +65,19 @@ func (p *SshPublisher) Publish(ctx context.Context, cfg *model.SshPublishConfig,
 	}
 
 	if strings.TrimSpace(cfg.ExecCommand) != "" {
-		if err := p.runCommand(ctx, client, cfg.ExecCommand, out); err != nil {
+		// 远程命令超时（对齐 Jenkins execTimeout）：只约束命令本身，
+		// 不影响上传阶段；超时需要杀掉远程会话，否则部署命令可能一直挂着。
+		cmdCtx := ctx
+		if cfg.ExecTimeoutSec > 0 {
+			var cancel context.CancelFunc
+			cmdCtx, cancel = context.WithTimeout(ctx, time.Duration(cfg.ExecTimeoutSec)*time.Second)
+			defer cancel()
+		}
+		if err := p.runCommand(cmdCtx, client, cfg.ExecCommand, out); err != nil {
+			if cfg.ExecTimeoutSec > 0 && errors.Is(cmdCtx.Err(), context.DeadlineExceeded) {
+				fmt.Fprintf(out, "[ssh] 远程命令超时（%ds），已终止会话\n", cfg.ExecTimeoutSec)
+				return fmt.Errorf("ssh publish: remote command timed out after %ds", cfg.ExecTimeoutSec)
+			}
 			return err
 		}
 	}
@@ -214,6 +226,14 @@ func (p *SshPublisher) upload(ctx context.Context, client *ssh.Client, cfg *mode
 	if base == "" || base == "/" {
 		return fmt.Errorf("ssh publish: remote_base_dir is required (refusing to publish to /)")
 	}
+	if cfg.CleanRemote {
+		// 对齐 Jenkins「Clean remote directory」：上传前清空目标目录，用于整目录替换部署。
+		// 递归删除不可逆，日志里明确写出被清空的路径，便于事后排查。
+		fmt.Fprintf(out, "[ssh] clean remote directory %s (cleanRemote=true)\n", base)
+		if err = sftpCli.RemoveAll(base); err != nil {
+			return fmt.Errorf("ssh publish: clean %s: %w", base, err)
+		}
+	}
 	if err = sftpCli.MkdirAll(base); err != nil {
 		return fmt.Errorf("ssh publish: mkdir %s: %w", base, err)
 	}
@@ -238,6 +258,7 @@ func (p *SshPublisher) upload(ctx context.Context, client *ssh.Client, cfg *mode
 		}
 		rel := relativeTo(workspace, local)
 		rel = applyRemovePrefix(rel, cfg.RemovePrefix)
+		rel = applyFlatten(rel, cfg.Flatten)
 		remotePath := path.Join(base, rel)
 
 		if err = sftpCli.MkdirAll(path.Dir(remotePath)); err != nil {
@@ -305,6 +326,15 @@ func (p *SshPublisher) runCommand(ctx context.Context, client *ssh.Client, cmd s
 	}
 	fmt.Fprintln(out, "[ssh] remote command finished")
 	return nil
+}
+
+// applyFlatten 对齐 Jenkins「Flatten files」：开启后只保留文件名、丢弃相对目录。
+// 单独抽出来是为了能在没有 SSH 服务端的单测里覆盖路径决策。
+func applyFlatten(rel string, flatten bool) string {
+	if !flatten {
+		return rel
+	}
+	return path.Base(rel)
 }
 
 // matchFiles 展开待上传文件，支持 Jenkins 风格的 ** 递归通配与目录模式。

@@ -51,8 +51,8 @@ export function usePipeline() {
     store.removeById(id)
   }
 
-  async function triggerBuild(id: string): Promise<Build> {
-    return pipelineApi.build(id)
+  async function triggerBuild(id: string, params?: Record<string, string>): Promise<Build> {
+    return pipelineApi.build(id, params)
   }
 
   return { store, loading, error, fetchList, fetchOne, save, remove, triggerBuild }

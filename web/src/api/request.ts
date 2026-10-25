@@ -106,6 +106,44 @@ export const http = {
   del<T>(path: string): Promise<T> {
     return request<T>(path, { method: 'DELETE' })
   },
+  // 取纯文本响应（如导出的 config.json 文档：不是统一包装，需要原样保存）。
+  async getText(path: string): Promise<string> {
+    const headers = new Headers()
+    const token = getToken()
+    if (token) {
+      headers.set('Authorization', `Bearer ${token}`)
+    }
+    const response = await fetch(`${BASE_URL}${path}`, { headers })
+    if (!response.ok) {
+      throw new ApiError(response.status, `HTTP ${response.status}`)
+    }
+    const text = await response.text()
+    // 出错时后端仍返回统一 JSON 包装，需要按业务码提示，而不是把错误 JSON 存成配置文件。
+    if (text.trimStart().startsWith('{')) {
+      try {
+        const body = JSON.parse(text) as ApiResponse<unknown>
+        if (typeof body.code === 'number' && body.code !== 0) {
+          if (body.code === CODE_UNAUTHORIZED) {
+            redirectToLogin()
+          }
+          throw new ApiError(body.code, body.msg)
+        }
+      } catch (error) {
+        if (error instanceof ApiError) {
+          throw error
+        }
+      }
+    }
+    return text
+  },
+  // 原样发送文本请求体（如 Jenkins config.xml），不走 JSON 序列化。
+  postRaw<T>(path: string, body: string, contentType: string): Promise<T> {
+    return request<T>(path, {
+      method: 'POST',
+      headers: { 'Content-Type': contentType },
+      body,
+    })
+  },
   download(path: string): Promise<Blob> {
     return requestBlob(path)
   },

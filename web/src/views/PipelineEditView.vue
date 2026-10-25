@@ -4,8 +4,9 @@ import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import ArtifactConfig from '@/components/ArtifactConfig.vue'
 import NotifyConfig from '@/components/NotifyConfig.vue'
+import ParamConfig from '@/components/ParamConfig.vue'
 import StepEditor from '@/components/StepEditor.vue'
-import SshPublishConfig from '@/components/SshPublishConfig.vue'
+import SshPublishEditor from '@/components/SshPublishConfig.vue'
 import { describeError } from '@/api/request'
 import { pipelineApi } from '@/api/pipeline'
 import { credentialApi } from '@/api/system'
@@ -22,10 +23,12 @@ import {
   type NotifyTarget,
   type Pipeline,
   type PipelinePayload,
+  type SshPublishConfig,
 } from '@/types/pipeline'
 import type { Credential } from '@/types/system'
 import { applyJobTypePreset, findJobType } from '@/types/jobType'
 import { validatePipeline } from '@/utils/validate'
+import { downloadText } from '@/utils/download'
 
 const props = defineProps<{ pipelineId?: string }>()
 
@@ -138,6 +141,11 @@ function toPayload(pipeline: Pipeline): PipelinePayload {
       enabled: pipeline.artifacts?.enabled ?? false,
       files: [...(pipeline.artifacts?.files ?? [])],
     },
+    // 参数定义：深拷贝 options，避免编辑表单时改到 store 里的任务对象。
+    params: (pipeline.params ?? []).map((def) => ({
+      ...def,
+      options: [...(def.options ?? [])],
+    })),
     // 通知：任务级配置（人员/群/事件）；null 表示沿用全局默认。
     notify: pipeline.notify
       ? {
@@ -171,15 +179,74 @@ function toPayload(pipeline: Pipeline): PipelinePayload {
         }
       : null,
     // 敏感字段不回显：密码置空，服务端会沿用旧值。
-    ssh_publish: pipeline.ssh_publish
-      ? {
-          ...pipeline.ssh_publish,
-          server_id: pipeline.ssh_publish.server_id ?? '',
-          password: '',
-          source_files: [...pipeline.ssh_publish.source_files],
-        }
-      : emptySshPublish(),
+    ssh_publish: null,
+    ssh_publishes: sshPublishesOf(pipeline),
   }
+}
+
+// sshPublishesOf 把接口返回的发布配置归一为列表：
+// 新数据用 ssh_publishes；旧数据只有 ssh_publish（单目标），迁移成一个目标。
+function sshPublishesOf(pipeline: Pipeline): SshPublishConfig[] {
+  const raw =
+    pipeline.ssh_publishes && pipeline.ssh_publishes.length > 0
+      ? pipeline.ssh_publishes
+      : pipeline.ssh_publish
+        ? [pipeline.ssh_publish]
+        : []
+  const list = raw.map((item, index) => ({
+    ...item,
+    name: item.name?.trim() ? item.name : `发布 ${index + 1}`,
+    server_id: item.server_id ?? '',
+    password: '',
+    source_files: [...(item.source_files ?? [])],
+  }))
+  return list.length > 0 ? list : [emptySshPublish()]
+}
+
+// 导出配置：只读接口，不会保存当前未保存的修改（避免把半成品导出成「正式配置」）。
+const exporting = ref(false)
+async function onExport(): Promise<void> {
+  if (!props.pipelineId) return
+  exporting.value = true
+  try {
+    const text = await pipelineApi.exportConfig(props.pipelineId)
+    downloadText(`${form.value.name || props.pipelineId}-config.json`, text)
+    ElMessage.success('配置已导出（不含密钥）')
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    exporting.value = false
+  }
+}
+
+// paramCount 与 envTools 只用于在配置页展示「当前实际生效」的状态，
+// 避免出现「页面写着不支持、其实已经支持」这类误导性提示。
+const paramCount = computed(() => form.value.params?.length ?? 0)
+
+// envTools 从全局工具配置里取出与本任务最相关的工具主目录（对齐 Jenkins 的 JDK / NodeJS 选择）。
+const envTools = computed(() => {
+  const categories = settingsStore.data?.tool_categories ?? []
+  const wanted: Array<{ id: string; label: string }> = [
+    { id: 'jdk', label: 'JDK (JAVA_HOME)' },
+    { id: 'nodejs', label: 'NodeJS (NODE_HOME)' },
+    { id: 'maven', label: 'Maven (MAVEN_HOME)' },
+    { id: 'golang', label: 'Go (GOROOT)' },
+  ]
+  return wanted.map((item) => {
+    const category = categories.find((c) => c.id === item.id)
+    const withHome = category?.installations.find((i) => (i.home ?? '').trim() !== '')
+    return { id: item.id, label: item.label, home: withHome?.home ?? '' }
+  })
+})
+
+function addSshPublish(): void {
+  const list = form.value.ssh_publishes ?? []
+  form.value.ssh_publishes = [...list, emptySshPublish()]
+}
+
+function removeSshPublish(index: number): void {
+  const list = form.value.ssh_publishes ?? []
+  form.value.ssh_publishes = list.filter((_, i) => i !== index)
 }
 
 onMounted(async () => {
@@ -370,23 +437,27 @@ async function onSave(): Promise<void> {
   }
   saving.value = true
   try {
-    // 关闭 SSH 发布时保留已填写的配置（与 Jenkins 一致），只有完全空白时才落为 null。
-    const ssh = form.value.ssh_publish
-    const sshConfigured =
-      !!ssh &&
-      (ssh.enabled ||
-        ssh.host.trim() !== '' ||
-        ssh.username.trim() !== '' ||
-        ssh.remote_base_dir.trim() !== '' ||
-        ssh.private_key_path.trim() !== '' ||
-        ssh.source_files.length > 0 ||
-        ssh.exec_command.trim() !== '')
+    // 关闭的发布目标仍保留已填写内容（与 Jenkins 一致），只丢弃完全空白的行。
+    const publishes = (form.value.ssh_publishes ?? [])
+      .map((item, index) => ({ ...item, name: item.name?.trim() || `发布 ${index + 1}` }))
+      .filter(
+        (item) =>
+          item.enabled ||
+          item.server_id !== '' ||
+          item.host.trim() !== '' ||
+          item.username.trim() !== '' ||
+          item.remote_base_dir.trim() !== '' ||
+          item.private_key_path.trim() !== '' ||
+          item.source_files.length > 0 ||
+          item.exec_command.trim() !== '',
+      )
     const payload: PipelinePayload = {
       ...form.value,
       // 只有选择 Git 时才提交仓库与凭据；切回“无”后保存即禁用，但切回 Git 时已填内容仍在。
       git_url: scm.value === 'git' ? form.value.git_url.trim() : '',
       git_credential_id: scm.value === 'git' ? form.value.git_credential_id : '',
-      ssh_publish: sshConfigured ? ssh : null,
+      ssh_publish: null,
+      ssh_publishes: publishes,
     }
     const pipeline = await save(props.pipelineId ?? null, payload)
     ElMessage.success(isEdit.value ? '已保存' : `任务已创建（id=${pipeline.id}）`)
@@ -445,9 +516,9 @@ function copyWebhook(): void {
     <nav class="configure__nav">
       <a @click="scrollTo('general')">General</a>
       <a @click="scrollTo('scm')">源码管理</a>
-      <a @click="scrollTo('triggers')">Triggers</a>
+      <a @click="scrollTo('triggers')">构建触发器</a>
       <a @click="scrollTo('environment')">构建环境</a>
-      <a @click="scrollTo('steps')">Build Steps</a>
+      <a @click="scrollTo('steps')">构建步骤</a>
       <a @click="scrollTo('postbuild')">构建后操作</a>
     </nav>
 
@@ -473,10 +544,30 @@ function copyWebhook(): void {
             </el-form-item>
           </template>
           <el-form-item label="参数化构建过程">
-            <el-alert type="info" :closable="false" show-icon title="基础版暂不支持参数化构建。" />
+            <div class="inline-row">
+              <el-tag v-if="paramCount > 0" type="success" effect="plain" disable-transitions>
+                已定义 {{ paramCount }} 个参数
+              </el-tag>
+              <el-tag v-else type="info" effect="plain" disable-transitions>未定义参数</el-tag>
+              <el-button size="small" @click="scrollTo('params')">编辑参数</el-button>
+            </div>
+            <div class="form-tip">定义参数后，触发构建会先弹出参数表单；参数以环境变量注入步骤并快照进构建记录。</div>
           </el-form-item>
           <el-form-item label="在必要的时候并发构建">
-            <el-alert type="info" :closable="false" show-icon title="基础版不做并发限制，构建按 worker 数量串行排队。" />
+            <el-alert
+              type="info"
+              :closable="false"
+              show-icon
+              title="平台对同一任务固定串行执行（避免多个构建同时写同一工作区），不同任务按 worker 数量并行；与 Jenkins 的「并发构建」开关等价于关闭。"
+            />
+          </el-form-item>
+          <el-form-item label="禁用任务">
+            <el-alert
+              type="info"
+              :closable="false"
+              show-icon
+              title="平台没有「禁用任务」开关：需要暂停自动触发时，清空「定时构建」并删除代码平台的 Webhook 即可；全站暂停请用「系统管理 → 准备关机」。"
+            />
           </el-form-item>
         </el-form>
       </section>
@@ -530,7 +621,7 @@ function copyWebhook(): void {
       </section>
 
       <section id="triggers" class="config-section">
-        <h2 class="config-section__title">Triggers</h2>
+        <h2 class="config-section__title">构建触发器</h2>
         <p class="config-section__hint">根据事件自动触发构建，如代码提交或远程调用。</p>
         <el-form label-width="160px" label-position="right">
           <el-form-item label="触发远程构建">
@@ -562,12 +653,19 @@ function copyWebhook(): void {
               按任务名散列偏移，避免集中触发）；修改后保存即生效，触发记录在构建历史中显示为「定时触发」。
             </div>
           </el-form-item>
+          <el-form-item label="代码平台事件">
+            <div class="form-tip">
+              GitLab / GitHub 的 <span class="mono">Push</span>（含新分支、Tag）事件会触发构建；
+              Merge Request / Pull Request 事件平台不区分（收到即按分支参数构建），请在代码平台只勾选 Push。
+              Jenkins 的「ciSkip / MR 审批后触发 / 备注重试」等选项平台不支持；跳过构建请在提交信息里不触发代码平台 Webhook。
+            </div>
+          </el-form-item>
           <el-form-item label="其他触发器">
             <el-alert
               type="info"
               :closable="false"
               show-icon
-              title="SCM 轮询在当前版本中暂不支持，可用定时构建替代。"
+              title="SCM 轮询在当前版本中暂不支持，可用定时构建替代；上游/下游任务链（build after other projects）也不支持。"
             />
           </el-form-item>
         </el-form>
@@ -591,20 +689,46 @@ function copyWebhook(): void {
               默认复用工作区：Git 只做增量 fetch，保留上次构建产物与依赖缓存。
             </div>
           </el-form-item>
+          <el-form-item label="构建工具版本">
+            <div class="tool-homes">
+              <div v-for="tool in envTools" :key="tool.id" class="tool-homes__item">
+                <span class="tool-homes__label">{{ tool.label }}</span>
+                <span v-if="tool.home" class="mono tool-homes__value">{{ tool.home }}</span>
+                <span v-else class="tool-homes__missing">未在「全局工具配置」中填写主目录，按系统 PATH 执行</span>
+              </div>
+            </div>
+            <div class="form-tip">
+              Jenkins 里每个任务可选 JDK / NodeJS 安装项；平台把版本收在「系统管理 → 全局工具配置」，
+              构建时把主目录注入 <span class="mono">JAVA_HOME</span>/<span class="mono">NODE_HOME</span> 等变量并前置到
+              <span class="mono">PATH</span>。需要不同版本请在该页面维护（或在该步骤里显式使用绝对路径）。
+            </div>
+          </el-form-item>
           <el-form-item label="其他环境配置">
             <el-alert
               type="info"
               :closable="false"
               show-icon
-              title="密钥文件、配置文件、NodeJS 环境、时间戳前缀等由全局环境变量与「全局工具配置」中的主目录统一提供。"
+              title="密钥文件、配置文件、时间戳前缀等由全局环境变量提供；平台日志自带时间戳，无需 Timestamper。"
             />
           </el-form-item>
         </el-form>
       </section>
 
+      <section id="params" class="config-section">
+        <h2 class="config-section__title">参数化构建</h2>
+        <p class="config-section__hint">
+          定义参数后，点击「构建」会先弹出参数表单；参数以环境变量形式传给构建步骤。
+        </p>
+        <el-form label-width="160px" label-position="right">
+          <el-form-item label="构建参数">
+            <ParamConfig v-model="form.params" />
+          </el-form-item>
+        </el-form>
+      </section>
+
       <section id="steps" class="config-section">
-        <h2 class="config-section__title">Build Steps</h2>
-        <p class="config-section__hint">按顺序编排构建任务，如编译、测试与打包。</p>
+        <h2 class="config-section__title">构建步骤</h2>
+        <p class="config-section__hint">按顺序编排构建任务，如编译、测试与打包；每步可单独设置超时、重试与失败处理。</p>
         <el-form label-width="160px" label-position="right">
           <el-form-item label="执行方式">
             <el-tag type="info" effect="plain" disable-transitions>本地服务器</el-tag>
@@ -616,7 +740,9 @@ function copyWebhook(): void {
           </el-form-item>
           <el-form-item label="执行 shell">
             <StepEditor v-model="form.steps" />
-            <div class="form-tip">每个步骤通过 shell 串行执行，退出码非零即失败。</div>
+            <div class="form-tip">
+              步骤通过 shell 串行执行，退出码非零即失败（可在「高级选项」里设置超时/重试/允许失败/执行条件）。
+            </div>
           </el-form-item>
         </el-form>
       </section>
@@ -625,8 +751,44 @@ function copyWebhook(): void {
         <h2 class="config-section__title">构建后操作</h2>
         <p class="config-section__hint">构建完成后的动作：先归档产物，再执行 SSH 发布与通知。</p>
         <ArtifactConfig v-if="form.artifacts" v-model="form.artifacts" />
-        <SshPublishConfig v-if="form.ssh_publish" v-model="form.ssh_publish" />
-        <el-alert v-else type="info" :closable="false" show-icon title="当前任务未配置 SSH 发布" />
+        <div class="ssh-targets">
+          <div class="ssh-targets__head">
+            <span class="ssh-targets__title">SSH 发布（可配置多个目标）</span>
+            <el-button size="small" @click="addSshPublish">添加发布目标</el-button>
+          </div>
+          <div
+            v-for="(target, index) in form.ssh_publishes"
+            :key="'ssh-' + index"
+            class="ssh-targets__item"
+          >
+            <div class="ssh-targets__item-head">
+              <span class="ssh-targets__name">目标 {{ index + 1 }}</span>
+              <el-input
+                :model-value="target.name ?? ''"
+                placeholder="目标名称，如 生产 / 备份"
+                style="width: 220px"
+                @update:model-value="(value: string) => (target.name = value)"
+              />
+              <el-button
+                v-if="(form.ssh_publishes ?? []).length > 1"
+                link
+                type="danger"
+                @click="removeSshPublish(index)"
+              >删除</el-button>
+            </div>
+            <SshPublishEditor
+              v-model="form.ssh_publishes[index]"
+              :title="`发布目标：${target.name || '未命名'}`"
+            />
+          </div>
+          <el-alert
+            v-if="!(form.ssh_publishes ?? []).length"
+            type="info"
+            :closable="false"
+            show-icon
+            title="当前任务未配置 SSH 发布"
+          />
+        </div>
         <NotifyConfig
           v-model="form.notify"
           :contacts="notifyContacts"
@@ -638,6 +800,7 @@ function copyWebhook(): void {
       <div class="configure__footer">
         <el-button type="primary" :loading="saving" @click="onSave">保存</el-button>
         <el-button @click="onCancel">取消</el-button>
+        <el-button v-if="props.pipelineId" :loading="exporting" @click="onExport">导出配置</el-button>
       </div>
     </el-card>
 
@@ -666,6 +829,67 @@ function copyWebhook(): void {
 </template>
 
 <style scoped>
+.inline-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.tool-homes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+}
+.tool-homes__item {
+  display: flex;
+  gap: 10px;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.tool-homes__label {
+  flex: none;
+  width: 170px;
+  color: var(--text-2, #606266);
+}
+.tool-homes__value {
+  color: var(--text-1, #303133);
+  word-break: break-all;
+}
+.tool-homes__missing {
+  color: var(--text-3, #909399);
+}
+
+.ssh-targets {
+  margin-top: 12px;
+}
+.ssh-targets__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.ssh-targets__title {
+  font-weight: 600;
+  font-size: 14px;
+}
+.ssh-targets__item {
+  border: 1px solid var(--border-color, #e4e7ed);
+  border-radius: 6px;
+  padding: 10px 12px 4px;
+  margin-bottom: 12px;
+}
+.ssh-targets__item-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.ssh-targets__name {
+  color: var(--text-3, #909399);
+  font-size: 12.5px;
+}
+
 .type-tag {
   margin-left: 10px;
   vertical-align: middle;

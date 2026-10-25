@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -34,6 +36,19 @@ func (s *PipelineStore) JobDir(id string) string {
 // configPath 返回 config.json 路径。
 func (s *PipelineStore) configPath(id string) string {
 	return filepath.Join(s.JobDir(id), configFileName)
+}
+
+// WriteAuxFile 在任务目录下写辅助文件（如导入来源 jenkins-config.xml）。
+// 文件名限定为单段安全名称，避免调用方把它变成路径穿越入口。
+func (s *PipelineStore) WriteAuxFile(id, name string, data []byte) error {
+	if id == "" || name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("invalid aux file %q/%q", id, name)
+	}
+	dir := s.JobDir(id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, name), data, 0o644)
 }
 
 // Exists 判断 pipeline 目录是否存在。

@@ -31,6 +31,15 @@ func sanitizePipeline(p *model.Pipeline) *model.Pipeline {
 	if p.SshPublish != nil {
 		p.SshPublish.Password = ""
 	}
+	if len(p.SshPublishes) > 0 {
+		// 多目标：旧版内联配置可能带密码，逐个清空（不改动共享切片指向的原数据）。
+		list := make([]model.SshPublishConfig, len(p.SshPublishes))
+		copy(list, p.SshPublishes)
+		for i := range list {
+			list[i].Password = ""
+		}
+		p.SshPublishes = list
+	}
 	// 任务级通知的群机器人 URL 含 access_token（Slack 还在 path 尾段）：
 	// 返回时按渠道脱敏（保留结构，值置 ***）。
 	// 升级群与分支路由的群同样含密钥，必须一并脱敏，否则等于把 token 直接吐给前端。
@@ -167,7 +176,20 @@ func (h *PipelineHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 // TriggerBuild POST /api/pipelines/{id}/build
 func (h *PipelineHandler) TriggerBuild(w http.ResponseWriter, r *http.Request) {
-	h.trigger(w, r, chi.URLParam(r, "pid"), model.TriggerManual, pkg.UserFromContext(r.Context()))
+	// body 可选（老前端/CI 脚本可能不带 body）；带参数时才解析。
+	var in triggerRequest
+	if r.ContentLength != 0 {
+		if err := decodeJSON(w, r, &in); err != nil {
+			pkg.Fail(w, err)
+			return
+		}
+	}
+	h.trigger(w, r, chi.URLParam(r, "pid"), model.TriggerManual, pkg.UserFromContext(r.Context()), in.Params)
+}
+
+// triggerRequest 是触发构建的请求体：params 为参数化构建的用户填值。
+type triggerRequest struct {
+	Params map[string]string `json:"params"`
 }
 
 // Rename POST /api/pipelines/{id}/rename
@@ -188,8 +210,8 @@ func (h *PipelineHandler) Rename(w http.ResponseWriter, r *http.Request) {
 }
 
 // trigger 是手动与 Webhook 共用的触发入口。
-func (h *PipelineHandler) trigger(w http.ResponseWriter, r *http.Request, pipelineID string, t model.TriggerType, triggeredBy string) {
-	b, err := h.builds.Trigger(r.Context(), pipelineID, t, triggeredBy)
+func (h *PipelineHandler) trigger(w http.ResponseWriter, r *http.Request, pipelineID string, t model.TriggerType, triggeredBy string, params map[string]string) {
+	b, err := h.builds.Trigger(r.Context(), pipelineID, t, triggeredBy, params)
 	if err != nil {
 		pkg.Fail(w, err)
 		return

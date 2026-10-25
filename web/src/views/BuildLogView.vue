@@ -21,6 +21,9 @@ const router = useRouter()
 const log = useBuildLog(props.pipelineId, props.buildId)
 const settingsStore = useSettingsStore()
 const authStore = useAuthStore()
+// 本次构建的参数快照（参数化构建才非空）：复盘时能确认「用的哪个版本/环境」。
+const buildParams = ref<Record<string, string>>({})
+const paramNames = computed(() => Object.keys(buildParams.value).sort())
 
 // 手动取消运行中/等待中的构建（对齐 Jenkins Stop Build）。
 const cancelling = ref(false)
@@ -67,6 +70,16 @@ const artifactTotal = ref(0)
 const artifactsLoading = ref(false)
 let artifactsLoaded = false
 
+// loadBuildParams 读取构建记录里的参数快照；失败不影响日志查看。
+async function loadBuildParams(): Promise<void> {
+  try {
+    const build = await buildApi.get(props.pipelineId, props.buildId)
+    buildParams.value = build.params ?? {}
+  } catch {
+    buildParams.value = {}
+  }
+}
+
 async function loadArtifacts(): Promise<void> {
   if (artifactsLoaded || !log.finished.value) {
     return
@@ -98,6 +111,7 @@ const statusPolling = usePolling(async () => {
 
 onMounted(async () => {
   await log.start()
+  void loadBuildParams()
   if (log.finished.value) {
     await loadArtifacts()
   } else {
@@ -165,6 +179,8 @@ async function downloadAll(): Promise<void> {
 // ===== 重新发布（把本次构建产物直接发到 SSH，不重新编译）=====
 const republishVisible = ref(false)
 const republishServerId = ref('')
+// 多目标任务：选择要重新发布到哪个目标（名称）。
+const republishTarget = ref('')
 const republishing = ref(false)
 const pipelineConfig = ref<Pipeline | null>(null)
 
@@ -172,8 +188,24 @@ const canRepublish = computed(
   () => log.status.value === 'success' && artifacts.value.length > 0,
 )
 
+// publishTargets 返回任务里启用的发布目标（兼容旧版单目标配置）。
+const publishTargets = computed(() => {
+  const p = pipelineConfig.value
+  if (!p) return []
+  const list =
+    p.ssh_publishes && p.ssh_publishes.length > 0
+      ? p.ssh_publishes
+      : p.ssh_publish
+        ? [p.ssh_publish]
+        : []
+  return list
+    .filter((item) => item.enabled)
+    .map((item, index) => ({ name: item.name || `发布 ${index + 1}`, serverId: item.server_id }))
+})
+
 async function openRepublish(): Promise<void> {
   republishServerId.value = ''
+  republishTarget.value = ''
   republishVisible.value = true
   void settingsStore.fetch()
   if (!pipelineConfig.value) {
@@ -183,7 +215,11 @@ async function openRepublish(): Promise<void> {
       // 拿不到任务配置时让用户手动选服务器
     }
   }
-  republishServerId.value = pipelineConfig.value?.ssh_publish?.server_id ?? ''
+  const first = publishTargets.value[0]
+  if (first) {
+    republishTarget.value = first.name
+    republishServerId.value = first.serverId ?? ''
+  }
 }
 
 async function submitRepublish(): Promise<void> {
@@ -193,7 +229,12 @@ async function submitRepublish(): Promise<void> {
   }
   republishing.value = true
   try {
-    await buildApi.republish(props.pipelineId, props.buildId, republishServerId.value)
+    await buildApi.republish(
+      props.pipelineId,
+      props.buildId,
+      republishServerId.value,
+      republishTarget.value,
+    )
     ElMessage.success('重新发布完成')
     republishVisible.value = false
     // 发布日志追加在本次构建的 log.txt 中，重新拉取一次展示
@@ -246,6 +287,17 @@ async function submitRepublish(): Promise<void> {
       style="margin-bottom: 12px"
     />
 
+    <el-card v-if="paramNames.length" shadow="never" class="param-card">
+      <template #header>
+        <span class="param-card__title">构建参数</span>
+      </template>
+      <el-descriptions :column="2" size="small" border>
+        <el-descriptions-item v-for="name in paramNames" :key="name" :label="name">
+          <span class="mono">{{ buildParams[name] }}</span>
+        </el-descriptions-item>
+      </el-descriptions>
+    </el-card>
+
     <LogTerminal :lines="log.lines.value" />
 
     <el-card v-if="artifacts.length > 0" v-loading="artifactsLoading" shadow="never" class="artifact-card">
@@ -287,6 +339,19 @@ async function submitRepublish(): Promise<void> {
 
     <el-dialog v-model="republishVisible" title="重新发布产物" width="480px">
       <el-form label-width="120px">
+        <el-form-item v-if="publishTargets.length > 0" label="发布目标">
+          <el-select v-model="republishTarget" placeholder="选择任务里配置的目标" style="width: 100%">
+            <el-option
+              v-for="target in publishTargets"
+              :key="target.name"
+              :label="target.name"
+              :value="target.name"
+            />
+          </el-select>
+          <div class="form-tip">
+            来自任务的「构建后操作 → SSH 发布」；选目标时服务器会自动带出，也可在下方临时覆盖。
+          </div>
+        </el-form-item>
         <el-form-item label="SSH 服务器">
           <el-select v-model="republishServerId" placeholder="选择发布目标" style="width: 100%">
             <el-option
@@ -310,6 +375,13 @@ async function submitRepublish(): Promise<void> {
 </template>
 
 <style scoped>
+.param-card {
+  margin-bottom: 12px;
+}
+.param-card__title {
+  font-weight: 600;
+}
+
 .build-log__actions {
   display: flex;
   align-items: center;

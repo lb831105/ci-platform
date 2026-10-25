@@ -4,7 +4,11 @@ import { RouterLink } from 'vue-router'
 import { useSettingsStore } from '@/stores/settingsStore'
 import type { SshPublishConfig } from '@/types/pipeline'
 
-const props = defineProps<{ modelValue: SshPublishConfig }>()
+const props = defineProps<{
+  modelValue: SshPublishConfig
+  // 多目标编辑时由父组件传入「发布目标：<名称>」，单目标可省略。
+  title?: string
+}>()
 
 const emit = defineEmits<{
   (event: 'update:modelValue', value: SshPublishConfig): void
@@ -34,7 +38,7 @@ function updateSourceFiles(value: string[]): void {
   <el-collapse class="ssh-config">
     <el-collapse-item name="ssh">
       <template #title>
-        <span class="ssh-config__title">SSH 发布（Publish Over SSH）</span>
+        <span class="ssh-config__title">{{ title ?? 'SSH 发布（Publish Over SSH）' }}</span>
         <el-tag v-if="config.enabled" type="warning" effect="plain" size="small" disable-transitions>
           已启用
         </el-tag>
@@ -156,6 +160,31 @@ function updateSourceFiles(value: string[]): void {
             />
           </el-form-item>
 
+          <el-form-item label="目录与文件">
+            <div class="ssh-config__options">
+              <el-checkbox
+                :model-value="config.flatten ?? false"
+                @update:model-value="(value: boolean) => patch({ flatten: value })"
+              >平铺文件（Flatten files）</el-checkbox>
+              <el-checkbox
+                :model-value="config.clean_remote ?? false"
+                @update:model-value="(value: boolean) => patch({ clean_remote: value })"
+              >发布前清空远程目录（Clean remote）</el-checkbox>
+            </div>
+            <div class="form-tip">
+              「平铺」只上传文件名、不保留工作区里的目录结构（对齐 Jenkins Flatten files）；
+              「清空」会在上传前递归删除远程基础目录，适合整目录替换部署——不可逆，请确认目录填写正确。
+            </div>
+            <el-alert
+              v-if="config.clean_remote"
+              type="warning"
+              :closable="false"
+              show-icon
+              style="width: 100%; margin-top: 8px"
+              :title="`每次发布都会先删除远程目录 ${config.remote_base_dir || selectedServer?.remote_base_dir || '（未填写）'} 下的全部内容`"
+            />
+          </el-form-item>
+
           <el-form-item label="远程执行命令">
             <el-input
               :model-value="config.exec_command"
@@ -167,6 +196,21 @@ function updateSourceFiles(value: string[]): void {
             />
             <div class="form-tip">为空则只上传文件不执行命令；输出会合并到构建日志。</div>
           </el-form-item>
+
+          <el-form-item label="命令超时（秒）">
+            <el-input-number
+              :model-value="config.exec_timeout_sec ?? 0"
+              :min="0"
+              :max="86400"
+              :step="30"
+              :disabled="!config.exec_command.trim()"
+              controls-position="right"
+              @update:model-value="(value: number | undefined) => patch({ exec_timeout_sec: value ?? 0 })"
+            />
+            <div class="form-tip">
+              0 表示沿用构建级超时（全局「单次构建超时」）；超时会终止远程会话并让发布失败（对齐 Jenkins execTimeout）。
+            </div>
+          </el-form-item>
         </template>
       </el-form>
     </el-collapse-item>
@@ -174,6 +218,13 @@ function updateSourceFiles(value: string[]): void {
 </template>
 
 <style scoped>
+.ssh-config__options {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
 .ssh-config__title {
   margin-right: 8px;
   font-weight: 500;

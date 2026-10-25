@@ -21,17 +21,19 @@ import (
 type Deps struct {
 	Config *config.Config
 
-	Pipeline   *handler.PipelineHandler
-	Build      *handler.BuildHandler
-	Webhook    *handler.WebhookHandler
-	WebSocket  *handler.WSHandler
-	Auth       *handler.AuthHandler
-	System     *handler.SystemHandler
-	Credential *handler.CredentialHandler
-	RBAC       *handler.RbacHandler
-	View       *handler.ViewHandler
-	Notify     *handler.NotifyHandler
-	Profile    *handler.ProfileHandler
+	Pipeline    *handler.PipelineHandler
+	Build       *handler.BuildHandler
+	Webhook     *handler.WebhookHandler
+	WebSocket   *handler.WSHandler
+	Auth        *handler.AuthHandler
+	System      *handler.SystemHandler
+	Credential  *handler.CredentialHandler
+	RBAC        *handler.RbacHandler
+	View        *handler.ViewHandler
+	Notify      *handler.NotifyHandler
+	Profile     *handler.ProfileHandler
+	Import      *handler.ImportHandler
+	Portability *handler.PortabilityHandler
 
 	// AuthService 同时供中间件校验会话。为 nil 或未启用时接口不鉴权。
 	AuthService *service.AuthService
@@ -168,6 +170,15 @@ func New(d Deps) http.Handler {
 				r.With(perm(model.PermSystemManage)).Post("/old-data/clean", d.System.CleanOldData)
 				r.With(perm(model.PermSystemRead)).Get("/data-home", d.System.GetDataHome)
 				r.With(perm(model.PermSystemManage)).Put("/data-home", d.System.UpdateDataHome)
+				// 从其它 CI 导入任务（当前支持 Jenkins config.xml）：管理员操作，
+				// 会创建任务与工作区，因此用系统管理权限而不是任务权限。
+				if d.Import != nil {
+					r.With(perm(model.PermSystemManage)).Post("/import/jenkins", d.Import.Jenkins)
+				}
+				// 导入平台自有 JSON 配置（导出文档或原生 config.json）。
+				if d.Portability != nil {
+					r.With(perm(model.PermSystemManage)).Post("/import/config", d.Portability.ImportConfig)
+				}
 			})
 
 			r.Route("/credentials", func(r chi.Router) {
@@ -187,6 +198,11 @@ func New(d Deps) http.Handler {
 
 				r.Route("/{pid}", func(r chi.Router) {
 					r.With(jobPerm(model.PermJobRead)).Get("/", d.Pipeline.Get)
+					// 导出任务配置（对齐 Jenkins 的 job/{name}/config.xml）：返回裸 JSON 文档，
+					// 可直接作为「导入配置」接口的输入，便于实例间搬迁。
+					if d.Portability != nil {
+						r.With(jobPerm(model.PermJobRead)).Get("/config.json", d.Portability.ExportConfig)
+					}
 					r.With(jobPerm(model.PermJobConfigure)).Put("/", d.Pipeline.Update)
 					r.With(jobPerm(model.PermJobDelete)).Delete("/", d.Pipeline.Delete)
 					r.With(jobPerm(model.PermJobBuild)).Post("/build", d.Pipeline.TriggerBuild)

@@ -1,0 +1,173 @@
+package logger
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// fakeSink 记录推给内存缓冲的条目。
+type fakeSink struct{ entries []string }
+
+func (f *fakeSink) Push(_ time.Time, level, message string) {
+	f.entries = append(f.entries, level+" "+message)
+}
+
+// dayPath 返回「月目录 / 天文件」的路径（按天记录、按月轮换）。
+func dayPath(dir string, at time.Time) string {
+	return filepath.Join(dir, at.Format("2006-01"), "app-"+at.Format("2006-01-02")+".log")
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(data)
+}
+
+func TestLevelFiltering(t *testing.T) {
+	dir := t.TempDir()
+	sink := &fakeSink{}
+	if err := Init(Options{Dir: dir, Level: LevelWarn, Stdout: os.Stderr, Sink: sink}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	defer func() { _ = Close() }()
+
+	Debugf("debug 不应出现")
+	Infof("info 也不应出现")
+	Warnf("warn 应出现")
+	Errorf("error 应出现")
+
+	content := readFile(t, dayPath(dir, time.Now()))
+	if strings.Contains(content, "不应出现") {
+		t.Fatalf("below-level logs must be dropped, got:\n%s", content)
+	}
+	if !strings.Contains(content, "WARN  warn 应出现") || !strings.Contains(content, "ERROR error 应出现") {
+		t.Fatalf("expected warn/error lines with level column, got:\n%s", content)
+	}
+	if len(sink.entries) != 2 {
+		t.Fatalf("sink should receive only passing levels, got %v", sink.entries)
+	}
+}
+
+// 按天切文件、按月换目录：同一天写同一文件，跨天换文件，跨月换目录并清理过期月份。
+func TestDailyFilesInMonthlyDirs(t *testing.T) {
+	dir := t.TempDir()
+	// 预置一个很老的月份目录，验证保留策略会整月删除。
+	oldDir := filepath.Join(dir, "2020-01")
+	if err := os.MkdirAll(oldDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldDir, "app-2020-01-05.log"), []byte("ancient"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 预置一个非月份目录，必须原样保留（不能误删用户自己建的东西）。
+	keepDir := filepath.Join(dir, "custom")
+	if err := os.MkdirAll(keepDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	if err := Init(Options{
+		Dir: dir, Level: LevelInfo, RetainMonths: 2, Stdout: os.Stderr, Now: clock,
+	}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	defer func() { _ = Close() }()
+
+	Infof("三月三十日")
+	if _, err := os.Stat(oldDir); !os.IsNotExist(err) {
+		t.Fatalf("expired month dir must be removed, err=%v", err)
+	}
+	if _, err := os.Stat(keepDir); err != nil {
+		t.Fatalf("non-month dir must be kept: %v", err)
+	}
+	march30 := dayPath(dir, now)
+	if !strings.Contains(readFile(t, march30), "三月三十日") {
+		t.Fatal("same-day log must append to one file")
+	}
+
+	// 同一天再写：仍是同一个文件（不按大小/条数切）。
+	Infof("三月三十日第二条")
+	content := readFile(t, march30)
+	if strings.Count(content, "\n") != 2 {
+		t.Fatalf("same day must reuse the file, got %s", content)
+	}
+
+	// 跨天：换文件，同目录。
+	now = time.Date(2026, 3, 31, 9, 0, 0, 0, time.UTC)
+	Infof("三月三十一日")
+	if !strings.Contains(readFile(t, dayPath(dir, now)), "三月三十一日") {
+		t.Fatal("new day must open a new file")
+	}
+	if !strings.Contains(readFile(t, march30), "三月三十日第二条") {
+		t.Fatal("previous day file must be kept")
+	}
+
+	// 跨月：换目录（一个月一轮换），上月目录保留。
+	now = time.Date(2026, 4, 1, 0, 5, 0, 0, time.UTC)
+	Infof("四月一日")
+	if !strings.Contains(readFile(t, dayPath(dir, now)), "四月一日") {
+		t.Fatal("new month must open a new directory")
+	}
+	for _, month := range []string{"2026-03", "2026-04"} {
+		if _, err := os.Stat(filepath.Join(dir, month)); err != nil {
+			t.Fatalf("%s must be kept: %v", month, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "2026-03", "app-2026-03-31.log")); err != nil {
+		t.Fatalf("march files must be kept after rotation: %v", err)
+	}
+}
+
+// 保留 1 个月时，跨月后上个月目录应被删除。
+func TestRetentionOneMonth(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 3, 20, 8, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	if err := Init(Options{Dir: dir, Level: LevelInfo, RetainMonths: 1, Stdout: os.Stderr, Now: clock}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	defer func() { _ = Close() }()
+	Infof("march")
+	now = time.Date(2026, 4, 2, 8, 0, 0, 0, time.UTC)
+	Infof("april")
+	if _, err := os.Stat(filepath.Join(dir, "2026-03")); !os.IsNotExist(err) {
+		t.Fatalf("previous month dir must be removed with retain=1, err=%v", err)
+	}
+}
+
+func TestParseLevel(t *testing.T) {
+	cases := map[string]Level{"debug": LevelDebug, "INFO": LevelInfo, "warn": LevelWarn, "Warning": LevelWarn, "error": LevelError, "": LevelInfo}
+	for raw, want := range cases {
+		got, err := ParseLevel(raw)
+		if err != nil || got != want {
+			t.Fatalf("ParseLevel(%q) = %v, %v", raw, got, err)
+		}
+	}
+	if _, err := ParseLevel("verbose"); err == nil {
+		t.Fatal("unknown level must error")
+	}
+	if LevelWarn.String() != "WARN " || LevelError.String() != "ERROR" {
+		t.Fatalf("level names must be fixed-width, got %q %q", LevelWarn.String(), LevelError.String())
+	}
+}
+
+// 多行消息（panic 堆栈）必须缩进续行，保证一行一条、可按行 grep。
+func TestMultilineIndented(t *testing.T) {
+	dir := t.TempDir()
+	if err := Init(Options{Dir: dir, Level: LevelInfo, Stdout: os.Stderr}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	defer func() { _ = Close() }()
+	Errorf("第一行\n第二行")
+	content := readFile(t, dayPath(dir, time.Now()))
+	if !strings.Contains(content, "第一行\n    第二行") {
+		t.Fatalf("continuation lines must be indented, got:\n%q", content)
+	}
+}

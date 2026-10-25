@@ -50,6 +50,13 @@ type PipelineExport struct {
 	CronSpec string           `json:"cron_spec,omitempty"`
 	Params   []model.ParamDef `json:"params,omitempty"`
 
+	// Webhook 触发器策略：分支/事件白名单不涉及密钥，可随文档走。
+	WebhookBranchMode string   `json:"webhook_branch_mode,omitempty"`
+	WebhookBranches   []string `json:"webhook_branches,omitempty"`
+	WebhookEvents     []string `json:"webhook_events,omitempty"`
+	// CommitStatus 里的凭据只带名字（跨实例 ID 不同）。
+	CommitStatus *CommitStatusExport `json:"commit_status,omitempty"`
+
 	SshPublishes []SshPublishExport `json:"ssh_publishes,omitempty"`
 
 	Artifacts model.ArtifactConfig `json:"artifacts"`
@@ -63,6 +70,13 @@ type PipelineExport struct {
 
 	// Warnings 说明导出时被清空/降级的内容，导入端与用户都需要知道。
 	Warnings []pkg.Warning `json:"warnings,omitempty"`
+}
+
+// CommitStatusExport 是「构建状态回写」的可搬运形式：凭据按名字对齐。
+type CommitStatusExport struct {
+	Enabled        bool   `json:"enabled"`
+	Project        string `json:"project,omitempty"`
+	CredentialName string `json:"credential_name,omitempty"`
 }
 
 // ImportOptions 是平台配置导入的参数。
@@ -127,6 +141,21 @@ func (s *PortabilityService) Export(ctx context.Context, pipelineID string) (*Pi
 		},
 		BuildRetentionMaxPerJob:  p.BuildRetentionMaxPerJob,
 		BuildRetentionMaxAgeDays: p.BuildRetentionMaxAgeDays,
+		WebhookBranchMode:        p.WebhookBranchMode,
+		WebhookBranches:          append([]string(nil), p.WebhookBranches...),
+		WebhookEvents:            append([]string(nil), p.WebhookEvents...),
+	}
+	if p.CommitStatus.Enabled || strings.TrimSpace(p.CommitStatus.Project) != "" {
+		status := &CommitStatusExport{Enabled: p.CommitStatus.Enabled, Project: p.CommitStatus.Project}
+		if p.CommitStatus.CredentialID != "" {
+			if name := s.credentialName(ctx, p.CommitStatus.CredentialID); name != "" {
+				status.CredentialName = name
+			} else {
+				add(pkg.LevelWarn, "commit_status",
+					"构建状态回写的凭据 %s 未能解析出名称，导入后需要重新选择", p.CommitStatus.CredentialID)
+			}
+		}
+		doc.CommitStatus = status
 	}
 	if p.DeleteWorkspaceBeforeBuild != nil {
 		keep := *p.DeleteWorkspaceBeforeBuild
@@ -370,6 +399,10 @@ var knownDocFields = map[string]bool{
 	"cron_spec": true, "params": true, "ssh_publishes": true, "artifacts": true,
 	"build_retention_max_per_job": true, "build_retention_max_age_days": true,
 	"delete_workspace_before_build": true, "notify": true, "warnings": true,
+	"webhook_branch_mode": true, "webhook_branches": true, "webhook_events": true,
+	"commit_status": true,
+	// 原生 config.json 里的触发器/审批字段（导入时按需读取）
+	"require_approval": true, "approval_timeout_minutes": true,
 	// 原生 config.json 的实例字段（导入时忽略）
 	"id": true, "created_at": true, "updated_at": true, "workspace_dir": true,
 	"executor": true, "image": true, "git_credential_id": true, "ssh_publish": true,
@@ -412,6 +445,17 @@ func (s *PortabilityService) toPipeline(ctx context.Context, exported *PipelineE
 	} else {
 		p.Artifacts = raw.Artifacts
 	}
+	p.WebhookBranchMode = firstNonEmpty(exported.WebhookBranchMode, raw.WebhookBranchMode)
+	if len(exported.WebhookBranches) > 0 {
+		p.WebhookBranches = append([]string(nil), exported.WebhookBranches...)
+	} else {
+		p.WebhookBranches = append([]string(nil), raw.WebhookBranches...)
+	}
+	if len(exported.WebhookEvents) > 0 {
+		p.WebhookEvents = append([]string(nil), exported.WebhookEvents...)
+	} else {
+		p.WebhookEvents = append([]string(nil), raw.WebhookEvents...)
+	}
 	p.BuildRetentionMaxPerJob = firstIntValue(exported.BuildRetentionMaxPerJob, raw.BuildRetentionMaxPerJob)
 	p.BuildRetentionMaxAgeDays = firstIntValue(exported.BuildRetentionMaxAgeDays, raw.BuildRetentionMaxAgeDays)
 	if exported.DeleteWorkspaceBeforeBuild != nil {
@@ -439,6 +483,33 @@ func (s *PortabilityService) toPipeline(ctx context.Context, exported *PipelineE
 		} else {
 			add(pkg.LevelError, "git_credential",
 				"当前实例没有名为 %q 的凭据，构建将无法拉取代码；请先在「凭据管理」创建同名凭据", credentialName)
+		}
+	}
+
+	// 构建状态回写：凭据按名字对齐。
+	if exported.CommitStatus != nil {
+		p.CommitStatus.Project = strings.TrimSpace(exported.CommitStatus.Project)
+	}
+	if exported.CommitStatus != nil && exported.CommitStatus.Enabled {
+		p.CommitStatus.Enabled = true
+		if name := strings.TrimSpace(exported.CommitStatus.CredentialName); name != "" {
+			if id := s.credentialID(ctx, name); id != "" {
+				p.CommitStatus.CredentialID = id
+			} else {
+				add(pkg.LevelWarn, "commit_status",
+					"当前实例没有名为 %q 的凭据，构建状态回写已关闭；如需启用请先创建同名凭据", name)
+				p.CommitStatus.Enabled = false
+			}
+		} else {
+			add(pkg.LevelWarn, "commit_status", "文档未提供回写凭据名，构建状态回写已关闭")
+			p.CommitStatus.Enabled = false
+		}
+	} else if raw.CommitStatus.Enabled {
+		// 原生 config.json：同实例导入，凭据 ID 直接沿用（不存在时下划线报错）。
+		p.CommitStatus = raw.CommitStatus
+		if p.CommitStatus.CredentialID != "" && !s.credentialExists(ctx, p.CommitStatus.CredentialID) {
+			add(pkg.LevelWarn, "commit_status", "构建状态回写的凭据在当前实例不存在，已关闭回写")
+			p.CommitStatus = model.CommitStatusConfig{}
 		}
 	}
 

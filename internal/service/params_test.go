@@ -196,7 +196,7 @@ func TestTriggerSnapshotsResolvedParams(t *testing.T) {
 	}}
 
 	b, err := svc.Trigger(context.Background(), "p1", model.TriggerManual, "alice",
-		map[string]string{"VERSION": "2.0.0"})
+		TriggerOptions{Params: map[string]string{"VERSION": "2.0.0"}})
 	if err != nil {
 		t.Fatalf("trigger: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestTriggerSnapshotsResolvedParams(t *testing.T) {
 
 	// 未知参数：拒绝，且不再投递新任务。
 	if _, err := svc.Trigger(context.Background(), "p1", model.TriggerManual, "alice",
-		map[string]string{"TYPO": "x"}); err == nil {
+		TriggerOptions{Params: map[string]string{"TYPO": "x"}}); err == nil {
 		t.Fatal("unknown param must be rejected")
 	}
 	if len(enq.jobs) != 1 {

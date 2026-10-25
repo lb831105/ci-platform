@@ -6,6 +6,7 @@ import type {
   DataHomeInfo,
   Feature,
   LoadStats,
+  SystemLogResponse,
   NotifyHistoryQuery,
   NotifyRecord,
   OldDataReport,
@@ -22,8 +23,8 @@ export const systemApi = {
     return http.get<LoadStats>('/system/load')
   },
 
-  log(lines = 500): Promise<{ lines: string[] }> {
-    return http.get<{ lines: string[] }>(`/system/log?lines=${lines}`)
+  log(lines = 500): Promise<SystemLogResponse> {
+    return http.get<SystemLogResponse>(`/system/log?lines=${lines}`)
   },
 
   clearLog(): Promise<null> {

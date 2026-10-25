@@ -28,6 +28,7 @@ import {
 import type { Credential } from '@/types/system'
 import { applyJobTypePreset, findJobType } from '@/types/jobType'
 import { validatePipeline } from '@/utils/validate'
+import { normalizeSshPublish, sshPublishIsBlank } from '@/utils/pipelineConfig'
 import { downloadText } from '@/utils/download'
 
 const props = defineProps<{ pipelineId?: string }>()
@@ -132,6 +133,15 @@ function toPayload(pipeline: Pipeline): PipelinePayload {
     git_branch: pipeline.git_branch,
     git_credential_id: pipeline.git_credential_id ?? '',
     webhook_secret: pipeline.webhook_secret,
+    // 触发器策略与状态回写：编辑/只改描述时都必须原样带回，否则保存会清空配置。
+    webhook_branch_mode: pipeline.webhook_branch_mode ?? '',
+    webhook_branches: [...(pipeline.webhook_branches ?? [])],
+    webhook_events: [...(pipeline.webhook_events ?? [])],
+    commit_status: {
+      enabled: pipeline.commit_status?.enabled ?? false,
+      credential_id: pipeline.commit_status?.credential_id ?? '',
+      project: pipeline.commit_status?.project ?? '',
+    },
     build_retention_max_per_job: pipeline.build_retention_max_per_job ?? 0,
     build_retention_max_age_days: pipeline.build_retention_max_age_days ?? 0,
     cron_spec: pipeline.cron_spec ?? '',
@@ -193,13 +203,9 @@ function sshPublishesOf(pipeline: Pipeline): SshPublishConfig[] {
       : pipeline.ssh_publish
         ? [pipeline.ssh_publish]
         : []
-  const list = raw.map((item, index) => ({
-    ...item,
-    name: item.name?.trim() ? item.name : `发布 ${index + 1}`,
-    server_id: item.server_id ?? '',
-    password: '',
-    source_files: [...(item.source_files ?? [])],
-  }))
+  // 统一走 normalizeSshPublish：服务端带 omitempty 的字段可能缺失，
+  // 补齐后表单里永远是确定的字符串/数组（否则 .trim() 会在导入的任务上崩）。
+  const list = raw.map((item, index) => normalizeSshPublish(item, index))
   return list.length > 0 ? list : [emptySshPublish()]
 }
 
@@ -439,18 +445,8 @@ async function onSave(): Promise<void> {
   try {
     // 关闭的发布目标仍保留已填写内容（与 Jenkins 一致），只丢弃完全空白的行。
     const publishes = (form.value.ssh_publishes ?? [])
-      .map((item, index) => ({ ...item, name: item.name?.trim() || `发布 ${index + 1}` }))
-      .filter(
-        (item) =>
-          item.enabled ||
-          item.server_id !== '' ||
-          item.host.trim() !== '' ||
-          item.username.trim() !== '' ||
-          item.remote_base_dir.trim() !== '' ||
-          item.private_key_path.trim() !== '' ||
-          item.source_files.length > 0 ||
-          item.exec_command.trim() !== '',
-      )
+      .map((item, index) => normalizeSshPublish(item, index))
+      .filter((item) => !sshPublishIsBlank(item))
     const payload: PipelinePayload = {
       ...form.value,
       // 只有选择 Git 时才提交仓库与凭据；切回“无”后保存即禁用，但切回 Git 时已填内容仍在。
@@ -653,13 +649,72 @@ function copyWebhook(): void {
               按任务名散列偏移，避免集中触发）；修改后保存即生效，触发记录在构建历史中显示为「定时触发」。
             </div>
           </el-form-item>
-          <el-form-item label="代码平台事件">
+          <el-form-item label="允许的事件">
+            <el-checkbox-group v-model="form.webhook_events">
+              <el-checkbox value="push">Push（分支推送）</el-checkbox>
+              <el-checkbox value="tag_push">Tag 推送</el-checkbox>
+            </el-checkbox-group>
             <div class="form-tip">
-              GitLab / GitHub 的 <span class="mono">Push</span>（含新分支、Tag）事件会触发构建；
-              Merge Request / Pull Request 事件平台不区分（收到即按分支参数构建），请在代码平台只勾选 Push。
-              Jenkins 的「ciSkip / MR 审批后触发 / 备注重试」等选项平台不支持；跳过构建请在提交信息里不触发代码平台 Webhook。
+              默认只接受 <span class="mono">Push</span>：Merge Request / 评论 / Pipeline 等事件会被忽略（返回 200 但不构建），
+              避免误配置导致每次都白跑。GitLab 网页上点「Test」发的是 Push 事件，会真触发一次构建。
             </div>
           </el-form-item>
+          <el-form-item label="构建分支">
+            <el-radio-group v-model="form.webhook_branch_mode">
+              <el-radio value="payload">按推送的分支构建</el-radio>
+              <el-radio value="fixed">始终构建「指定分支」</el-radio>
+            </el-radio-group>
+            <div class="form-tip">
+              选「按推送的分支构建」时，一个任务即可服务所有分支（推 <span class="mono">dev</span> 就构建 dev），
+              这是 GitLab CI 的默认心智模型；选另一项则忽略推送分支，始终构建上面配置的那条分支。
+            </div>
+          </el-form-item>
+          <el-form-item label="允许的分支">
+            <el-select
+              v-model="form.webhook_branches"
+              multiple
+              filterable
+              allow-create
+              default-first-option
+              :reserve-keyword="false"
+              placeholder="留空表示任意分支，例如 main、release/*、hotfix/**"
+              style="max-width: 560px; width: 100%"
+            >
+              <el-option v-for="item in form.webhook_branches ?? []" :key="item" :label="item" :value="item" />
+            </el-select>
+            <div class="form-tip">
+              支持精确名与通配：<span class="mono">release/*</span> 匹配一层，<span class="mono">hotfix/**</span> 匹配多级。
+              不在白名单内的推送会返回成功但不构建。
+            </div>
+          </el-form-item>
+          <el-form-item label="跳过 CI">
+            <div class="form-tip">
+              提交说明包含 <span class="mono">[ci skip]</span> / <span class="mono">[skip ci]</span> 时不会触发构建（对齐 GitLab）。
+            </div>
+          </el-form-item>
+          <el-form-item label="回写构建状态">
+            <el-switch v-model="form.commit_status.enabled" />
+            <span class="muted" style="margin-left: 10px">把构建状态写回 GitLab，MR 里可直接看到结果</span>
+          </el-form-item>
+          <template v-if="form.commit_status.enabled">
+            <el-form-item label="GitLab 凭据">
+              <el-select v-model="form.commit_status.credential_id" placeholder="选择存有 Personal Access Token 的凭据" style="max-width: 420px">
+                <el-option v-for="cred in credentials" :key="cred.id" :label="cred.name" :value="cred.id" />
+              </el-select>
+              <div class="form-tip">
+                凭据类型选「密钥文本」，内容填 GitLab 的 Personal Access Token（需要 <span class="mono">api</span> 权限）。
+                站点地址在「系统管理 → 系统配置 → GitLab 地址」里配置。
+              </div>
+            </el-form-item>
+            <el-form-item label="GitLab 项目">
+              <el-input
+                v-model="form.commit_status.project"
+                class="mono"
+                placeholder="留空表示用 Webhook 事件里的项目，如 ops/order-api 或 项目 ID"
+                style="max-width: 480px"
+              />
+            </el-form-item>
+          </template>
           <el-form-item label="其他触发器">
             <el-alert
               type="info"

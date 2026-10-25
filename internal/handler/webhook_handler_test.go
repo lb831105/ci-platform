@@ -4,6 +4,8 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -23,7 +25,7 @@ func TestVerifySecretAcceptsWebhookSecretHeader(t *testing.T) {
 	req := httptest.NewRequest("POST", "/api/webhook/123", nil)
 	req.Header.Set("X-Webhook-Secret", "s3cret")
 	h := &WebhookHandler{}
-	if !h.verifySecret(httptest.NewRecorder(), req, "s3cret") {
+	if !h.verifySecret(httptest.NewRecorder(), req, "s3cret", bodyOf(req)) {
 		t.Fatal("X-Webhook-Secret should be accepted")
 	}
 }
@@ -33,7 +35,7 @@ func TestVerifySecretAcceptsGitlabToken(t *testing.T) {
 	req := httptest.NewRequest("POST", "/api/webhook/123", nil)
 	req.Header.Set("X-Gitlab-Token", "s3cret")
 	h := &WebhookHandler{}
-	if !h.verifySecret(httptest.NewRecorder(), req, "s3cret") {
+	if !h.verifySecret(httptest.NewRecorder(), req, "s3cret", bodyOf(req)) {
 		t.Fatal("X-Gitlab-Token should be accepted (GitLab webhooks)")
 	}
 }
@@ -44,7 +46,7 @@ func TestVerifySecretAcceptsGithubSignature(t *testing.T) {
 	req := httptest.NewRequest("POST", "/api/webhook/123", strings.NewReader(body))
 	req.Header.Set("X-Hub-Signature-256", githubSignature("s3cret", body))
 	h := &WebhookHandler{}
-	if !h.verifySecret(httptest.NewRecorder(), req, "s3cret") {
+	if !h.verifySecret(httptest.NewRecorder(), req, "s3cret", bodyOf(req)) {
 		t.Fatal("X-Hub-Signature-256 should be accepted")
 	}
 }
@@ -56,19 +58,29 @@ func TestVerifySecretRejectsWrongSecret(t *testing.T) {
 	req.Header.Set("X-Gitlab-Token", "wrong")
 	req.Header.Set("X-Hub-Signature-256", "sha256=deadbeef")
 	h := &WebhookHandler{}
-	if h.verifySecret(httptest.NewRecorder(), req, "s3cret") {
+	if h.verifySecret(httptest.NewRecorder(), req, "s3cret", bodyOf(req)) {
 		t.Fatal("wrong secret must be rejected")
 	}
 	// 无任何 header。
 	req2 := httptest.NewRequest("POST", "/api/webhook/123", nil)
-	if h.verifySecret(httptest.NewRecorder(), req2, "s3cret") {
+	if h.verifySecret(httptest.NewRecorder(), req2, "s3cret", bodyOf(req2)) {
 		t.Fatal("missing headers must be rejected")
 	}
 	// GitHub 签名与 body 不匹配（body 被篡改）。
 	body := `{"object_kind":"push","ref":"refs/heads/main"}`
 	req3 := httptest.NewRequest("POST", "/api/webhook/123", strings.NewReader(body))
 	req3.Header.Set("X-Hub-Signature-256", githubSignature("s3cret", `{"object_kind":"push","ref":"refs/heads/dev"}`))
-	if h.verifySecret(httptest.NewRecorder(), req3, "s3cret") {
+	if h.verifySecret(httptest.NewRecorder(), req3, "s3cret", bodyOf(req3)) {
 		t.Fatal("signature mismatch with body must be rejected")
 	}
+}
+
+// bodyOf 读出测试请求体（verifySecret 现在接收已读取的 body，
+// 真实 handler 里只读一次，避免签名校验与事件解析重复读流）。
+func bodyOf(r *http.Request) []byte {
+	if r.Body == nil {
+		return nil
+	}
+	data, _ := io.ReadAll(r.Body)
+	return data
 }

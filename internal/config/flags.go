@@ -59,6 +59,8 @@ func (c *Config) ParseArgs(args []string) error {
 	fs.IntVar(&c.Workers, "workers", c.Workers, "构建 worker 并发数")
 	fs.IntVar(&c.QueueSize, "queue", c.QueueSize, "构建队列容量")
 	fs.IntVar(&c.LogBufferSize, "log-buffer", c.LogBufferSize, "单条 WebSocket 连接的日志发送缓冲行数")
+	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "平台日志级别：debug / info / warn / error")
+	fs.IntVar(&c.LogRetainMonths, "log-retain-months", c.LogRetainMonths, "平台日志保留月数：每天一个文件、每月一个目录，过期月份目录整月删除（0 = 永久保留）")
 	corsOrigins := strings.Join(c.CORSOrigins, ",")
 	fs.StringVar(&corsOrigins, "cors-origins", corsOrigins, "允许跨域来源，逗号分隔；* 表示开放")
 	fs.DurationVar(&c.ShutdownTimeout, "shutdown-timeout", c.ShutdownTimeout, "优雅停机等待运行中构建的最长时间")
@@ -67,7 +69,7 @@ func (c *Config) ParseArgs(args []string) error {
 	fs.DurationVar(&c.CleanInterval, "clean-interval", c.CleanInterval, "工作区过期扫描间隔，如 5m")
 	fs.BoolVar(&c.AuthEnabled, "auth", c.AuthEnabled, "是否开启登录校验")
 	fs.StringVar(&c.AuthUser, "auth-user", c.AuthUser, "管理员用户名")
-	fs.StringVar(&c.AuthPassword, "auth-password", c.AuthPassword, "管理员密码")
+	fs.StringVar(&c.AuthPassword, "auth-password", c.AuthPassword, "管理员初始密码（仅首次初始化生效，之后在「个人资料 → 修改密码」修改）")
 	fs.DurationVar(&c.AuthTokenTTL, "auth-ttl", c.AuthTokenTTL, "登录会话有效期，如 12h")
 	fs.BoolVar(&c.ShowVersion, "version", false, "打印版本信息后退出")
 

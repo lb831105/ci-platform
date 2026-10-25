@@ -51,6 +51,17 @@ type statusResponse struct {
 	Authenticated bool     `json:"authenticated"`
 	Username      string   `json:"username"`
 	Permissions   []string `json:"permissions,omitempty"` // 有效权限（前端隐藏入口用）
+	// 任务角色的 Pattern 规则：前端据此判断「这一行任务」的按钮是否该显示，
+	// 避免用全局权限一刀切（只被授予任务角色的用户会被误判为无权）。
+	JobRoles []model.JobRoleRule `json:"job_roles,omitempty"`
+}
+
+// jobRolesOf 返回用户的任务角色规则；rbac 未注入时返回 nil。
+func (h *AuthHandler) jobRolesOf(username string) []model.JobRoleRule {
+	if h.rbac == nil {
+		return nil
+	}
+	return h.rbac.JobRoleRules(username)
 }
 
 // permissionsOf 返回用户的有效权限；rbac 未注入时返回 nil（不隐藏任何入口）。
@@ -94,6 +105,7 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 		Authenticated: true,
 		Username:      username,
 		Permissions:   h.permissionsOf(username),
+		JobRoles:      h.jobRolesOf(username),
 	})
 }
 
@@ -127,23 +139,30 @@ type changePasswordRequest struct {
 }
 
 // ChangePassword POST /api/auth/password
+// ChangePassword POST /api/auth/password
+// 修改「当前登录账号」的密码：内置管理员与平台内用户都走这个接口，
+// 由 AuthService 按账号类型分流到 settings.json / rbac.json。
 func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	var in changePasswordRequest
 	if err := decodeJSON(w, r, &in); err != nil {
 		pkg.Fail(w, err)
 		return
 	}
+	username := pkg.UserFromContext(r.Context())
 	if h.auth.Enabled() {
-		if err := h.auth.ChangePassword(in.OldPassword, in.NewPassword, pkg.BearerToken(r)); err != nil {
+		if err := h.auth.ChangePassword(username, in.OldPassword, in.NewPassword, pkg.BearerToken(r)); err != nil {
 			pkg.Fail(w, err)
 			return
 		}
-		// 同步落盘，保证重启后新密码仍然生效。
-		current := h.settings.Current()
-		current.AuthPassword = in.NewPassword
-		if _, err := h.settings.Update(current); err != nil {
-			pkg.Fail(w, err)
-			return
+		// 只有内置管理员的密码存在系统配置里，需要同步落盘保证重启后生效；
+		// 平台内用户的 hash 已由 RBACService 写入 rbac.json，不必动 settings。
+		if h.auth.IsAdmin(username) {
+			current := h.settings.Current()
+			current.AuthPassword = in.NewPassword
+			if _, err := h.settings.Update(current); err != nil {
+				pkg.Fail(w, err)
+				return
+			}
 		}
 	}
 	pkg.OK(w, nil)

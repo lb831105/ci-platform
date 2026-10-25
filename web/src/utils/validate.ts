@@ -41,27 +41,35 @@ export function validatePipeline(payload: PipelinePayload, options: ValidateOpti
     }
   }
 
+  // 服务端字段带 omitempty（如只用 server_id 时没有 host/username/password），
+  // 读取 JSON 后可能是 undefined，这里统一按空串处理，避免 .trim() 抛异常。
   const ssh = payload.ssh_publish
   if (ssh && ssh.enabled) {
-    if (!(ssh.server_id ?? '').trim()) {
+    const serverID = (ssh.server_id ?? '').trim()
+    const host = (ssh.host ?? '').trim()
+    const username = (ssh.username ?? '').trim()
+    const remoteBaseDir = (ssh.remote_base_dir ?? '').trim()
+    const privateKeyPath = (ssh.private_key_path ?? '').trim()
+    const password = (ssh.password ?? '').trim()
+    if (!serverID) {
       // 旧版内联配置：要求主机/账号等字段。
-      if (ssh.host.trim() === '') {
+      if (host === '') {
         errors.push('请选择系统配置中的 SSH 服务器（或填写旧版主机地址）')
       }
-      if (ssh.username.trim() === '') {
+      if (username === '') {
         errors.push('SSH 用户名不能为空')
       }
-      if (ssh.remote_base_dir.trim() === '') {
+      if (remoteBaseDir === '') {
         errors.push('SSH 远程基础目录不能为空')
       }
-      if (ssh.auth_type === 'key' && ssh.private_key_path.trim() === '') {
+      if (ssh.auth_type === 'key' && privateKeyPath === '') {
         errors.push('使用密钥认证时必须填写私钥路径')
       }
-      if (ssh.auth_type === 'password' && !options.keepSshPassword && ssh.password.trim() === '') {
+      if (ssh.auth_type === 'password' && !options.keepSshPassword && password === '') {
         errors.push('使用密码认证时必须填写密码')
       }
     }
-    if (ssh.source_files.length === 0) {
+    if ((ssh.source_files ?? []).length === 0) {
       errors.push('SSH 待上传文件至少要配置一个匹配模式')
     }
   }

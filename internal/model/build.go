@@ -22,7 +22,21 @@ const (
 	// BuildAborted 手动取消（对齐 Jenkins 的 aborted）：构建被用户主动停止，
 	// 与失败区分开，便于区分“代码问题”与“人为干预”。
 	BuildAborted BuildStatus = "aborted"
+	// BuildPendingApproval 等待发布审批：任务开启了「发布审批」时，构建创建后先停在这里，
+	// 由拥有 job.approve 权限的人放行才开始执行（此时不占用执行器，也不产生工作区）。
+	BuildPendingApproval BuildStatus = "pending_approval"
 )
+
+// BuildApproval 记录一次发布审批的来龙去脉（谁申请、谁放行/拒绝、理由、时间）。
+// 为什么落进 build.json：审批是发布链路的一部分，必须能和这次构建一起复盘与导出。
+type BuildApproval struct {
+	RequestedAt time.Time  `json:"requested_at"`
+	RequestedBy string     `json:"requested_by,omitempty"` // 触发人
+	DecidedAt   *time.Time `json:"decided_at,omitempty"`
+	DecidedBy   string     `json:"decided_by,omitempty"` // 审批人
+	Approved    bool       `json:"approved"`
+	Comment     string     `json:"comment,omitempty"` // 审批意见（拒绝时必填）
+}
 
 // TriggerType 触发方式枚举：手动、Webhook 与定时（cron）。
 type TriggerType string
@@ -61,6 +75,13 @@ type Build struct {
 
 	// Params 是本次构建实际使用的参数值（触发时快照，便于复盘「这次用的是什么版本号」）。
 	Params map[string]string `json:"params,omitempty"`
+
+	// Approval 仅在任务开启发布审批时有值。
+	Approval *BuildApproval `json:"approval,omitempty"`
+
+	// CommitProject 是本次构建对应的代码平台项目（如 GitLab 的 group/app），
+	// 由 Webhook payload 带入：任务里没固定写项目路径时，回写状态用它定位。
+	CommitProject string `json:"commit_project,omitempty"`
 
 	// SCM 现场信息：从实际签出的工作区读取，供「按分支路由」与「通知提交者」使用。
 	// 非 Git 任务为空。

@@ -1,7 +1,7 @@
 package service
 
 import (
-	"log"
+	"ci-platform/internal/pkg/logger"
 	"sync/atomic"
 
 	"ci-platform/internal/model"
@@ -41,7 +41,7 @@ func (s *AuditService) Post(e model.AuditEntry) {
 	e.ID = s.seq.Add(1)
 	e.User = sanitizeAuditUser(e.User)
 	if err := s.recorder.Append(&e); err != nil {
-		log.Printf("[audit] append failed: %v", err)
+		logger.Errorf("[audit] append failed: %v", err)
 	}
 }
 

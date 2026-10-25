@@ -23,13 +23,15 @@ export interface SshPublishConfig {
   name?: string
   enabled: boolean
   // 引用系统配置中的 SSH 服务器；为空时使用下方的旧版内联配置。
-  server_id: string
-  host: string
-  port: number
-  username: string
-  auth_type: SshAuthType
-  private_key_path: string
-  password: string
+  // 注意：以下服务端带 omitempty 的字段在 JSON 里可能**缺失**（如只用 server_id 时
+  // 没有 host/username/password），读取时必须用 ?? '' 兜底，否则 .trim() 会抛异常。
+  server_id?: string
+  host?: string
+  port?: number
+  username?: string
+  auth_type?: SshAuthType
+  private_key_path?: string
+  password?: string
   remote_base_dir: string
   source_files: string[]
   remove_prefix: string
@@ -210,6 +212,13 @@ export function emptyJobNotify(): JobNotify {
   }
 }
 
+// 构建状态回写（GitLab commit status）
+export interface CommitStatusConfig {
+  enabled: boolean
+  credential_id?: string
+  project?: string
+}
+
 export interface Pipeline {
   id: string
   name: string
@@ -220,6 +229,14 @@ export interface Pipeline {
   git_branch: string
   git_credential_id: string
   webhook_secret: string
+  // Webhook 分支策略：'' / 'payload' 用推送事件的分支（默认）；'fixed' 始终构建 git_branch
+  webhook_branch_mode?: string
+  // 允许触发的分支白名单（精确 / release/* / hotfix/**），空表示任意分支
+  webhook_branches?: string[]
+  // 允许触发的事件类型（push / tag_push），空表示只接受 push
+  webhook_events?: string[]
+  // 构建状态回写代码平台（GitLab commit status）
+  commit_status: CommitStatusConfig
   // 定时构建（对齐 Jenkins Build periodically）：5 字段 cron 规格，空表示不启用
   cron_spec: string
   // 构建参数定义；为空则是普通「立即构建」，不弹参数表单
@@ -280,6 +297,10 @@ export function emptyPipeline(): PipelinePayload {
     git_branch: 'main',
     git_credential_id: '',
     webhook_secret: '',
+    webhook_branch_mode: 'payload',
+    webhook_branches: [],
+    webhook_events: ['push'],
+    commit_status: { enabled: false, credential_id: '', project: '' },
     cron_spec: '',
     params: [],
     ssh_publish: null,

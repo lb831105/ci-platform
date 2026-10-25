@@ -55,6 +55,30 @@ export interface RbacPermissionGroup {
   permissions?: RbacPermissionItem[]
 }
 
+// 生效预览（后端计算）：每个主体最终能看到哪些任务、每个角色覆盖哪些任务。
+export interface SubjectEffective {
+  subject: string
+  administer: boolean
+  all_jobs: boolean
+  permissions: string[]
+  visible_jobs: string[]
+  roles: string[]
+}
+
+export interface RoleMatch {
+  name: string
+  kind: RbacRoleKind
+  pattern: string
+  matched_jobs: string[]
+  permissions: string[]
+}
+
+export interface RbacEffective {
+  subjects: SubjectEffective[]
+  roles: RoleMatch[]
+  job_names: string[]
+}
+
 export interface RbacData {
   roles: RbacRole[]
   assignments: RbacAssignment[]

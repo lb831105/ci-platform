@@ -1,10 +1,11 @@
 package service
 
 import (
+	"ci-platform/internal/pkg/logger"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
-	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,13 @@ type UserVerifier interface {
 	VerifyLogin(name, password string) bool
 }
 
+// UserPasswordUpdater 让平台内用户（用户管理里创建的账号）也能自助改密。
+// 内置管理员的密码存在系统配置里，由 AuthService 自己处理；其余账号在 rbac.json 里，
+// 因此这里把「校验旧密码 + 写新 hash」委托给 RBACService 实现。
+type UserPasswordUpdater interface {
+	ChangeUserPassword(name, oldPassword, newPassword string) error
+}
+
 // AuthService 负责管理员凭据校验与会话签发/校验。
 // 凭据与开关可在运行时通过「全局安全配置」修改。
 type AuthService struct {
@@ -36,7 +44,9 @@ type AuthService struct {
 	user         string
 	passwordHash string // bcrypt hash；绝不保存明文
 	userVerifier UserVerifier
-	sessions     map[string]session
+	// passwordUpdater 处理平台内用户的自助改密；为 nil 时只支持内置管理员改密。
+	passwordUpdater UserPasswordUpdater
+	sessions        map[string]session
 }
 
 // NewAuthService 构造认证服务。ttl <= 0 时回退为 12 小时。
@@ -50,7 +60,7 @@ func NewAuthService(enabled bool, user, password string, ttl time.Duration) *Aut
 	hash, err := normalizePasswordHash(password)
 	if err != nil {
 		// 配置密码过长等极端情况：保持空 hash，认证必然失败，避免静默使用明文。
-		log.Printf("WARN: 初始化管理员密码失败（登录将被拒绝）: %v", err)
+		logger.Warnf("初始化管理员密码失败（登录将被拒绝）: %v", err)
 	}
 	return &AuthService{
 		enabled:      enabled,
@@ -97,6 +107,20 @@ func (a *AuthService) SetUserVerifier(v UserVerifier) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.userVerifier = v
+}
+
+// SetUserPasswordUpdater 注入平台内用户改密实现（由 main 在装配阶段调用）。
+func (a *AuthService) SetUserPasswordUpdater(u UserPasswordUpdater) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.passwordUpdater = u
+}
+
+// IsAdmin 判断用户名是否是内置管理员（密码保存在系统配置里的那个账号）。
+func (a *AuthService) IsAdmin(username string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return subtle.ConstantTimeCompare([]byte(username), []byte(a.user)) == 1
 }
 
 // AdminUser 返回系统管理员用户名（RBAC 据此保证管理员始终 Administer）。
@@ -150,7 +174,7 @@ func (a *AuthService) SetCredentials(user, passwordHash string) {
 	if passwordHash != "" {
 		hash, err := normalizePasswordHash(passwordHash)
 		if err != nil {
-			log.Printf("WARN: 更新管理员密码失败: %v", err)
+			logger.Warnf("更新管理员密码失败: %v", err)
 			return
 		}
 		if hash != a.passwordHash {
@@ -164,27 +188,64 @@ func (a *AuthService) SetCredentials(user, passwordHash string) {
 	}
 }
 
-// ChangePassword 校验旧密码后更新密码，并使除当前 token 外的会话失效。
-func (a *AuthService) ChangePassword(oldPassword, newPassword, keepToken string) error {
+// ChangePassword 校验旧密码后更新「当前登录账号」的密码，
+// 并使该账号除当前 token 外的其他会话失效（改密后其他设备应立即掉线）。
+//
+// 内置管理员与平台内用户是两套存储（settings.json / rbac.json），这里按账号类型分流：
+// 前者改内存 hash 后由 handler 落盘，后者委托 UserPasswordUpdater 写入 rbac.json。
+func (a *AuthService) ChangePassword(username, oldPassword, newPassword, keepToken string) error {
 	if err := validatePasswordStrength(newPassword); err != nil {
 		return err
 	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return pkg.NewError(pkg.CodeUnauthorized, "未登录，无法修改密码")
+	}
+
+	a.mu.Lock()
+	isAdmin := subtle.ConstantTimeCompare([]byte(username), []byte(a.user)) == 1
+	if isAdmin {
+		if !a.credentialsMatchLocked(username, oldPassword) {
+			a.mu.Unlock()
+			return pkg.NewError(pkg.CodeUnauthorized, "当前密码不正确")
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+		if err != nil {
+			a.mu.Unlock()
+			return pkg.ErrBadRequest("新密码不符合要求: %v", err)
+		}
+		a.passwordHash = string(hash)
+		a.revokeSessionsLocked(username, keepToken)
+		a.mu.Unlock()
+		return nil
+	}
+	updater := a.passwordUpdater
+	a.mu.Unlock()
+	if updater == nil {
+		return pkg.ErrBadRequest("该账号不支持自助修改密码，请联系管理员重置")
+	}
+	// 注意：不在持锁状态下调用外部服务，避免锁顺序问题。
+	if err := updater.ChangeUserPassword(username, oldPassword, newPassword); err != nil {
+		return err
+	}
+	a.RevokeUserSessionsExcept(username, keepToken)
+	return nil
+}
+
+// RevokeUserSessionsExcept 撤销该用户除 keepToken 外的会话（改密后让其他设备掉线）。
+func (a *AuthService) RevokeUserSessionsExcept(username, keepToken string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if !a.credentialsMatchLocked(a.user, oldPassword) {
-		return pkg.NewError(pkg.CodeUnauthorized, "当前密码不正确")
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
-	if err != nil {
-		return pkg.ErrBadRequest("新密码不符合要求: %v", err)
-	}
-	a.passwordHash = string(hash)
-	for token := range a.sessions {
-		if token != keepToken {
+	a.revokeSessionsLocked(username, keepToken)
+}
+
+// revokeSessionsLocked 需在持锁状态下调用。
+func (a *AuthService) revokeSessionsLocked(username, keepToken string) {
+	for token, s := range a.sessions {
+		if s.username == username && token != keepToken {
 			delete(a.sessions, token)
 		}
 	}
-	return nil
 }
 
 // Login 校验凭据并签发 token。认证关闭时直接返回一个匿名会话。

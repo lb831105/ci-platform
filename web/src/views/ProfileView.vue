@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
+import { authApi } from '@/api/auth'
 import { profileApi } from '@/api/profile'
 import { describeError } from '@/api/request'
 import type { Profile } from '@/types/profile'
@@ -20,6 +21,42 @@ const code = ref('')
 const sentTo = ref('')
 
 const readonly = ref(false)
+
+// 修改密码：内置管理员与平台内用户都走同一个接口（POST /api/auth/password），
+// 服务端按账号类型分别写入 settings.json / rbac.json，并让其他设备的会话失效。
+const pwdSaving = ref(false)
+const pwd = reactive({ old_password: '', new_password: '', confirm: '' })
+
+function resetPwd(): void {
+  pwd.old_password = ''
+  pwd.new_password = ''
+  pwd.confirm = ''
+}
+
+async function changePassword(): Promise<void> {
+  if (!pwd.old_password) {
+    ElMessage.error('请输入当前密码')
+    return
+  }
+  if (pwd.new_password.length < 8) {
+    ElMessage.error('新密码至少需要 8 个字符')
+    return
+  }
+  if (pwd.new_password !== pwd.confirm) {
+    ElMessage.error('两次输入的新密码不一致')
+    return
+  }
+  pwdSaving.value = true
+  try {
+    await authApi.changePassword(pwd.old_password, pwd.new_password)
+    resetPwd()
+    ElMessage.success('密码已修改，其他设备上的登录已失效')
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    pwdSaving.value = false
+  }
+}
 
 async function load(): Promise<void> {
   loading.value = true
@@ -176,6 +213,52 @@ async function confirmCode(): Promise<void> {
       </el-form>
     </el-card>
 
+    <el-card shadow="never" class="profile-card password-card">
+      <template #header>
+        <div>
+          <h2 class="profile-title">修改密码</h2>
+          <p class="profile-sub">
+            登录密码由你自己维护；修改成功后，除当前浏览器外的其他登录会立即失效。
+          </p>
+        </div>
+      </template>
+
+      <el-form label-width="120px" @submit.prevent>
+        <el-form-item label="当前密码" required>
+          <el-input
+            v-model="pwd.old_password"
+            type="password"
+            show-password
+            autocomplete="current-password"
+            style="max-width: 320px"
+          />
+        </el-form-item>
+        <el-form-item label="新密码" required>
+          <el-input
+            v-model="pwd.new_password"
+            type="password"
+            show-password
+            autocomplete="new-password"
+            style="max-width: 320px"
+          />
+          <div class="form-tip">至少 8 个字符，最多 72 字节。</div>
+        </el-form-item>
+        <el-form-item label="确认新密码" required>
+          <el-input
+            v-model="pwd.confirm"
+            type="password"
+            show-password
+            autocomplete="new-password"
+            style="max-width: 320px"
+          />
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" :loading="pwdSaving" @click="changePassword">修改密码</el-button>
+          <el-button @click="resetPwd">清空</el-button>
+        </el-form-item>
+      </el-form>
+    </el-card>
+
     <el-dialog v-model="verifyVisible" title="验证邮箱" width="420px">
       <p class="verify-tip">
         验证码已发送到 <span class="mono">{{ sentTo }}</span>，10 分钟内有效。
@@ -199,6 +282,10 @@ async function confirmCode(): Promise<void> {
 <style scoped>
 .profile-card {
   max-width: 860px;
+}
+
+.password-card {
+  margin-top: 16px;
 }
 
 .profile-header {

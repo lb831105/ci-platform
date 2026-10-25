@@ -1,10 +1,15 @@
 import { http } from './request'
-import type { RbacAssignment, RbacData, RbacRole, UserAccount } from '@/types/rbac'
+import type { RbacAssignment, RbacData, RbacEffective, RbacRole, UserAccount } from '@/types/rbac'
 
 // 「Manage and Assign Roles」接口：仅 Administer 可调用。
 export const rbacApi = {
   get(): Promise<RbacData> {
     return http.get<RbacData>('/security/rbac')
+  },
+
+  // 生效预览：每个主体能看哪些任务、每个角色覆盖哪些任务（后端权威计算）。
+  effective(): Promise<RbacEffective> {
+    return http.get<RbacEffective>('/security/rbac/effective')
   },
 
   saveRoles(roles: RbacRole[]): Promise<RbacData> {

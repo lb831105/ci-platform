@@ -37,7 +37,8 @@ func Summarize(p Pipeline, builds []*Build) PipelineSummary {
 		Recent:   make([]BuildStatus, 0, 5),
 	}
 	for _, b := range builds {
-		if b.Status == BuildRunning || b.Status == BuildPending {
+		// 待审批同属「未完成」：列表里应显示为活动状态，而不是最后一条历史结果。
+		if b.Status == BuildRunning || b.Status == BuildPending || b.Status == BuildPendingApproval {
 			summary.Running = true
 		}
 	}

@@ -2,7 +2,7 @@ package middleware
 
 import (
 	"bufio"
-	"log"
+	"ci-platform/internal/pkg/logger"
 	"net"
 	"net/http"
 	"runtime/debug"
@@ -18,7 +18,7 @@ func Recover(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
-				log.Printf("panic recovered: %v\n%s", rec, debug.Stack())
+				logger.Errorf("panic recovered: %v\n%s", rec, debug.Stack())
 				pkg.JSON(w, pkg.CodeInternal, "internal server error", nil)
 			}
 		}()
@@ -122,7 +122,7 @@ func Logger(next http.Handler) http.Handler {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(rec, r)
-		log.Printf("[%s] %s %s %d %dB %s",
+		logger.Infof("[%s] %s %s %d %dB %s",
 			RequestIDFromContext(r.Context()), r.Method, r.URL.Path, rec.status, rec.bytes,
 			time.Since(start).Round(time.Millisecond))
 	})

@@ -4,45 +4,77 @@ import { ElMessage } from 'element-plus'
 import ManagePageHeader from '@/components/ManagePageHeader.vue'
 import { rbacApi } from '@/api/rbac'
 import { describeError } from '@/api/request'
-import type { RbacAssignment, RbacData, RbacRoleKind } from '@/types/rbac'
+import type { RbacAssignment, RbacData, RbacEffective, RbacRoleKind } from '@/types/rbac'
 
 const loading = ref(false)
 const saving = ref(false)
 // 本页只做「授权」：谁 -> 哪个角色。账号自身的增删改密在「用户管理」页。
 const data = ref<RbacData | null>(null)
+// 生效预览（后端算）：主体能看到哪些任务 / 角色覆盖哪些任务。
+const effective = ref<RbacEffective | null>(null)
 
 // 内置主体（对齐 Jenkins）：anonymous 未登录、authenticated 所有已登录用户。
 const builtinSubjects = ['anonymous', 'authenticated']
 
-const globalRoles = computed(() =>
-  (data.value?.roles ?? []).filter((r) => r.kind === 'global'),
-)
-const itemRoles = computed(() => (data.value?.roles ?? []).filter((r) => r.kind === 'item'))
+// Jenkins Role Strategy 的两个过滤框：按 User/Group 筛人、按 Role 筛角色。
+// 角色多起来（生产上几十个任务角色）不做过滤，一行里根本找不到目标。
+const filterSubject = ref('')
+const filterRole = ref('')
 
-// 每类角色的主体行：内置主体 + 平台内用户 + 授权里出现过的其他主体（自由输入的用户/组）。
-function subjectsFor(kind: RbacRoleKind): string[] {
+const globalRoles = computed(() => (data.value?.roles ?? []).filter((r) => r.kind === 'global'))
+const allItemRoles = computed(() => (data.value?.roles ?? []).filter((r) => r.kind === 'item'))
+
+function roleVisible(roleName: string): boolean {
+  const kw = filterRole.value.trim().toLowerCase()
+  return kw === '' || roleName.toLowerCase().includes(kw)
+}
+
+const itemRoles = computed(() => allItemRoles.value.filter((r) => roleVisible(r.name)))
+
+// 主体行：内置主体 + 平台内用户 + 授权里出现过的主体（历史数据里可能有已删除账号）。
+function subjectsOf(kind: RbacRoleKind): string[] {
   const set = new Set<string>(builtinSubjects)
   ;(data.value?.users ?? []).forEach((u) => set.add(u.name))
   ;(data.value?.assignments ?? [])
     .filter((a) => a.kind === kind)
     .forEach((a) => set.add(a.subject))
+  const kw = filterSubject.value.trim().toLowerCase()
   return [...set]
+    .filter((s) => kw === '' || s.toLowerCase().includes(kw))
+    .sort(subjectOrder)
 }
 
-const globalSubjects = computed(() => subjectsFor('global'))
-const itemSubjects = computed(() => subjectsFor('item'))
+// 内置主体排最前，其余按名称排序（Jenkins 顺序一致，便于扫读）。
+function subjectOrder(a: string, b: string): number {
+  const ia = builtinSubjects.indexOf(a)
+  const ib = builtinSubjects.indexOf(b)
+  if (ia >= 0 || ib >= 0) {
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib)
+  }
+  return a.localeCompare(b)
+}
 
-const newUserSubject = ref('')
-const newItemSubject = ref('')
+const globalSubjects = computed(() => subjectsOf('global'))
+const itemSubjects = computed(() => subjectsOf('item'))
 
 async function load(): Promise<void> {
   loading.value = true
   try {
     data.value = await rbacApi.get()
+    await reloadEffective()
   } catch (e) {
     ElMessage.error(describeError(e))
   } finally {
     loading.value = false
+  }
+}
+
+async function reloadEffective(): Promise<void> {
+  try {
+    effective.value = await rbacApi.effective()
+  } catch {
+    // 预览失败不影响授权本身（保存后仍会生效）
+    effective.value = null
   }
 }
 
@@ -81,24 +113,52 @@ function setChecked(kind: RbacRoleKind, subject: string, roleName: string, value
   }
 }
 
-function addSubject(kind: RbacRoleKind): void {
-  const raw = (kind === 'global' ? newUserSubject : newItemSubject).value.trim()
-  if (!raw) {
-    ElMessage.error('请输入用户/组名称')
-    return
+// ---- 生效预览：全部来自后端（/security/rbac/effective） ----
+// 前端不再自己拼：administer 隐含全部权限、模板继承、Pattern 为空不生效
+// 这些规则都在服务端，自己算就会显示成「有角色但 0 个任务」。
+function subjectInfo(subject: string) {
+  return effective.value?.subjects.find((s) => s.subject === subject)
+}
+
+function visibleJobs(subject: string): { known: boolean; all: boolean; names: string[] } {
+  const info = subjectInfo(subject)
+  if (!info) {
+    return { known: false, all: false, names: [] }
   }
-  const state = requireData()
-  if (!state) {
-    return
+  return { known: true, all: info.all_jobs, names: info.visible_jobs ?? [] }
+}
+
+function roleMatch(roleName: string) {
+  return effective.value?.roles.find((r) => r.name === roleName)
+}
+
+// 角色 chip 的悬停提示：Pattern + 覆盖任务数，Pattern 为空要明说不生效。
+function roleTip(roleName: string): string {
+  const rm = roleMatch(roleName)
+  if (!rm) {
+    return roleName
   }
-  const list = kind === 'global' ? globalSubjects : itemSubjects
-  if (list.value.includes(raw)) {
-    ElMessage.warning(`${raw} 已在列表中`)
-  } else {
-    // 自由输入的主体（外部用户/组）不落在 users 里，仅参与授权矩阵。
-    state.assignments.push({ role: '', kind, subject: raw })
+  if (rm.kind === 'global') {
+    return `全局角色：覆盖全部任务`
   }
-  ;(kind === 'global' ? newUserSubject : newItemSubject).value = ''
+  if (!rm.pattern.trim()) {
+    return 'Pattern 为空 —— 这个任务角色不会生效（只能作为 Template 被引用）'
+  }
+  const n = rm.matched_jobs?.length ?? 0
+  if (n === 0) {
+    return `Pattern: ${rm.pattern}\n没有匹配到任何任务（检查正则是否写错）`
+  }
+  const names = (rm.matched_jobs ?? []).slice(0, 8).join('、')
+  return `Pattern: ${rm.pattern}\n匹配 ${n} 个任务：${names}${n > 8 ? ' …' : ''}`
+}
+
+// 有角色却看不到任何任务：几乎总是 Pattern 写错或角色没给 job.read。
+function looksBroken(subject: string): boolean {
+  const info = subjectInfo(subject)
+  if (!info || !info.roles.length) {
+    return false
+  }
+  return !info.all_jobs && (info.visible_jobs ?? []).length === 0
 }
 
 function removeSubject(kind: RbacRoleKind, subject: string): void {
@@ -116,9 +176,10 @@ function removeSubject(kind: RbacRoleKind, subject: string): void {
 async function save(): Promise<void> {
   saving.value = true
   try {
-    // 丢弃 role 为空的占位行（仅用于把自由输入主体带进矩阵）。
+    // 丢弃 role 为空的占位行（历史数据里可能残留）。
     const list: RbacAssignment[] = (data.value?.assignments ?? []).filter((a) => a.role !== '')
     data.value = await rbacApi.saveAssignments(list)
+    await reloadEffective()
     ElMessage.success('授权已保存')
   } catch (e) {
     ElMessage.error(describeError(e))
@@ -132,167 +193,225 @@ onMounted(load)
 
 <template>
   <div class="page manage">
-    <ManagePageHeader title="Assign Roles" description="把用户/组授权到全局角色与任务角色（Manage and Assign Roles）" />
+    <ManagePageHeader
+      title="分配角色"
+      description="谁 → 哪个角色（角色自身权限在「管理角色」页定义）；一行一个主体，避免几十个角色横铺成表格"
+    >
+      <template #actions>
+        <el-button @click="$router.push({ name: 'system-roles-manage' })">管理角色</el-button>
+        <el-button @click="$router.push({ name: 'system-users' })">用户管理</el-button>
+        <el-button type="primary" :loading="saving" @click="save">保存</el-button>
+      </template>
+    </ManagePageHeader>
 
-    <el-alert
-      type="info"
-      :closable="false"
-      show-icon
-      title="任务角色的授权按任务名 Pattern 生效：勾选后用户只能对该角色 Pattern 匹配到的任务执行对应操作。anonymous 为未登录主体（仅认证关闭时有意义），authenticated 为所有已登录用户。"
-      style="margin-bottom: 12px"
-    />
+    <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
+      <template #title>
+        勾选角色即授权。<b>任务角色</b>只对它的 Pattern 匹配到的任务生效，行尾显示该主体
+        <b>实际能看到的任务数</b>（后端计算，与真实接口行为一致）；出现
+        <el-tag size="small" type="warning" effect="plain">有角色但看不到任务</el-tag>
+        说明角色缺 <span class="mono">job.read</span> 或 Pattern 写错了。
+        新增账号请到「用户管理」创建（平台无外部安全域，因此不提供 Jenkins 的「Add Group」）。
+      </template>
+    </el-alert>
+
+    <div class="filters">
+      <el-input v-model="filterSubject" placeholder="按用户/组筛选" clearable style="width: 200px" />
+      <el-input v-model="filterRole" placeholder="按角色筛选（任务角色）" clearable style="width: 220px" />
+      <span class="filters__hint">
+        全局角色 {{ globalRoles.length }} 个 · 任务角色 {{ allItemRoles.length }} 个
+        <template v-if="filterRole.trim()">（已筛出 {{ itemRoles.length }} 个）</template>
+        · 任务总数 {{ effective?.job_names.length ?? 0 }}
+      </span>
+    </div>
 
     <el-card v-loading="loading" shadow="never" class="assign-card">
       <template #header>
-        <div class="card-header">
-          <span>Global roles</span>
-          <router-link :to="{ name: 'system-users' }" class="users-entry">
-            <el-button size="small">管理用户</el-button>
-          </router-link>
+        <span class="card-title">全局角色</span>
+        <span class="card-hint">权限作用于全部任务</span>
+      </template>
+
+      <div v-for="subject in globalSubjects" :key="'g-' + subject" class="subj-row">
+        <div class="subj-row__id">
+          <span class="mono" :class="{ 'is-builtin': builtinSubjects.includes(subject) }">{{ subject }}</span>
+          <el-tag v-if="builtinSubjects.includes(subject)" size="small" type="info" effect="plain">内置</el-tag>
+          <el-button
+            v-else-if="!isPlatformUser(subject)"
+            link
+            type="danger"
+            size="small"
+            @click="removeSubject('global', subject)"
+          >移除</el-button>
         </div>
-      </template>
-      <el-table :data="globalSubjects" size="small">
-        <el-table-column label="User/Group" width="200" fixed>
-          <template #default="{ row }">
-            <div class="subject-cell">
-              <span class="mono" :class="{ 'is-builtin': builtinSubjects.includes(row) }">{{ row }}</span>
-              <el-button
-                v-if="!builtinSubjects.includes(row) && !isPlatformUser(row)"
-                link
-                type="danger"
-                size="small"
-                @click="removeSubject('global', row)"
-              >移除</el-button>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column
-          v-for="role in globalRoles"
-          :key="role.name"
-          :label="role.name"
-          min-width="110"
-          align="center"
-        >
-          <template #default="{ row }">
-            <el-checkbox
-              :model-value="isChecked('global', row, role.name)"
-              @update:model-value="(v: boolean) => setChecked('global', row, role.name, v)"
-            />
-          </template>
-        </el-table-column>
-      </el-table>
-      <div class="add-row">
-        <span class="add-row__label">Add User/Group</span>
-        <el-input
-          v-model="newUserSubject"
-          placeholder="用户或组名称"
-          style="width: 220px"
-          @keyup.enter="addSubject('global')"
-        />
-        <el-button @click="addSubject('global')">Add</el-button>
+        <div class="subj-row__roles">
+          <el-tooltip v-for="role in globalRoles" :key="role.name" :content="roleTip(role.name)" placement="top">
+            <el-check-tag
+              :checked="isChecked('global', subject, role.name)"
+              size="small"
+              class="role-chip"
+              @change="(v: boolean) => setChecked('global', subject, role.name, v)"
+            >{{ role.name }}</el-check-tag>
+          </el-tooltip>
+          <span v-if="!globalRoles.length" class="muted">还没有全局角色</span>
+        </div>
+        <div class="subj-row__effect">
+          <el-tooltip
+            v-if="visibleJobs(subject).all"
+            :content="`全部 ${effective?.job_names.length ?? 0} 个任务`"
+            placement="top"
+          >
+            <el-tag size="small" type="success" effect="plain">可见全部任务</el-tag>
+          </el-tooltip>
+          <el-tooltip
+            v-else-if="visibleJobs(subject).names.length"
+            :content="visibleJobs(subject).names.join('、')"
+            placement="top"
+          >
+            <el-tag size="small" type="success" effect="plain">
+              可见 {{ visibleJobs(subject).names.length }} 个任务
+            </el-tag>
+          </el-tooltip>
+          <el-tooltip v-else-if="looksBroken(subject)" content="有角色但看不到任何任务：角色缺 job.read，或 Pattern 匹配不到现有任务" placement="top">
+            <el-tag size="small" type="warning" effect="plain">有角色但看不到任务</el-tag>
+          </el-tooltip>
+          <span v-else-if="subjectInfo(subject)?.roles.length" class="muted">可见 0 个任务</span>
+          <span v-else class="muted">未授权</span>
+        </div>
       </div>
     </el-card>
 
     <el-card v-loading="loading" shadow="never" class="assign-card">
-      <template #header>Item roles</template>
-      <el-table :data="itemSubjects" size="small">
-        <el-table-column label="User/Group" width="200" fixed>
-          <template #default="{ row }">
-            <div class="subject-cell">
-              <span class="mono" :class="{ 'is-builtin': builtinSubjects.includes(row) }">{{ row }}</span>
-              <el-button
-                v-if="!builtinSubjects.includes(row) && !isPlatformUser(row)"
-                link
-                type="danger"
-                size="small"
-                @click="removeSubject('item', row)"
-              >移除</el-button>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column
-          v-for="role in itemRoles"
-          :key="role.name"
-          :label="role.name"
-          min-width="110"
-          align="center"
-        >
-          <template #default="{ row }">
-            <el-checkbox
-              :model-value="isChecked('item', row, role.name)"
-              @update:model-value="(v: boolean) => setChecked('item', row, role.name, v)"
-            />
-          </template>
-        </el-table-column>
-      </el-table>
-      <div class="add-row">
-        <span class="add-row__label">Add User/Group</span>
-        <el-input
-          v-model="newItemSubject"
-          placeholder="用户或组名称"
-          style="width: 220px"
-          @keyup.enter="addSubject('item')"
-        />
-        <el-button @click="addSubject('item')">Add</el-button>
-      </div>
-    </el-card>
-
-    <el-card shadow="never" class="assign-card is-unsupported">
       <template #header>
-        Agent roles
-        <el-tag size="small" type="info" effect="plain" style="margin-left: 8px">平台不支持</el-tag>
+        <span class="card-title">任务角色</span>
+        <span class="card-hint">只对 Pattern 匹配的任务生效；悬停角色名可看覆盖了哪些任务</span>
       </template>
-      <div class="muted">平台为单机本地执行，无代理节点；代理角色授权在引入多节点执行后启用。</div>
+
+      <div v-for="subject in itemSubjects" :key="'i-' + subject" class="subj-row">
+        <div class="subj-row__id">
+          <span class="mono" :class="{ 'is-builtin': builtinSubjects.includes(subject) }">{{ subject }}</span>
+          <el-tag v-if="builtinSubjects.includes(subject)" size="small" type="info" effect="plain">内置</el-tag>
+          <el-button
+            v-else-if="!isPlatformUser(subject)"
+            link
+            type="danger"
+            size="small"
+            @click="removeSubject('item', subject)"
+          >移除</el-button>
+        </div>
+        <div class="subj-row__roles">
+          <el-tooltip v-for="role in itemRoles" :key="role.name" :content="roleTip(role.name)" placement="top">
+            <el-check-tag
+              :checked="isChecked('item', subject, role.name)"
+              size="small"
+              class="role-chip"
+              @change="(v: boolean) => setChecked('item', subject, role.name, v)"
+            >{{ role.name }}</el-check-tag>
+          </el-tooltip>
+          <span v-if="!itemRoles.length" class="muted">没有匹配的角色（检查角色筛选框）</span>
+        </div>
+        <div class="subj-row__effect">
+          <el-tooltip
+            v-if="visibleJobs(subject).names.length"
+            :content="visibleJobs(subject).names.join('、')"
+            placement="top"
+          >
+            <el-tag size="small" type="success" effect="plain">
+              可见 {{ visibleJobs(subject).names.length }} 个任务
+            </el-tag>
+          </el-tooltip>
+          <el-tooltip v-else-if="looksBroken(subject)" content="有角色但看不到任何任务：角色缺 job.read，或 Pattern 匹配不到现有任务" placement="top">
+            <el-tag size="small" type="warning" effect="plain">有角色但看不到任务</el-tag>
+          </el-tooltip>
+          <span v-else class="muted">可见 0 个任务</span>
+        </div>
+      </div>
     </el-card>
 
     <div class="save-bar">
-      <el-button type="primary" :loading="saving" @click="save">Save</el-button>
+      <el-button type="primary" :loading="saving" @click="save">保存</el-button>
     </div>
-
   </div>
 </template>
 
 <style scoped>
+.filters {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.filters__hint {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
 .assign-card {
   margin-bottom: 16px;
 }
 
-.assign-card.is-unsupported {
-  opacity: 0.75;
+.card-title {
+  font-weight: 600;
 }
 
-.users-entry {
-  text-decoration: none;
+.card-hint {
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
 }
 
-.card-header {
+/* 一行一个主体：名字 + 角色 chip 横排 + 生效预览 */
+.subj-row {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--el-border-color-lighter);
 }
 
-.subject-cell {
+.subj-row:last-of-type {
+  border-bottom: none;
+}
+
+.subj-row__id {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  width: 200px;
+  flex: 0 0 auto;
+  padding-top: 2px;
 }
 
-.subject-cell .is-builtin {
+.subj-row__id .mono {
+  word-break: break-all;
+}
+
+.subj-row__id .is-builtin {
   color: var(--el-text-color-secondary);
   font-style: italic;
 }
 
-.add-row {
+.subj-row__roles {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 12px;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 1 1 auto;
 }
 
-.add-row__label {
+.subj-row__effect {
+  flex: 0 0 auto;
+  width: 160px;
+  text-align: right;
+  padding-top: 2px;
+}
+
+.role-chip {
+  margin: 0 !important;
+}
+
+.muted {
+  font-size: 12px;
   color: var(--el-text-color-secondary);
-  font-size: 13px;
-  white-space: nowrap;
 }
 
 .save-bar {

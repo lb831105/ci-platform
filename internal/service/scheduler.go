@@ -1,6 +1,7 @@
 package service
 
 import (
+	"ci-platform/internal/pkg/logger"
 	"context"
 	"os"
 	"path/filepath"
@@ -109,6 +110,8 @@ func (s *Scheduler) Enqueue(job Job) error {
 	s.mu.Unlock()
 	select {
 	case s.queue <- job:
+		logger.Debugf("[scheduler] enqueued pipeline=%s build=%s queue=%d/%d",
+			job.PipelineID, job.BuildID, len(s.queue), cap(s.queue))
 		return nil
 	default:
 		return pkg.ErrConflict("build queue is full (%d pending), please retry later", cap(s.queue))
@@ -223,6 +226,7 @@ func (s *Scheduler) process(ctx context.Context, job Job) {
 	for {
 		s.setActive(job.PipelineID, true)
 		s.touchWorkspace(job)
+		logger.Debugf("[scheduler] start pipeline=%s build=%s", job.PipelineID, job.BuildID)
 		s.runner.Run(ctx, job)
 		s.setActive(job.PipelineID, false)
 		s.touchWorkspace(job)

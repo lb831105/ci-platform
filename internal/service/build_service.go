@@ -1,11 +1,11 @@
 package service
 
 import (
+	"ci-platform/internal/pkg/logger"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -150,7 +150,7 @@ func (s *BuildService) SetNotifier(n *NotifyService) { s.notifier = n }
 func (s *BuildService) Recover(ctx context.Context) {
 	pipelines, err := s.pipelines.List(ctx)
 	if err != nil {
-		log.Printf("recover builds: list pipelines: %v", err)
+		logger.Infof("recover builds: list pipelines: %v", err)
 		return
 	}
 	recovered := 0
@@ -160,6 +160,8 @@ func (s *BuildService) Recover(ctx context.Context) {
 			continue
 		}
 		for _, b := range builds {
+			// 只回收真正执行中的构建：pending_approval 是「等人审批」，重启后应当继续等待，
+			// 否则一次重启就会把还没人审批的发布悄悄变成失败。
 			if b.Status != model.BuildRunning && b.Status != model.BuildPending {
 				continue
 			}
@@ -179,12 +181,23 @@ func (s *BuildService) Recover(ctx context.Context) {
 		}
 	}
 	if recovered > 0 {
-		log.Printf("recovered %d interrupted build(s) -> failed", recovered)
+		logger.Errorf("recovered %d interrupted build(s) -> failed", recovered)
 	}
 }
 
 // Trigger 创建构建记录并入队，返回 pending 状态的构建。
-func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger model.TriggerType, triggeredBy string, params map[string]string) (*model.Build, error) {
+// TriggerOptions 是触发构建时的可选覆盖项。
+type TriggerOptions struct {
+	// Params 是参数化构建的用户填值（未传的参数取默认值）。
+	Params map[string]string
+	// Branch 覆盖任务配置的分支：Webhook 按推送事件的分支构建时使用，
+	// 这是「一个任务服务所有分支」的关键（否则推 dev 却构建 main）。
+	Branch string
+	// CommitProject 是代码平台项目路径（Webhook payload 提供），用于状态回写。
+	CommitProject string
+}
+
+func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger model.TriggerType, triggeredBy string, opts TriggerOptions) (*model.Build, error) {
 	p, err := s.pipelines.Get(ctx, pipelineID)
 	if err != nil {
 		return nil, err
@@ -194,9 +207,16 @@ func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger m
 	}
 	// 参数在触发时就解析成最终值并快照进构建记录：
 	// 后续有人改了参数默认值，历史构建仍能还原「当时用的什么」。
-	resolved, err := ResolveBuildParams(p.Params, params)
+	resolved, err := ResolveBuildParams(p.Params, opts.Params)
 	if err != nil {
 		return nil, err
+	}
+	if branch := strings.TrimSpace(opts.Branch); branch != "" {
+		if err := validateTriggerBranch(branch); err != nil {
+			return nil, err
+		}
+		// 只改本次构建使用的分支（p 是从磁盘新读出来的副本，不会写回配置）。
+		p.GitBranch = branch
 	}
 
 	b := &model.Build{
@@ -205,6 +225,24 @@ func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger m
 		TriggerType: trigger,
 		TriggeredBy: strings.TrimSpace(triggeredBy),
 		Params:      resolved,
+		// 触发时先记下分支：签出后会由 git 现场信息覆盖，但排队/待审批阶段
+		// 也需要知道"这次是哪条分支"，否则列表里只看到任务配置的那条。
+		Branch:        strings.TrimSpace(p.GitBranch),
+		CommitProject: strings.TrimSpace(opts.CommitProject),
+	}
+	// 发布审批：先落 pending_approval 再等放行，绝不能先跑起来再问——生产发布
+	// 一旦执行就有副作用，审批必须发生在「执行之前」。
+	if p.RequireApproval {
+		now := time.Now().UTC()
+		b.Status = model.BuildPendingApproval
+		b.Approval = &model.BuildApproval{RequestedAt: now, RequestedBy: b.TriggeredBy}
+		if err := s.builds.CreateNext(ctx, b); err != nil {
+			return nil, err
+		}
+		_ = s.builds.AppendLog(ctx, pipelineID, b.ID, []byte(
+			"[ci] 等待发布审批：本任务开启了发布审批，需要拥有 job.approve 权限的人放行后才开始执行\n"))
+		logger.Infof("build %s/%s pending approval (requested by %s)", pipelineID, b.ID, b.TriggeredBy)
+		return b, nil
 	}
 	if err := s.builds.CreateNext(ctx, b); err != nil {
 		return nil, err
@@ -290,7 +328,7 @@ func (s *BuildService) Run(ctx context.Context, job Job) {
 	// 构建会永远卡在 waiting。这里兜底为失败并释放调度器状态。
 	defer func() {
 		if rec := recover(); rec != nil {
-			log.Printf("build panic (pipeline=%s build=%s): %v", job.PipelineID, job.BuildID, rec)
+			logger.Errorf("build panic (pipeline=%s build=%s): %v", job.PipelineID, job.BuildID, rec)
 			s.finishWithError(context.WithoutCancel(ctx), job, fmt.Errorf("build panic: %v", rec))
 		}
 	}()
@@ -311,7 +349,7 @@ func (s *BuildService) Run(ctx context.Context, job Job) {
 
 	// pending 构建在排队/静默期被取消：直接跳过执行，保持 aborted 状态。
 	if b.Status == model.BuildAborted {
-		log.Printf("build %s/%s skipped (cancelled while pending)", job.PipelineID, job.BuildID)
+		logger.Infof("build %s/%s skipped (cancelled while pending)", job.PipelineID, job.BuildID)
 		return
 	}
 
@@ -400,6 +438,7 @@ func (s *BuildService) Run(ctx context.Context, job Job) {
 	persistCtx := context.WithoutCancel(ctx)
 	_ = s.builds.Update(persistCtx, b)
 
+	s.reportCommitStatus(p, b, settings, gitlabStateOf(b.Status), buildStatusSummary(b))
 	s.pruneBuilds(persistCtx, p, settings)
 	s.dispatchNotify(persistCtx, p, b)
 }
@@ -441,7 +480,7 @@ func (s *BuildService) Cancel(pipelineID, buildID string) error {
 	if err != nil {
 		return err
 	}
-	if b.Status != model.BuildRunning && b.Status != model.BuildPending {
+	if b.Status != model.BuildRunning && b.Status != model.BuildPending && b.Status != model.BuildPendingApproval {
 		return pkg.ErrConflict("build #%s is %s, only running/pending builds can be cancelled", buildID, b.Status)
 	}
 	cancelKey := model.LogKey(pipelineID, buildID)
@@ -449,9 +488,19 @@ func (s *BuildService) Cancel(pipelineID, buildID string) error {
 	entry, ok := s.cancels[cancelKey]
 	s.cancelMu.Unlock()
 	if !ok {
-		// pending 构建尚未开始执行（静默期前的排队阶段），没有句柄可取消；
+		// pending / pending_approval 构建尚未开始执行（排队或等审批），没有句柄可取消；
 		// 直接落 aborted，worker 执行前会重新检查状态。
-		if b.Status == model.BuildPending {
+		if b.Status == model.BuildPending || b.Status == model.BuildPendingApproval {
+			if b.Status == model.BuildPendingApproval {
+				// 撤回审批申请：记录为「被发起人取消」，避免事后看起来像是审批超时。
+				now := time.Now().UTC()
+				if b.Approval == nil {
+					b.Approval = &model.BuildApproval{RequestedAt: now}
+				}
+				b.Approval.DecidedAt = &now
+				b.Approval.Approved = false
+				b.Approval.Comment = "发起人撤回审批申请"
+			}
 			b.Status = model.BuildAborted
 			b.ExitCode = -1
 			finishedAt := time.Now().UTC()
@@ -460,7 +509,7 @@ func (s *BuildService) Cancel(pipelineID, buildID string) error {
 			if err := s.builds.Update(persistCtx, b); err != nil {
 				return err
 			}
-			log.Printf("build %s/%s cancelled while pending", pipelineID, buildID)
+			logger.Infof("build %s/%s cancelled while pending", pipelineID, buildID)
 			return nil
 		}
 		return pkg.ErrConflict("build #%s is not running", buildID)
@@ -470,7 +519,7 @@ func (s *BuildService) Cancel(pipelineID, buildID string) error {
 	entry.cancelled = true
 	s.cancelMu.Unlock()
 	entry.cancel()
-	log.Printf("build %s/%s cancelled by user", pipelineID, buildID)
+	logger.Infof("build %s/%s cancelled by user", pipelineID, buildID)
 	return nil
 }
 
@@ -506,7 +555,7 @@ func (s *BuildService) DeleteBuild(ctx context.Context, pipelineID, buildID stri
 	s.cancelMu.Lock()
 	delete(s.cancels, cancelKey)
 	s.cancelMu.Unlock()
-	log.Printf("build %s/%s deleted by user (status=%s)", pipelineID, buildID, b.Status)
+	logger.Infof("build %s/%s deleted by user (status=%s)", pipelineID, buildID, b.Status)
 	return nil
 }
 
@@ -580,6 +629,10 @@ func (s *BuildService) executeStages(ctx context.Context, p *model.Pipeline, b *
 		env["GIT_AUTHOR_EMAIL"] = settings.GitUserEmail
 		env["GIT_COMMITTER_EMAIL"] = settings.GitUserEmail
 	}
+
+	// 回写代码平台的 commit status（GitLab）：让 MR 里能看到"构建中"。
+	// 异步执行且失败只写日志——状态回写失败绝不能影响构建本身。
+	s.reportCommitStatus(p, b, settings, "running", "构建中")
 
 	// 本地执行：把全局工具配置里填写的主目录注入 PATH/GOROOT/JAVA_HOME 等。
 	injectLocalToolHomes(settings, env)
@@ -980,5 +1033,237 @@ func (s *BuildService) finishAborted(job Job, b *model.Build, reason string) {
 	}
 	_ = s.builds.AppendLog(persistCtx, job.PipelineID, job.BuildID,
 		[]byte(fmt.Sprintf("[ci] build #%s ABORTED (%s)\n", job.BuildID, reason)))
-	log.Printf("build %s/%s aborted: %s", job.PipelineID, job.BuildID, reason)
+	logger.Infof("build %s/%s aborted: %s", job.PipelineID, job.BuildID, reason)
+}
+
+// DecideApproval 放行或拒绝一次「待审批」的构建。
+//
+// approve=true  → 状态回到 pending 并进入调度队列（此后与普通构建无异）；
+// approve=false → 直接落 aborted（对齐 Jenkins：input 被拒绝即 ABORTED），
+// 理由与审批人写进 build.json 与日志，供复盘「谁在什么时候拦下了这次发布」。
+func (s *BuildService) DecideApproval(ctx context.Context, pipelineID, buildID string, approve bool, comment, actor string) (*model.Build, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	b, err := s.builds.Get(ctx, pipelineID, buildID)
+	if err != nil {
+		return nil, err
+	}
+	if b.Status != model.BuildPendingApproval {
+		return nil, pkg.ErrConflict("build #%s is %s, only pending_approval builds can be approved", buildID, b.Status)
+	}
+	comment = strings.TrimSpace(comment)
+	if !approve && comment == "" {
+		// 拒绝必须给出理由：否则事后没人知道这次发布为什么被拦下。
+		return nil, pkg.ErrBadRequest("拒绝发布必须填写理由")
+	}
+	if b.Approval == nil {
+		b.Approval = &model.BuildApproval{RequestedAt: time.Now().UTC()}
+	}
+	now := time.Now().UTC()
+	b.Approval.DecidedAt = &now
+	b.Approval.DecidedBy = strings.TrimSpace(actor)
+	b.Approval.Approved = approve
+	b.Approval.Comment = comment
+
+	if !approve {
+		b.Status = model.BuildAborted
+		b.ExitCode = -1
+		b.FinishedAt = &now
+		if err := s.builds.Update(ctx, b); err != nil {
+			return nil, err
+		}
+		_ = s.builds.AppendLog(ctx, pipelineID, buildID, []byte(fmt.Sprintf(
+			"[ci] 发布审批被拒绝（审批人 %s）：%s\n[ci] build #%s ABORTED\n", actorName(b.Approval.DecidedBy), comment, buildID)))
+		logger.Infof("build %s/%s approval rejected by %s", pipelineID, buildID, actor)
+		return b, nil
+	}
+
+	b.Status = model.BuildPending
+	if err := s.builds.Update(ctx, b); err != nil {
+		return nil, err
+	}
+	_ = s.builds.AppendLog(ctx, pipelineID, buildID, []byte(fmt.Sprintf(
+		"[ci] 发布审批通过（审批人 %s）：%s\n", actorName(b.Approval.DecidedBy), orNone(comment))))
+	p, err := s.pipelines.Get(ctx, pipelineID)
+	if err != nil {
+		return nil, err
+	}
+	dir := p.WorkspaceDir
+	if dir == "" {
+		dir = p.ID
+	}
+	if s.enqueuer == nil {
+		return nil, pkg.NewError(pkg.CodeInternal, "scheduler is not initialized")
+	}
+	if err := s.enqueuer.Enqueue(Job{PipelineID: pipelineID, BuildID: buildID, WorkspaceDir: dir}); err != nil {
+		// 入队失败必须让构建明确失败，否则会永远停在 pending。
+		b.Status = model.BuildFailed
+		b.ExitCode = -1
+		b.FinishedAt = &now
+		_ = s.builds.Update(ctx, b)
+		return nil, err
+	}
+	logger.Infof("build %s/%s approval granted by %s", pipelineID, buildID, actor)
+	return b, nil
+}
+
+// SweepApprovals 把超过审批等待上限的构建落为 aborted。
+// 由后台定时任务调用：没人处理的发布不能一直挂在「待审批」，
+// 否则历史列表里会出现一个永远不动的条目，也会让「该任务上次构建」失真。
+func (s *BuildService) SweepApprovals(ctx context.Context) int {
+	pipelines, err := s.pipelines.List(ctx)
+	if err != nil {
+		return 0
+	}
+	swept := 0
+	for _, p := range pipelines {
+		if p.ApprovalTimeoutMinutes <= 0 {
+			continue
+		}
+		builds, listErr := s.builds.ListByPipeline(ctx, p.ID)
+		if listErr != nil {
+			continue
+		}
+		deadline := time.Duration(p.ApprovalTimeoutMinutes) * time.Minute
+		for _, b := range builds {
+			if b.Status != model.BuildPendingApproval || b.Approval == nil {
+				continue
+			}
+			if time.Since(b.Approval.RequestedAt) < deadline {
+				continue
+			}
+			now := time.Now().UTC()
+			reason := fmt.Sprintf("超过 %d 分钟未审批，自动取消", p.ApprovalTimeoutMinutes)
+			b.Status = model.BuildAborted
+			b.ExitCode = -1
+			b.FinishedAt = &now
+			b.Approval.DecidedAt = &now
+			b.Approval.Approved = false
+			b.Approval.Comment = reason
+			if updateErr := s.builds.Update(ctx, b); updateErr != nil {
+				continue
+			}
+			_ = s.builds.AppendLog(ctx, p.ID, b.ID, []byte(fmt.Sprintf(
+				"[ci] %s\n[ci] build #%s ABORTED\n", reason, b.ID)))
+			logger.Infof("build %s/%s approval timed out after %d minutes", p.ID, b.ID, p.ApprovalTimeoutMinutes)
+			swept++
+		}
+	}
+	return swept
+}
+
+// actorName 在审批人为空（认证关闭时）给出可读标识。
+func actorName(actor string) string {
+	if strings.TrimSpace(actor) == "" {
+		return "未登录用户"
+	}
+	return actor
+}
+
+// orNone 把空意见转成可读占位。
+func orNone(comment string) string {
+	if comment == "" {
+		return "（未填写意见）"
+	}
+	return comment
+}
+
+// validateTriggerBranch 校验 Webhook 传入的分支名。
+// 分支名会直接进 git 命令与工作区路径，必须拒绝空白、路径穿越与选项注入形态。
+func validateTriggerBranch(branch string) error {
+	if len(branch) > maxBranchNameLen {
+		return pkg.ErrBadRequest("分支名过长（最多 %d 字符）", maxBranchNameLen)
+	}
+	if strings.ContainsAny(branch, " \t\r\n") {
+		return pkg.ErrBadRequest("分支名不能包含空白字符")
+	}
+	if strings.HasPrefix(branch, "-") || strings.Contains(branch, "..") ||
+		strings.HasPrefix(branch, "/") || strings.HasSuffix(branch, "/") {
+		return pkg.ErrBadRequest("分支名非法：%s", branch)
+	}
+	return nil
+}
+
+// reportCommitStatus 把构建状态回写到代码平台（GitLab commit status）。
+//
+// 设计要点：
+//   - 参数默认关闭（pipeline.commit_status.enabled），不配置就完全不发请求；
+//   - 异步执行：一次 HTTP 往返不该拖慢构建，更不能因网络问题让构建失败；
+//   - 失败只写平台日志，不写构建日志（避免噪音污染用户可见输出）。
+func (s *BuildService) reportCommitStatus(p *model.Pipeline, b *model.Build, settings model.Settings, state, description string) {
+	if !p.CommitStatus.Enabled || state == "" {
+		return
+	}
+	if strings.TrimSpace(settings.GitlabBaseURL) == "" {
+		logger.Infof("[commit-status] pipeline=%s 已开启状态回写，但未配置「系统配置 → GitLab 地址」", p.ID)
+		return
+	}
+	if strings.TrimSpace(b.Commit) == "" {
+		// 非 Git 任务或尚未签出成功：没有 SHA 就无可回写。
+		return
+	}
+	if s.credentials == nil {
+		return
+	}
+	cred, err := s.credentials.Resolve(context.Background(), p.CommitStatus.CredentialID)
+	if err != nil {
+		logger.Errorf("[commit-status] pipeline=%s resolve credential failed: %v", p.ID, err)
+		return
+	}
+	project := strings.TrimSpace(p.CommitStatus.Project)
+	if project == "" {
+		project = strings.TrimSpace(b.CommitProject)
+	}
+	if project == "" {
+		// 既没在任务里固定项目、Webhook 也没带 payload：无从回写。
+		return
+	}
+	target := ""
+	if base := strings.TrimRight(strings.TrimSpace(settings.JenkinsURL), "/"); base != "" {
+		target = fmt.Sprintf("%s/pipelines/%s/builds/%s", base, p.ID, b.ID)
+	}
+	name := "ci-platform"
+	in := executor.GitlabCommitStatus{
+		BaseURL:     settings.GitlabBaseURL,
+		Token:       cred.Secret,
+		Project:     project,
+		SHA:         b.Commit,
+		State:       state,
+		Name:        name,
+		TargetURL:   target,
+		Description: fmt.Sprintf("#%s %s (%s)", b.ID, description, b.Branch),
+	}
+	go func() {
+		// 与请求生命周期解耦：构建结束时 ctx 可能已被取消。
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := executor.PostGitlabCommitStatus(ctx, in); err != nil {
+			logger.Errorf("[commit-status] pipeline=%s build=%s state=%s failed: %v", p.ID, b.ID, state, err)
+		}
+	}()
+}
+
+// gitlabStateOf 把平台状态映射为 GitLab commit status 的 state。
+func gitlabStateOf(status model.BuildStatus) string {
+	switch status {
+	case model.BuildRunning:
+		return "running"
+	case model.BuildSuccess:
+		return "success"
+	case model.BuildFailed:
+		return "failed"
+	case model.BuildAborted:
+		return "canceled"
+	}
+	return ""
+}
+
+// buildStatusSummary 给 commit status 生成一句人类可读的说明。
+func buildStatusSummary(b *model.Build) string {
+	status := string(b.Status)
+	if b.Duration() > 0 {
+		return fmt.Sprintf("%s，耗时 %s", status, b.Duration().Round(time.Second))
+	}
+	return status
 }

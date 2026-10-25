@@ -1,10 +1,17 @@
 import { http } from './request'
 
+// 任务角色规则：Pattern 覆盖的任务上拥有的权限（与后端 JobScope 同一套规则）。
+export interface JobRoleRule {
+  pattern: string
+  permissions: string[]
+}
+
 export interface AuthStatus {
   enabled: boolean
   authenticated: boolean
   username: string
   permissions?: string[]
+  job_roles?: JobRoleRule[]
 }
 
 export interface LoginResult {

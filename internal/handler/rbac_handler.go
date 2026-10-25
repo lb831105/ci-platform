@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"sort"
 	"strings"
 
 	"ci-platform/internal/model"
@@ -13,11 +14,18 @@ import (
 type RbacHandler struct {
 	rbac *service.RBACService
 	auth *service.AuthService
+	// pipelines 仅用于生效预览：需要全部任务名（不按浏览者权限过滤）。
+	pipelines *service.PipelineService
 }
 
 // NewRbacHandler 构造 RBAC 接口处理器。auth 用于删除用户/重置密码后撤销会话。
 func NewRbacHandler(rbac *service.RBACService, auth *service.AuthService) *RbacHandler {
 	return &RbacHandler{rbac: rbac, auth: auth}
+}
+
+// SetPipelines 注入任务服务（生效预览需要任务名列表）。
+func (h *RbacHandler) SetPipelines(pipelines *service.PipelineService) {
+	h.pipelines = pipelines
 }
 
 // rbacView 是 GET /api/security/rbac 的响应：数据 + 权限矩阵元信息。
@@ -43,6 +51,37 @@ type rolesRequest struct {
 // 用户管理页的数据源：内置管理员 + 平台用户 + 联系方式 + 角色摘要。
 func (h *RbacHandler) Users(w http.ResponseWriter, r *http.Request) {
 	pkg.OK(w, h.rbac.Users())
+}
+
+// effectiveView 是 GET /api/security/rbac/effective 的响应。
+type effectiveView struct {
+	Subjects []service.SubjectEffective `json:"subjects"`
+	Roles    []service.RoleMatch        `json:"roles"`
+	// JobNames 是参与计算的**全部**任务名（不受当前浏览者权限影响），
+	// 页面上「匹配几个任务」的口径以它为准。
+	JobNames []string `json:"job_names"`
+}
+
+// Effective GET /api/security/rbac/effective
+//
+// 生效预览：每个主体最终能看哪些任务、每个任务角色覆盖哪些任务。
+// 由后端计算而不是前端拼：administer 隐含全部权限、模板继承、Pattern 为空
+// 不生效这些规则都在服务端，前端自己算必然和真实行为对不上。
+func (h *RbacHandler) Effective(w http.ResponseWriter, r *http.Request) {
+	names := []string{}
+	if h.pipelines != nil {
+		items, err := h.pipelines.List(r.Context())
+		if err != nil {
+			pkg.Fail(w, err)
+			return
+		}
+		for _, p := range items {
+			names = append(names, p.Name)
+		}
+		sort.Strings(names)
+	}
+	subjects, roles := h.rbac.EffectiveView(names)
+	pkg.OK(w, effectiveView{Subjects: subjects, Roles: roles, JobNames: names})
 }
 
 // PutRoles PUT /api/security/rbac/roles

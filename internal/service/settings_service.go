@@ -288,6 +288,9 @@ func validateSettings(in *model.Settings) error {
 	in.JobNameRegex = strings.TrimSpace(in.JobNameRegex)
 	in.Shell = strings.TrimSpace(in.Shell)
 	in.JenkinsURL = strings.TrimSpace(in.JenkinsURL)
+	// GitLab 地址：允许用户粘贴带 /api/v4 的地址，统一剥掉，避免拼成 /api/v4/api/v4。
+	in.GitlabBaseURL = strings.TrimRight(strings.TrimSpace(in.GitlabBaseURL), "/")
+	in.GitlabBaseURL = strings.TrimSuffix(in.GitlabBaseURL, "/api/v4")
 	in.AdminEmail = strings.TrimSpace(in.AdminEmail)
 
 	if in.DefaultBranch == "" {

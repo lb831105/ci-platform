@@ -127,6 +127,7 @@ func New(d Deps) http.Handler {
 			r.Route("/security", func(r chi.Router) {
 				r.Use(perm(model.PermOverallAdminister))
 				r.Get("/rbac", d.RBAC.Get)
+				r.Get("/rbac/effective", d.RBAC.Effective)
 				r.Put("/rbac/roles", d.RBAC.PutRoles)
 				r.Put("/rbac/assignments", d.RBAC.PutAssignments)
 				r.Get("/users", d.RBAC.Users)
@@ -145,9 +146,11 @@ func New(d Deps) http.Handler {
 				r.With(perm(model.PermViewDelete)).Delete("/{name}", d.View.Delete)
 			})
 
-			// 总览/全局列表：Overall Read。
-			r.With(perm(model.PermOverallRead)).Get("/overview", d.Pipeline.Overview)
-			r.With(perm(model.PermOverallRead)).Get("/builds", d.Pipeline.AllBuilds)
+			// 总览/全局列表：登录即可访问，内容由任务角色的 Pattern 过滤。
+			// 不能用 overall.read 卡：只被授予任务角色的用户拿不到 overall.read，
+			// 结果就是"授权了却连任务列表都打不开"，任务级权限形同虚设。
+			r.Get("/overview", d.Pipeline.Overview)
+			r.Get("/builds", d.Pipeline.AllBuilds)
 
 			r.Route("/system", func(r chi.Router) {
 				r.With(perm(model.PermSystemRead)).Get("/info", d.System.Info)
@@ -193,7 +196,8 @@ func New(d Deps) http.Handler {
 			r.With(perm(model.PermJobConfigure)).Get("/notify/contacts", d.Notify.Contacts)
 
 			r.Route("/pipelines", func(r chi.Router) {
-				r.With(perm(model.PermOverallRead)).Get("/", d.Pipeline.List)
+				// 任务列表同理：登录即可，内容按 JobScope 过滤（无任何 job.read 则返回空列表）。
+				r.Get("/", d.Pipeline.List)
 				r.With(perm(model.PermJobCreate)).Post("/", d.Pipeline.Create)
 
 				r.Route("/{pid}", func(r chi.Router) {

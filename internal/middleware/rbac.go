@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"ci-platform/internal/pkg/logger"
 	"context"
 	"net/http"
 
@@ -34,6 +35,8 @@ func RequirePerm(rbac PermChecker, perm string) func(http.Handler) http.Handler 
 				return
 			}
 			if !rbac.HasPermission(pkg.UserFromContext(r.Context()), perm) {
+				logger.Debugf("[rbac] deny user=%q perm=%s path=%s",
+					pkg.UserFromContext(r.Context()), perm, r.URL.Path)
 				pkg.Fail(w, pkg.NewError(pkg.CodeForbidden, "没有该操作所需的权限: %s", perm))
 				return
 			}

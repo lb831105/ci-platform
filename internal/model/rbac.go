@@ -41,6 +41,7 @@ const (
 	PermJobDelete    = "job.delete"    // 删除任务
 	PermJobBuild     = "job.build"     // 触发构建
 	PermJobReplay    = "job.replay"    // Run.Replay：把历史产物重新发布到 SSH
+	PermJobApprove   = "job.approve"   // 放行「待审批」的构建（发布审批）
 
 	// 视图（Views）
 	PermViewRead   = "view.read"   // 查看视图及视图内任务
@@ -109,11 +110,12 @@ func PermissionGroups() []PermissionGroup {
 				{ID: PermJobDelete, Title: "Delete"},
 				{ID: PermJobBuild, Title: "Build"},
 				{ID: PermJobReplay, Title: "Replay"},
+				{ID: PermJobApprove, Title: "Approve"},
 			},
 		},
 		// 以下分类平台不支持：保持矩阵完整可见但禁用，避免误以为已生效。
 		{ID: "agent", Title: "代理", Hint: "平台为单机本地执行，无代理节点", Supported: false},
-		{ID: "run", Title: "运行", Hint: "取消/删除运行暂未实现；Replay（重新发布）归入任务列", Supported: false},
+		{ID: "run", Title: "运行", Hint: "未单独拆出权限：取消/删除构建沿用「任务」列的 Build / Configure，Replay 归入任务列", Supported: false},
 		// 视图（平台已实现 Jenkins Views 精简版：列表视图 + 我的视图）。
 		{
 			ID:        "view",
@@ -184,6 +186,16 @@ func (r RbacRole) Has(perm string, resolveTemplate func(name string) (RbacRole, 
 		}
 	}
 	return false
+}
+
+// JobRoleRule 是「某个 Pattern 上拥有哪些任务权限」的对外投影。
+//
+// 前端不能用全局 permissions 判断「这一行任务的构建按钮该不该显示」：
+// 只被授予任务角色的用户，权限是按任务名 Pattern 生效的。所以 /auth/me
+// 一并返回规则，让按钮显示与实际可操作性一致。
+type JobRoleRule struct {
+	Pattern     string   `json:"pattern"`
+	Permissions []string `json:"permissions"`
 }
 
 // RbacAssignment 把主体（用户/组/内置主体）绑定到角色。

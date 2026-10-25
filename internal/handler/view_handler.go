@@ -47,7 +47,8 @@ func (h *ViewHandler) Jobs(w http.ResponseWriter, r *http.Request) {
 	for _, n := range names {
 		selected[n] = true
 	}
-	pipelines, err := h.pipelines.List(r.Context())
+	// 视图里的任务同样按任务角色过滤：无权限的任务不应借视图列表暴露。
+	pipelines, err := h.pipelines.ListFor(r.Context(), user)
 	if err != nil {
 		pkg.Fail(w, err)
 		return

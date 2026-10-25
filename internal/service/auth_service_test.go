@@ -24,7 +24,7 @@ func TestAuthServiceUsesBcryptHash(t *testing.T) {
 	if _, _, _, err = auth.Login("admin", "wrong"); err == nil {
 		t.Fatal("wrong password must fail")
 	}
-	if err = auth.ChangePassword("secret", "new-secret", token); err != nil {
+	if err = auth.ChangePassword("admin", "secret", "new-secret", token); err != nil {
 		t.Fatalf("change password: %v", err)
 	}
 	if _, _, _, err = auth.Login("admin", "secret"); err == nil {
@@ -64,5 +64,56 @@ func TestSettingsServiceMigratesPlaintextAuthPassword(t *testing.T) {
 	auth := NewAuthService(true, "admin", current.AuthPasswordHash, time.Hour)
 	if _, _, _, err = auth.Login("admin", "legacy"); err != nil {
 		t.Fatalf("legacy password should still work: %v", err)
+	}
+}
+
+// 平台内用户（用户管理里创建的账号）必须能自己改密码：
+// 之前只有内置管理员能改，普通用户只能找管理员重置。
+func TestAuthServiceChangeUserPassword(t *testing.T) {
+	rbac, err := NewRBACService(&memRbacStore{}, &fakeAuthChecker{enabled: true, admin: "root"})
+	if err != nil {
+		t.Fatalf("new rbac: %v", err)
+	}
+	if err = rbac.AddUser("alice", "alice-pass-1", "alice@example.com"); err != nil {
+		t.Fatalf("add user: %v", err)
+	}
+	auth := NewAuthService(true, "root", "root-pass-1", time.Hour)
+	auth.SetUserVerifier(rbac)
+	auth.SetUserPasswordUpdater(rbac)
+
+	token, user, _, err := auth.Login("alice", "alice-pass-1")
+	if err != nil || user != "alice" {
+		t.Fatalf("login as platform user: user=%q err=%v", user, err)
+	}
+	// 另一个设备上的会话：改密后应被踢下线。
+	otherToken, _, _, err := auth.Login("alice", "alice-pass-1")
+	if err != nil {
+		t.Fatalf("second login: %v", err)
+	}
+
+	if err = auth.ChangePassword("alice", "wrong-old", "alice-pass-2", token); err == nil {
+		t.Fatal("wrong current password must be rejected")
+	}
+	if err = auth.ChangePassword("alice", "alice-pass-1", "short", token); err == nil {
+		t.Fatal("weak new password must be rejected")
+	}
+	if err = auth.ChangePassword("alice", "alice-pass-1", "alice-pass-2", token); err != nil {
+		t.Fatalf("change password: %v", err)
+	}
+	if !rbac.VerifyLogin("alice", "alice-pass-2") {
+		t.Fatal("new password must work for platform user")
+	}
+	if rbac.VerifyLogin("alice", "alice-pass-1") {
+		t.Fatal("old password must stop working")
+	}
+	if _, ok := auth.Verify(token); !ok {
+		t.Fatal("current session must survive a password change")
+	}
+	if _, ok := auth.Verify(otherToken); ok {
+		t.Fatal("other sessions must be revoked after a password change")
+	}
+	// 内置管理员不受影响。
+	if _, _, _, err = auth.Login("root", "root-pass-1"); err != nil {
+		t.Fatalf("admin login must keep working: %v", err)
 	}
 }

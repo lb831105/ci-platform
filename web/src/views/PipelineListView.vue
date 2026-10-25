@@ -174,9 +174,9 @@ async function onRemove(job: PipelineSummary): Promise<void> {
 
         <el-table-column label="操作" width="220" align="right">
           <template #default="{ row }">
-            <el-button v-if="auth.hasPerm('job.build')" size="small" type="primary" @click.stop="onBuild(row)">构建</el-button>
-            <el-button v-if="auth.hasPerm('job.configure')" size="small" @click.stop="goEdit(row)">配置</el-button>
-            <el-button v-if="auth.hasPerm('job.delete')" size="small" type="danger" plain @click.stop="onRemove(row)">删除</el-button>
+            <el-button v-if="auth.canJob('job.build', row.name)" size="small" type="primary" @click.stop="onBuild(row)">构建</el-button>
+            <el-button v-if="auth.canJob('job.configure', row.name)" size="small" @click.stop="goEdit(row)">配置</el-button>
+            <el-button v-if="auth.canJob('job.delete', row.name)" size="small" type="danger" plain @click.stop="onRemove(row)">删除</el-button>
           </template>
         </el-table-column>
 

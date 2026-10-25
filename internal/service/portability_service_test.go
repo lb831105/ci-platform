@@ -359,3 +359,48 @@ func TestImportDropsMaskedNotifyURLs(t *testing.T) {
 	}
 	assertLevel(t, out.Warnings, "notify", pkg.LevelWarn)
 }
+
+// Webhook 触发器策略与「状态回写」必须能跨实例搬迁：
+// 分支/事件白名单是配置而非密钥，应随文档走；回写凭据按名字对齐。
+func TestPortabilityKeepsWebhookPolicy(t *testing.T) {
+	ctx := context.Background()
+	svc, pipeSvc := newPortabilityService(t, nil, nil)
+
+	p := &model.Pipeline{
+		Name:              "gl-job",
+		Steps:             []model.Step{{Name: "s", Run: "echo hi"}},
+		WebhookBranchMode: "payload",
+		WebhookBranches:   []string{"main", "release/*"},
+		WebhookEvents:     []string{"push", "tag_push"},
+		CommitStatus:      model.CommitStatusConfig{Enabled: false, Project: "ops/gl-job"},
+	}
+	if _, err := pipeSvc.Create(ctx, p); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	doc, err := svc.Export(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	data, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	out, err := svc.Import(ctx, data, ImportOptions{Name: "gl-job-copy", Mode: "create"})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	got := out.Pipeline
+	if got.WebhookBranchMode != "payload" {
+		t.Fatalf("branch mode lost: %q", got.WebhookBranchMode)
+	}
+	if len(got.WebhookBranches) != 2 || got.WebhookBranches[1] != "release/*" {
+		t.Fatalf("branches lost: %v", got.WebhookBranches)
+	}
+	if len(got.WebhookEvents) != 2 {
+		t.Fatalf("events lost: %v", got.WebhookEvents)
+	}
+	if got.CommitStatus.Project != "ops/gl-job" {
+		t.Fatalf("commit status project lost: %q", got.CommitStatus.Project)
+	}
+}

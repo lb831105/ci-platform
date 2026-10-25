@@ -367,3 +367,33 @@ func TestMergeNotifyURLsChannelAlias(t *testing.T) {
 		t.Fatalf("slack masked url not restored: %q", in2.Notify.Targets[0].URL)
 	}
 }
+
+// 任务留空分支时用「系统配置 → 默认分支」补齐；未配置时仍回退 main。
+func TestNormalizeDefaultsGitBranch(t *testing.T) {
+	base := func() *model.Pipeline {
+		return &model.Pipeline{Name: "no-branch", Steps: []model.Step{{Name: "s", Run: "echo"}}}
+	}
+	p := base()
+	if err := normalizeAndValidate(p, "", "develop"); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if p.GitBranch != "develop" {
+		t.Fatalf("git branch should follow settings default, got %q", p.GitBranch)
+	}
+	p = base()
+	if err := normalizeAndValidate(p, ""); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if p.GitBranch != "main" {
+		t.Fatalf("git branch should fall back to main, got %q", p.GitBranch)
+	}
+	// 任务自己填了分支时不能被默认值覆盖。
+	p = base()
+	p.GitBranch = "release/1.0"
+	if err := normalizeAndValidate(p, "", "develop"); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if p.GitBranch != "release/1.0" {
+		t.Fatalf("explicit branch must win, got %q", p.GitBranch)
+	}
+}

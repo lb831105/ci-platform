@@ -23,13 +23,13 @@ onMounted(async () => {
 
 <template>
   <div class="page">
-    <ManagePageHeader title="插件管理" description="平台以单二进制交付，内置能力清单（只读）" />
+    <ManagePageHeader title="内置能力" description="平台以单二进制交付，这里是编译进二进制的组件清单（只读）" />
 
     <el-alert
       type="info"
       :closable="false"
       show-icon
-      title="基础版不支持动态安装插件：Git / SSH / Webhook / WebSocket 等能力已内置于二进制。"
+      title="平台没有插件机制：Git / SSH / Webhook / WebSocket 等能力在编译期内置，不能动态安装或停用。"
       style="margin-bottom: 16px; max-width: 960px"
     />
 

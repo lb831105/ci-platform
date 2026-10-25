@@ -14,6 +14,7 @@ import (
 	"ci-platform/internal/executor"
 	"ci-platform/internal/model"
 	"ci-platform/internal/pkg"
+	"ci-platform/internal/pkg/logger"
 )
 
 // SystemService 汇总「系统管理」所需的只读信息与运维动作。
@@ -76,7 +77,8 @@ func (s *SystemService) Info(ctx context.Context) (model.SystemInfo, error) {
 	}
 	running := 0
 	for _, item := range all {
-		if item.Status == model.BuildRunning || item.Status == model.BuildPending {
+		// 待审批也是「在途」构建（占队列语义上的位置），统计进在途数量不算错。
+		if item.Status == model.BuildRunning || item.Status == model.BuildPending || item.Status == model.BuildPendingApproval {
 			running++
 		}
 	}
@@ -107,7 +109,10 @@ func (s *SystemService) Info(ctx context.Context) (model.SystemInfo, error) {
 		PipelineCount: len(pipelines),
 		BuildCount:    len(all),
 		RunningBuilds: running,
-		ServerTime:    time.Now().UTC(),
+		// 启动参数以「实际生效值」为准：settings.json 里的副本可能因换过启动参数而过期。
+		WorkspaceTTLMinutes:  int(s.cfg.WorkspaceTTL.Minutes()),
+		CleanIntervalMinutes: int(s.cfg.CleanInterval.Minutes()),
+		ServerTime:           time.Now().UTC(),
 	}, nil
 }
 
@@ -138,7 +143,7 @@ func (s *SystemService) Load(ctx context.Context) (model.LoadStats, error) {
 			stats.FailedBuilds++
 		case model.BuildRunning:
 			stats.RunningBuilds++
-		case model.BuildPending:
+		case model.BuildPending, model.BuildPendingApproval:
 			stats.PendingBuilds++
 		}
 		if item.Status == model.BuildSuccess || item.Status == model.BuildFailed {
@@ -160,6 +165,20 @@ func (s *SystemService) Load(ctx context.Context) (model.LoadStats, error) {
 // LogLines 返回最近 n 行系统日志。
 func (s *SystemService) LogLines(n int) []string {
 	return s.logbuf.Lines(n)
+}
+
+// LogEntries 返回带级别的结构化日志，供「系统日志」页按级别过滤。
+func (s *SystemService) LogEntries(n int) []pkg.LogEntry {
+	return s.logbuf.Entries(n)
+}
+
+// LogFile 返回当前正在写入的日志文件与保留策略，便于运维直接去服务器上看。
+func (s *SystemService) LogFile() map[string]interface{} {
+	return map[string]interface{}{
+		"file":          logger.CurrentFile(),
+		"level":         logger.LevelOf().String(),
+		"retain_months": s.cfg.LogRetainMonths,
+	}
 }
 
 // Settings 返回当前系统配置副本。
@@ -194,7 +213,7 @@ func (s *SystemService) ClearLog() {
 
 // SendTestEmail 使用当前 SMTP 配置发送一封测试邮件（「邮件通知」页的测试按钮）。
 func (s *SystemService) SendTestEmail(to string) error {
-	cfg := s.settings.Current().Email
+	cfg := effectiveEmail(s.settings.Current())
 	if cfg.SMTPHost == "" {
 		return pkg.ErrBadRequest("请先填写 SMTP 服务器")
 	}
@@ -229,7 +248,7 @@ func (s *SystemService) Features() []model.Feature {
 		{Name: "publish-over-ssh", Version: "builtin", Status: "active", Description: "构建产物通过 SSH / SFTP 发布"},
 		{Name: "webhook-trigger", Version: "builtin", Status: "active", Description: "通过 Webhook 触发构建（密钥校验）"},
 		{Name: "websocket-console", Version: "builtin", Status: "active", Description: "实时控制台日志（WebSocket 流式推送）"},
-		{Name: "file-store", Version: "builtin", Status: "builtin", Description: "纯文件系统存储，零数据库依赖"},
+		{Name: "file-store", Version: "builtin", Status: "active", Description: "纯文件系统存储，零数据库依赖"},
 		{Name: "credential-store", Version: "builtin", Status: "active", Description: "凭据管理（用户名密码 / 密钥 / 私钥）"},
 		{Name: "scheduler", Version: "builtin", Status: "active", Description: "构建队列与 worker 池调度"},
 	}

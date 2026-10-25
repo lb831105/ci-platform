@@ -331,6 +331,15 @@ async function onEditDescription(): Promise<void> {
     git_branch: p.git_branch,
     git_credential_id: p.git_credential_id ?? '',
     webhook_secret: p.webhook_secret,
+    // 触发器策略与状态回写：编辑/只改描述时都必须原样带回，否则保存会清空配置。
+    webhook_branch_mode: p.webhook_branch_mode ?? '',
+    webhook_branches: [...(p.webhook_branches ?? [])],
+    webhook_events: [...(p.webhook_events ?? [])],
+    commit_status: {
+      enabled: p.commit_status?.enabled ?? false,
+      credential_id: p.commit_status?.credential_id ?? '',
+      project: p.commit_status?.project ?? '',
+    },
     build_retention_max_per_job: p.build_retention_max_per_job ?? 0,
     build_retention_max_age_days: p.build_retention_max_age_days ?? 0,
     cron_spec: p.cron_spec ?? '',

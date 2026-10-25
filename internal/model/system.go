@@ -4,30 +4,33 @@ import "time"
 
 // SystemInfo 对应 Jenkins「系统信息」，返回运行环境与平台装配参数。
 type SystemInfo struct {
-	AppName       string    `json:"app_name"`
-	Version       string    `json:"version"`
-	Commit        string    `json:"commit"`
-	BuildDate     string    `json:"build_date"`
-	GoVersion     string    `json:"go_version"`
-	OS            string    `json:"os"`
-	Arch          string    `json:"arch"`
-	CPUs          int       `json:"cpus"`
-	Goroutines    int       `json:"goroutines"`
-	MemoryAllocMB float64   `json:"memory_alloc_mb"`
-	MemorySysMB   float64   `json:"memory_sys_mb"`
-	UptimeSeconds int64     `json:"uptime_seconds"`
-	DataHome      string    `json:"data_home"`
-	JobsDir       string    `json:"jobs_dir"`
-	WorkspaceDir  string    `json:"workspace_dir"`
-	Workers       int       `json:"workers"`
-	QueueCapacity int       `json:"queue_capacity"`
-	QueueLength   int       `json:"queue_length"`
-	QuietMode     bool      `json:"quiet_mode"`
-	AuthEnabled   bool      `json:"auth_enabled"`
-	PipelineCount int       `json:"pipeline_count"`
-	BuildCount    int       `json:"build_count"`
-	RunningBuilds int       `json:"running_builds"`
-	ServerTime    time.Time `json:"server_time"`
+	AppName       string  `json:"app_name"`
+	Version       string  `json:"version"`
+	Commit        string  `json:"commit"`
+	BuildDate     string  `json:"build_date"`
+	GoVersion     string  `json:"go_version"`
+	OS            string  `json:"os"`
+	Arch          string  `json:"arch"`
+	CPUs          int     `json:"cpus"`
+	Goroutines    int     `json:"goroutines"`
+	MemoryAllocMB float64 `json:"memory_alloc_mb"`
+	MemorySysMB   float64 `json:"memory_sys_mb"`
+	UptimeSeconds int64   `json:"uptime_seconds"`
+	DataHome      string  `json:"data_home"`
+	JobsDir       string  `json:"jobs_dir"`
+	WorkspaceDir  string  `json:"workspace_dir"`
+	Workers       int     `json:"workers"`
+	QueueCapacity int     `json:"queue_capacity"`
+	QueueLength   int     `json:"queue_length"`
+	QuietMode     bool    `json:"quiet_mode"`
+	AuthEnabled   bool    `json:"auth_enabled"`
+	PipelineCount int     `json:"pipeline_count"`
+	BuildCount    int     `json:"build_count"`
+	RunningBuilds int     `json:"running_builds"`
+	// 启动参数的实际生效值（来自 -workspace-ttl / -clean-interval，不是 settings.json）。
+	WorkspaceTTLMinutes  int       `json:"workspace_ttl_minutes"`
+	CleanIntervalMinutes int       `json:"clean_interval_minutes"`
+	ServerTime           time.Time `json:"server_time"`
 }
 
 // LoadStats 对应 Jenkins「负载统计」。

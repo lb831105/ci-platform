@@ -294,3 +294,19 @@ func TestNotifyParallelTargets(t *testing.T) {
 		t.Fatalf("targets not sorted: %v", res.Targets)
 	}
 }
+
+// 「系统管理员邮件地址」是发件人的兜底：SMTP 常要求 From 与登录账号同域，
+// 界面上填了这一栏就必须真的生效。
+func TestEffectiveEmailUsesAdminEmailAsFrom(t *testing.T) {
+	settings := model.Settings{
+		AdminEmail: "ci-admin@example.com",
+		Email:      model.EmailSettings{SMTPHost: "smtp.example.com"},
+	}
+	if got := effectiveEmail(settings).From; got != "ci-admin@example.com" {
+		t.Fatalf("from should fall back to admin email, got %q", got)
+	}
+	settings.Email.From = "build@example.com"
+	if got := effectiveEmail(settings).From; got != "build@example.com" {
+		t.Fatalf("explicit from must win, got %q", got)
+	}
+}

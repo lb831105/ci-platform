@@ -12,7 +12,7 @@ const settingsStore = useSettingsStore()
 const loading = ref(false)
 const saving = ref(false)
 const categories = ref<ToolCategory[]>([])
-const maven = ref<MavenSettings>({ default_settings: '', global_settings: '', maven_opts: '', local_repo: '' })
+const maven = ref<MavenSettings>({ maven_opts: '', local_repo: '' })
 let base: Settings | null = null
 
 function cloneCategory(category: ToolCategory): ToolCategory {
@@ -41,6 +41,12 @@ function addInstallation(category: ToolCategory): void {
 
 function removeInstallation(category: ToolCategory, index: number): void {
   category.installations.splice(index, 1)
+}
+
+// effectiveIndex 返回该类别的「生效项」下标：与后端一致，取第一个填写了主目录的安装项。
+// 其余项只做登记（名称/说明），不会注入环境变量——界面上标出来，避免以为可以多版本并存。
+function effectiveIndex(category: ToolCategory): number {
+  return category.installations.findIndex((item) => (item.home ?? '').trim() !== '')
 }
 
 // 按工具类别给出主目录示例，降低填写成本。
@@ -132,35 +138,26 @@ async function onSave(): Promise<void> {
           </div>
         </template>
         <el-form label-width="180px" label-position="right">
-          <el-form-item label="默认 settings 提供">
+          <el-form-item label="全局 MAVEN_OPTS">
+            <el-input v-model="maven.maven_opts" class="mono" placeholder="如 -Xmx1024m" style="max-width: 520px" />
+            <div class="form-tip">注入到每次构建环境的 <span class="mono">MAVEN_OPTS</span>。</div>
+          </el-form-item>
+          <el-form-item label="本地仓库路径">
             <el-input
-              v-model="maven.default_settings"
-              type="textarea"
-              :rows="6"
-              placeholder="settings.xml 内容"
-              class="xml-input"
+              v-model="maven.local_repo"
+              class="mono"
+              placeholder="如 C:/Users/you/.m2/repository 或 /root/.m2/repository"
+              style="max-width: 520px"
             />
             <div class="form-tip">
-              对应 Jenkins 的「默认 settings 提供」。当前版本不会自动写入服务器的 ~/.m2/settings.xml，
-              如需生效请手动放置，或在构建步骤中通过 <span class="mono">-s</span> 指定文件。
+              以 <span class="mono">-Dmaven.repo.local</span> 注入构建，空值表示沿用服务器默认的 ~/.m2/repository。
             </div>
           </el-form-item>
-          <el-form-item label="默认全局 settings 提供">
-            <el-input
-              v-model="maven.global_settings"
-              type="textarea"
-              :rows="6"
-              placeholder="全局 settings.xml 内容（通常由 CI 管理员统一维护）"
-              class="xml-input"
-            />
-          </el-form-item>
-          <el-form-item label="Pipeline Maven Configuration">
-            <el-alert
-              type="info"
-              :closable="false"
-              show-icon
-              title="基础版不注入数据库：无 DAO / JDBC 配置，Maven 构建直接使用服务器上的 mvn。"
-            />
+          <el-form-item label="settings.xml">
+            <div class="form-tip">
+              平台不托管 settings.xml：需要私有仓库 / 镜像时，把文件放在服务器的 ~/.m2/settings.xml，
+              或在构建步骤里用 <span class="mono">mvn -s /path/to/settings.xml</span> 指定。
+            </div>
           </el-form-item>
         </el-form>
       </el-card>
@@ -189,6 +186,20 @@ async function onSave(): Promise<void> {
                 class="mono"
                 :placeholder="homePlaceholder(category.id)"
               />
+            </template>
+          </el-table-column>
+          <el-table-column label="构建时" width="110">
+            <template #default="{ $index }">
+              <el-tag
+                v-if="effectiveIndex(category) === $index"
+                size="small"
+                type="success"
+                effect="plain"
+                disable-transitions
+              >
+                生效
+              </el-tag>
+              <el-tag v-else size="small" type="info" effect="plain" disable-transitions>仅记录</el-tag>
             </template>
           </el-table-column>
           <el-table-column label="说明" min-width="160">
@@ -240,9 +251,5 @@ async function onSave(): Promise<void> {
   padding: 12px 0;
   color: #a8abb2;
   font-size: 13px;
-}
-.xml-input :deep(textarea) {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
 }
 </style>

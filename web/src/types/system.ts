@@ -1,5 +1,19 @@
 // 与 Go internal/model/settings.go / system.go / credential.go 的 json tag 对齐。
 
+// 平台日志条目（系统管理 → 系统日志）：级别由后端分级记录。
+export interface LogEntry {
+  at: string
+  level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR' | string
+  message: string
+}
+
+export interface SystemLogResponse {
+  lines: string[]
+  entries: LogEntry[]
+  // 当前落盘文件与保留策略（运维可据此直接去服务器上 grep）
+  file?: { file: string; level: string; retain_months: number }
+}
+
 export interface ToolInstallation {
   name: string
   home?: string
@@ -13,9 +27,9 @@ export interface ToolCategory {
   installations: ToolInstallation[]
 }
 
+// 对应 Jenkins「Maven 项目配置」中真正会影响构建的两项。
+// settings.xml 内容不在此维护：平台不会写入磁盘，放在这里只会让人以为已经生效。
 export interface MavenSettings {
-  default_settings: string
-  global_settings: string
   maven_opts: string
   local_repo: string
 }
@@ -68,6 +82,8 @@ export interface Settings {
   display_name: string
   system_message: string
   jenkins_url: string
+  // GitLab 站点地址（如 https://gitlab.example.com），用于「回写构建状态」
+  gitlab_base_url?: string
   admin_email: string
   default_branch: string
   job_name_regex: string
@@ -124,6 +140,9 @@ export interface SystemInfo {
   pipeline_count: number
   build_count: number
   running_builds: number
+  // 启动参数的实际生效值（来自命令行参数，不是 settings.json）
+  workspace_ttl_minutes: number
+  clean_interval_minutes: number
   server_time: string
 }
 
@@ -172,7 +191,8 @@ export interface OldDataReport {
   scanned_at: string
 }
 
-export type CredentialType = 'username_password' | 'secret_text' | 'ssh_key'
+// ssh_key 暂不支持：平台没有「凭据 → 私钥文件」的使用方，后端会明确拒绝。
+export type CredentialType = 'username_password' | 'secret_text'
 
 export interface Credential {
   id: string

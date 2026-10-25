@@ -77,7 +77,11 @@ func (h *SystemHandler) Log(w http.ResponseWriter, r *http.Request) {
 			lines = n
 		}
 	}
-	pkg.OK(w, map[string]interface{}{"lines": h.system.LogLines(lines)})
+	pkg.OK(w, map[string]interface{}{
+		"lines":   h.system.LogLines(lines),
+		"entries": h.system.LogEntries(lines),
+		"file":    h.system.LogFile(),
+	})
 }
 
 // ClearLog DELETE /api/system/log

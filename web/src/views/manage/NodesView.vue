@@ -26,7 +26,7 @@ onMounted(async () => {
 
 <template>
   <div class="page">
-    <ManagePageHeader title="节点和云管理" description="控制系统运行任务的节点与执行器" />
+    <ManagePageHeader title="执行器" description="本机执行器、构建队列与工作区的运行状态（单机执行，无远程节点）" />
 
     <el-card v-loading="loading" shadow="never" class="node-card">
       <template #header>
@@ -49,15 +49,10 @@ onMounted(async () => {
       </el-descriptions>
     </el-card>
 
-    <el-card shadow="never" class="node-card">
-      <template #header>云 / 分布式节点</template>
-      <el-alert
-        type="info"
-        :closable="false"
-        show-icon
-        title="基础版不提供云实例与远程 agent 的动态编排；构建在运行服务的宿主机上执行，同一任务串行、不同任务按 worker 并行。"
-      />
-    </el-card>
+    <div class="node-note">
+      平台没有云实例与远程 agent 的动态编排：构建在运行服务的宿主机上执行，同一任务串行、不同任务按 worker 并行。
+      扩容方式是调整启动参数 <span class="mono">-workers</span> 后重启。
+    </div>
   </div>
 </template>
 
@@ -65,6 +60,15 @@ onMounted(async () => {
 .node-card {
   max-width: 960px;
   margin-bottom: 16px;
+}
+.node-note {
+  max-width: 960px;
+  padding: 12px 16px;
+  border: 1px dashed var(--border-1);
+  border-radius: 8px;
+  color: var(--text-3);
+  font-size: 13px;
+  line-height: 1.8;
 }
 .node-card__head {
   display: flex;

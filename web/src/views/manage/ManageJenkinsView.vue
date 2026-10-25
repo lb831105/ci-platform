@@ -23,10 +23,10 @@ const sections: ManageSection[] = [
   {
     title: '系统配置',
     entries: [
-      { title: '系统配置', desc: '配置全局设置和路径，包括应用名称与默认构建参数', route: 'system-configure' },
+      { title: '系统配置', desc: '全局设置、数据目录、SSH 服务器、通知与静默模式（含「读取设置」）', route: 'system-configure' },
       { title: '全局工具配置', desc: '维护服务器上的工具主目录（JAVA_HOME / GOROOT 等）', route: 'system-tools' },
-      { title: '插件管理', desc: '查看平台内置能力与运行状态', route: 'system-plugins' },
-      { title: '节点和云管理', desc: '查看执行器、构建队列与工作区', route: 'system-nodes' },
+      { title: '内置能力', desc: '查看二进制内置的组件清单（只读，平台不支持动态安装插件）', route: 'system-plugins' },
+      { title: '执行器', desc: '查看本机执行器数量、构建队列与工作区（单机执行，无节点/云）', route: 'system-nodes' },
       { title: '导入任务', desc: '从 Jenkins config.xml 或平台导出的 config.json 导入任务配置', route: 'system-import' },
     ],
   },
@@ -36,8 +36,8 @@ const sections: ManageSection[] = [
       { title: '全局安全配置', desc: '开启或关闭登录校验，定义谁可以访问系统', route: 'system-security' },
       { title: '凭据管理', desc: '配置用户名密码、密钥与 SSH 私钥', route: 'system-credentials' },
       { title: '用户管理', desc: '新建/删除用户、重置密码、维护通知联系方式', route: 'system-users' },
-      { title: 'Manage and Assign Roles', desc: '定义全局/任务角色并授权给用户（角色决定每个任务可用的功能）', route: 'system-roles-manage' },
-      { title: 'Assign Roles', desc: '把用户/组授权到全局角色与任务角色', route: 'system-roles-assign' },
+      { title: '管理角色', desc: '定义全局/任务角色与权限矩阵（决定每个用户可用的功能）', route: 'system-roles-manage' },
+      { title: '分配角色', desc: '把用户授权到全局角色与任务角色', route: 'system-roles-assign' },
     ],
   },
   {
@@ -48,20 +48,12 @@ const sections: ManageSection[] = [
       { title: '操作日志', desc: '谁在何时做了什么：登录、构建触发、任务与配置变更', route: 'system-audit' },
       { title: '通知记录', desc: '每次告警的投递结果：谁收到了、谁失败了、哪些被合并', route: 'system-notify-history' },
       { title: '负载统计', desc: '检查构建、队列与磁盘资源利用情况', route: 'system-load' },
-      { title: '关于', desc: '查看版本、构建信息与证书说明', route: 'system-about' },
+      { title: '关于与 API', desc: '查看版本、构建信息，以及 REST API 用法（无 Groovy 脚本控制台）', route: 'system-about' },
     ],
   },
   {
     title: '问题排查',
     entries: [{ title: '管理旧数据', desc: '清理构建工作区与无主任务目录，释放磁盘', route: 'system-old-data' }],
-  },
-  {
-    title: '工具和动作',
-    entries: [
-      { title: '读取设置', desc: '从磁盘重新读取 settings.json（手动修改配置后使用）', route: 'system-configure' },
-      { title: '准备关机', desc: '进入静默模式，停止接受新的构建任务', route: 'system-configure' },
-      { title: '命令行接口 / 脚本命令行', desc: '通过 REST API 或外部脚本管理平台', route: 'system-about' },
-    ],
   },
 ]
 

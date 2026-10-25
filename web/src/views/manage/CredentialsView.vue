@@ -25,7 +25,6 @@ const form = reactive<CredentialPayload>({
 const TYPE_LABELS: Record<CredentialType, string> = {
   username_password: '用户名密码',
   secret_text: '密钥文本',
-  ssh_key: 'SSH 私钥',
 }
 
 async function load(): Promise<void> {
@@ -156,7 +155,6 @@ async function onRemove(row: Credential): Promise<void> {
           <el-select v-model="form.type" style="width: 100%">
             <el-option label="用户名密码" value="username_password" />
             <el-option label="密钥文本" value="secret_text" />
-            <el-option label="SSH 私钥" value="ssh_key" />
           </el-select>
         </el-form-item>
         <el-form-item v-if="form.type === 'username_password'" label="用户名">
@@ -166,8 +164,8 @@ async function onRemove(row: Credential): Promise<void> {
           <el-input
             v-model="form.secret"
             type="textarea"
-            :rows="form.type === 'ssh_key' ? 6 : 2"
-            :placeholder="isEdit ? '留空表示保持原值不变' : form.type === 'ssh_key' ? '粘贴私钥内容' : '密码 / Token'"
+            :rows="2"
+            :placeholder="isEdit ? '留空表示保持原值不变' : form.type === 'secret_text' ? 'Token / 密钥文本' : '密码'"
           />
           <div v-if="isEdit" class="form-tip">原值已保存在服务端（data/credentials/*.json），留空不修改，填写则覆盖。</div>
         </el-form-item>

@@ -93,7 +93,7 @@ async function onSubmit(): Promise<void> {
         <form class="login__form" @submit.prevent="onSubmit">
           <label class="login__field">
             <span class="login__label">用户名</span>
-            <input v-model="username" class="login__input" type="text" autocomplete="username" placeholder="admin" autofocus />
+            <input v-model="username" class="login__input" type="text" autocomplete="username" placeholder="用户名" autofocus />
           </label>
 
           <label class="login__field">
@@ -112,9 +112,6 @@ async function onSubmit(): Promise<void> {
           </button>
         </form>
 
-        <p class="login__hint">
-          默认账号 <code>admin</code> / <code>admin</code>，可在「系统管理 → 全局安全配置」中修改。
-        </p>
       </section>
 
       <div class="login__copyright">© 2026 CI Platform · 内部使用</div>
@@ -286,18 +283,6 @@ async function onSubmit(): Promise<void> {
 .login__submit:disabled {
   opacity: 0.7;
   cursor: not-allowed;
-}
-.login__hint {
-  margin: 22px 0 0;
-  font-size: 12px;
-  color: var(--text-3);
-  line-height: 1.7;
-}
-.login__hint code {
-  background: #f1f5f9;
-  border-radius: 4px;
-  padding: 1px 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 .login__copyright {
   margin-top: 26px;

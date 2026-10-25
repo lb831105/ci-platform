@@ -3,6 +3,7 @@ import { defineStore } from 'pinia'
 import { authApi } from '@/api/auth'
 import { clearToken, getStoredUsername, getToken, setToken } from '@/api/token'
 import { describeError } from '@/api/request'
+import type { JobRoleRule } from '@/api/auth'
 
 // 认证状态：判断是否需要登录、当前用户名，以及登录/登出动作。
 export const useAuthStore = defineStore('auth', () => {
@@ -12,6 +13,8 @@ export const useAuthStore = defineStore('auth', () => {
   const initialized = ref(false)
   // 有效权限列表（/auth/me 或 /auth/status 返回）；前端据此隐藏入口/按钮。
   const permissions = ref<string[]>([])
+  // 任务角色规则：只被授予任务角色的用户，权限按任务名 Pattern 生效。
+  const jobRoles = ref<JobRoleRule[]>([])
 
   // bootstrap 在应用启动（路由首次导航）时调用一次：
   // 探测认证开关，并用手上已有的 token 换取登录态。
@@ -30,8 +33,10 @@ export const useAuthStore = defineStore('auth', () => {
         try {
           const me = await authApi.me()
           permissions.value = me.permissions ?? []
+          jobRoles.value = me.job_roles ?? []
         } catch {
           permissions.value = []
+          jobRoles.value = []
         }
       }
       if (status.enabled && !status.authenticated) {
@@ -57,8 +62,10 @@ export const useAuthStore = defineStore('auth', () => {
     try {
       const me = await authApi.me()
       permissions.value = me.permissions ?? []
+      jobRoles.value = me.job_roles ?? []
     } catch {
       permissions.value = []
+      jobRoles.value = []
     }
   }
 
@@ -81,13 +88,38 @@ export const useAuthStore = defineStore('auth', () => {
     return permissions.value.includes(perm)
   }
 
+  // canJob 判断当前用户对「某个具体任务」是否拥有权限：
+  // 全局权限直接true；否则看任务角色 Pattern 是否匹配该任务名。
+  // 这样只被授予任务角色的用户，也能看到自己任务上的「构建/配置」按钮。
+  function canJob(perm: string, jobName: string): boolean {
+    if (hasPerm(perm)) {
+      return true
+    }
+    for (const rule of jobRoles.value) {
+      if (!rule.permissions.includes(perm)) {
+        continue
+      }
+      try {
+        // 与后端一致：忽略大小写、完全匹配
+        if (new RegExp(`^(?:${rule.pattern})$`, 'i').test(jobName)) {
+          return true
+        }
+      } catch {
+        // Pattern 非法时不授予（后端保存时已校验）
+      }
+    }
+    return false
+  }
+
   return {
     enabled,
     authenticated,
     username,
     initialized,
     permissions,
+    jobRoles,
     hasPerm,
+    canJob,
     isAdmin: computed(() => hasPerm('overall.administer')),
     bootstrap,
     login,

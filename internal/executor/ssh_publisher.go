@@ -1,11 +1,11 @@
 package executor
 
 import (
+	"ci-platform/internal/pkg/logger"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"path"
@@ -188,7 +188,7 @@ func (p *SshPublisher) dial(ctx context.Context, cfg *model.SshPublishConfig) (*
 func sshHostKeyCallback(knownHostsPath string) (ssh.HostKeyCallback, error) {
 	knownHostsPath = strings.TrimSpace(knownHostsPath)
 	if knownHostsPath == "" {
-		log.Printf("WARN: ssh publish host key verification disabled; configure known_hosts_path to enable it")
+		logger.Warnf("ssh publish host key verification disabled; configure known_hosts_path to enable it")
 		return ssh.InsecureIgnoreHostKey(), nil
 	}
 	path := expandHome(knownHostsPath)

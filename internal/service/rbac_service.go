@@ -154,6 +154,184 @@ func (s *RBACService) HasJobPermission(user, action, jobName string) bool {
 	return false
 }
 
+// JobScope 返回该用户的任务可见性判定器（供列表类接口过滤任务）。
+//
+// 与 HasJobPermission 的区别：那个是"能不能对某个任务做某个动作"，
+// 这个是"任务名要不要出现在列表里"。判定依据相同（任务角色的 Pattern），
+// 但预备好编译后的正则，避免列表循环里反复 regexp.Compile（性能审计 A 项）。
+func (s *RBACService) JobScope(user string) *JobScope {
+	if s.authDisabled() || s.IsAdmin(user) {
+		return AllJobs()
+	}
+	for _, role := range s.rolesFor(user, model.RoleKindGlobal) {
+		// 全局角色给了 job.read 或 overall.administer = 全部任务可见（Jenkins 语义）。
+		if role.Has(model.PermJobRead, s.resolveTemplate, 0) || role.Has(model.PermOverallAdminister, s.resolveTemplate, 0) {
+			return AllJobs()
+		}
+	}
+	var patterns []string
+	for _, role := range s.rolesFor(user, model.RoleKindItem) {
+		if !role.Has(model.PermJobRead, s.resolveTemplate, 0) {
+			continue
+		}
+		// 任务角色带 administer 时 Pattern 没意义：直接给全部（与 HasJobPermission 一致）。
+		if role.Has(model.PermOverallAdminister, s.resolveTemplate, 0) {
+			return AllJobs()
+		}
+		patterns = append(patterns, role.Pattern)
+	}
+	return NewJobScope(false, patterns)
+}
+
+// SubjectEffective 是「某个主体最终有什么权限、能看到哪些任务」的权威结果。
+//
+// 为什么由后端算：前端只拿到角色和 permissions 数组，无法正确处理
+// overall.administer 隐含全部权限、模板继承、以及「任务角色 Pattern 为空等于不生效」
+// 这些规则 —— 算错了就会显示成「明明有角色却 0 个任务」。
+type SubjectEffective struct {
+	Subject     string   `json:"subject"`
+	Administer  bool     `json:"administer"`   // 拥有 Overall/Administer（隐含全部权限）
+	AllJobs     bool     `json:"all_jobs"`     // 能看到全部任务
+	Permissions []string `json:"permissions"`  // 有效权限
+	VisibleJobs []string `json:"visible_jobs"` // 实际可见的任务名
+	Roles       []string `json:"roles"`        // 被授予的角色名
+}
+
+// RoleMatch 是「某个角色覆盖了哪些任务」，用于角色 chip 的悬停提示。
+type RoleMatch struct {
+	Name        string   `json:"name"`
+	Kind        string   `json:"kind"`
+	Pattern     string   `json:"pattern"`
+	MatchedJobs []string `json:"matched_jobs"`
+	Permissions []string `json:"permissions"` // 含模板继承后的有效权限
+}
+
+// EffectiveView 计算全部主体与角色的生效结果，供「分配角色」页直接展示。
+func (s *RBACService) EffectiveView(jobNames []string) ([]SubjectEffective, []RoleMatch) {
+	subjects := s.allSubjects()
+	out := make([]SubjectEffective, 0, len(subjects))
+	for _, subject := range subjects {
+		perms := s.EffectivePermissions(subject)
+		item := SubjectEffective{
+			Subject:     subject,
+			Administer:  s.IsAdmin(subject) || containsPerm(perms, model.PermOverallAdminister),
+			Permissions: perms,
+			Roles:       s.roleNamesOf(subject),
+		}
+		// 切片统一初始化为空切片：JSON 里是 [] 而不是 null，
+		// 前端就能少一堆 `?? []` 兜底（也避免 undefined.length 这类崩溃）。
+		if item.Permissions == nil {
+			item.Permissions = []string{}
+		}
+		if item.Roles == nil {
+			item.Roles = []string{}
+		}
+		item.VisibleJobs = make([]string, 0, len(jobNames))
+		for _, name := range jobNames {
+			if s.HasJobPermission(subject, model.PermJobRead, name) {
+				item.VisibleJobs = append(item.VisibleJobs, name)
+			}
+		}
+		item.AllJobs = s.JobScope(subject).All()
+		out = append(out, item)
+	}
+
+	s.mu.RLock()
+	roles := make([]model.RbacRole, len(s.data.Roles))
+	copy(roles, s.data.Roles)
+	s.mu.RUnlock()
+
+	matches := make([]RoleMatch, 0, len(roles))
+	for _, role := range roles {
+		perms := make([]string, 0, len(role.Perms))
+		for _, perm := range model.AllPermissionIDs() {
+			if role.Has(perm, s.resolveTemplate, 0) {
+				perms = append(perms, perm)
+			}
+		}
+		rm := RoleMatch{Name: role.Name, Kind: role.Kind, Pattern: role.Pattern, Permissions: perms, MatchedJobs: []string{}}
+		if role.Kind == model.RoleKindItem && strings.TrimSpace(role.Pattern) != "" {
+			for _, name := range jobNames {
+				if matchJobPattern(role.Pattern, name) {
+					rm.MatchedJobs = append(rm.MatchedJobs, name)
+				}
+			}
+		}
+		matches = append(matches, rm)
+	}
+	return out, matches
+}
+
+// allSubjects 返回页面上要展示的主体：内置主体 + 平台用户 + 授权里出现过的主体。
+func (s *RBACService) allSubjects() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	add(model.SubjectAnonymous)
+	add(model.SubjectAuthenticated)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, u := range s.data.Users {
+		add(u.Name)
+	}
+	for _, a := range s.data.Assignments {
+		add(a.Subject)
+	}
+	return out
+}
+
+// roleNamesOf 返回主体被授予的角色名（全局 + 任务）。
+func (s *RBACService) roleNamesOf(subject string) []string {
+	out := []string{}
+	for _, kind := range []string{model.RoleKindGlobal, model.RoleKindItem} {
+		for _, role := range s.rolesFor(subject, kind) {
+			out = append(out, role.Name)
+		}
+	}
+	return out
+}
+
+func containsPerm(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// JobRoleRules 返回该用户的任务角色规则（Pattern + 有效权限，含模板继承）。
+//
+// 管理员/认证关闭返回 nil：这种情况前端用全局 permissions 判断即可。
+func (s *RBACService) JobRoleRules(user string) []model.JobRoleRule {
+	if s.authDisabled() || s.IsAdmin(user) {
+		return nil
+	}
+	var rules []model.JobRoleRule
+	for _, role := range s.rolesFor(user, model.RoleKindItem) {
+		if strings.TrimSpace(role.Pattern) == "" {
+			continue // 模板角色没有作用范围，不参与任务级判断
+		}
+		perms := make([]string, 0, len(role.Perms))
+		for _, perm := range model.AllPermissionIDs() {
+			if role.Has(perm, s.resolveTemplate, 0) {
+				perms = append(perms, perm)
+			}
+		}
+		if len(perms) == 0 {
+			continue
+		}
+		rules = append(rules, model.JobRoleRule{Pattern: role.Pattern, Permissions: perms})
+	}
+	return rules
+}
+
 // matchJobPattern 对齐 Jenkins Role Strategy：正则忽略大小写、完全匹配任务名。
 func matchJobPattern(pattern, jobName string) bool {
 	if strings.TrimSpace(pattern) == "" {

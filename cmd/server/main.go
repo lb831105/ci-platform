@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -20,6 +19,7 @@ import (
 	"ci-platform/internal/handler"
 	"ci-platform/internal/model"
 	"ci-platform/internal/pkg"
+	"ci-platform/internal/pkg/logger"
 	"ci-platform/internal/router"
 	"ci-platform/internal/service"
 	"ci-platform/internal/store"
@@ -36,12 +36,11 @@ var (
 // main 只做装配：构造 config / store / executor / service / handler，
 // 启动调度器与 HTTP 服务，并处理优雅退出。业务逻辑不在此处出现。
 func main() {
+	// 三方库/未迁移的 stdlib log 输出仍然走 stderr，并带上时间戳。
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	// 系统日志缓冲：标准日志同时写入 stderr 与内存环形缓冲，
-	// 供「系统管理 → 系统日志」页面回看，不额外落盘。
+	// 系统日志缓冲：平台日志同时进内存环形缓冲，供「系统管理 → 系统日志」页面回看。
 	logBuffer := pkg.NewLogBuffer(2000)
-	log.SetOutput(io.MultiWriter(os.Stderr, logBuffer))
 
 	// 0. 装配参数：环境变量打底，命令行覆盖（-port / -addr / -data-home ...）
 	cfg := config.Load()
@@ -65,7 +64,7 @@ func main() {
 			log.Printf("WARN: 读取引导配置 %s 失败: %v", cfg.ConfigFile, bootErr)
 		} else if b != nil && b.DataHome != "" {
 			cfg.DataHome = b.DataHome
-			log.Printf("data home from bootstrap %s: %s", cfg.ConfigFile, cfg.DataHome)
+			logger.Infof("data home from bootstrap %s: %s", cfg.ConfigFile, cfg.DataHome)
 		}
 	}
 
@@ -73,7 +72,27 @@ func main() {
 		log.Fatalf("配置错误: %v", err)
 	}
 
-	log.Printf("ci-platform version=%s commit=%s built=%s", buildVersion, buildCommit, buildDate)
+	// 1.0 日志系统：带级别、按月轮转到 data/logs/app-YYYY-MM.log。
+	// 必须在其它日志之前初始化，否则启动阶段的消息会缺失或没有级别。
+	level, levelErr := logger.ParseLevel(cfg.LogLevel)
+	if levelErr != nil {
+		logger.Warnf("%v，已回退为 info", levelErr)
+	}
+	if err := logger.Init(logger.Options{
+		Dir:           filepath.Join(cfg.DataHome, "logs"),
+		Level:         level,
+		RetainMonths:  cfg.LogRetainMonths,
+		RetainForever: cfg.LogRetainMonths == 0,
+		Stdout:        os.Stderr,
+		Sink:          logBuffer,
+	}); err != nil {
+		// 日志落盘失败不阻断启动：继续用控制台输出即可，但要让运维看见。
+		logger.Warnf("初始化文件日志失败（仅输出到控制台）: %v", err)
+	}
+	defer func() { _ = logger.Close() }()
+
+	logger.Infof("ci-platform version=%s commit=%s built=%s level=%s log_dir=%s retain_months=%d",
+		buildVersion, buildCommit, buildDate, level, logger.CurrentFile(), cfg.LogRetainMonths)
 
 	// 1. 运行时目录（文件即数据库）
 	for _, dir := range []string{cfg.JobsDir(), cfg.WorkspaceDir()} {
@@ -133,15 +152,24 @@ func main() {
 	if rbacErr != nil {
 		log.Fatalf("init rbac: %v", rbacErr)
 	}
+	// 任务可见性：列表/概览/全局构建历史按任务角色 Pattern 过滤，
+	// 让「角色 ↔ 任务」真正挂钩（看不到的任务不出现，而不是点进去才 403）。
+	if pipelineSvc != nil {
+		pipelineSvc.SetJobScoper(rbacSvc)
+	}
 	// 多用户登录：管理员凭据不匹配时回退校验平台内用户。
 	authSvc.SetUserVerifier(rbacSvc)
+	// 平台内用户（rbac.json 里的账号）自助改密：内置管理员走系统配置，其余走 RBAC。
+	authSvc.SetUserPasswordUpdater(rbacSvc)
 	if authSvc.Enabled() {
-		log.Printf("auth enabled: user=%s (可在「系统管理 → 全局安全配置」中修改，-no-auth 关闭)", settings.AuthUser)
+		logger.Infof("auth enabled: user=%s (可在「系统管理 → 全局安全配置」中修改，-no-auth 关闭)", settings.AuthUser)
+		// 只提示"还没改过初始密码"，不写出具体口令：
+		// 启动日志常被收集/转发，写出默认口令等于把凭据公开。
 		if authSvc.UsesPassword("admin") {
-			log.Printf("WARN: 正在使用默认管理员密码 admin，请在首次登录后立即修改（系统管理 → 全局安全配置）")
+			logger.Warnf("管理员密码仍为初始密码，请登录后在「个人资料 → 修改密码」中修改")
 		}
 	} else {
-		log.Printf("WARN: 登录校验已关闭（-no-auth / CI_AUTH_ENABLED=false），任何人都可直接访问")
+		logger.Warnf("登录校验已关闭（-no-auth / CI_AUTH_ENABLED=false），任何人都可直接访问")
 	}
 
 	// 4.2 凭据管理与系统管理服务
@@ -163,9 +191,9 @@ func main() {
 
 	// 5. 前端资源：优先使用二进制内嵌的 web/dist，其次回退磁盘目录
 	webAssets, source := assets.Resolve(cfg.WebDir)
-	log.Printf("web assets source: %s", source)
+	logger.Infof("web assets source: %s", source)
 	if webAssets == nil {
-		log.Printf("WARN: 前端资源不可用（既未内嵌也未在 %s 找到 index.html），"+
+		logger.Warnf("前端资源不可用（既未内嵌也未在 %s 找到 index.html），"+
 			"Web 控制台将返回提示页。请执行 `cd web && npm install && npm run build` 后重新编译。", cfg.WebDir)
 	}
 
@@ -179,10 +207,11 @@ func main() {
 	systemHandler := handler.NewSystemHandler(systemSvc, authSvc)
 	credentialHandler := handler.NewCredentialHandler(credentialSvc)
 	rbacHandler := handler.NewRbacHandler(rbacSvc, authSvc)
+	rbacHandler.SetPipelines(pipelineSvc)
 	// 历史用户可能没有邮箱（旧版本允许留空）：启动时显式告警，
 	// 否则「任务里选了人却收不到邮件」会变成静默故障。
 	if missing := rbacSvc.UsersWithoutEmail(); len(missing) > 0 {
-		log.Printf("WARN: 以下用户缺少邮箱，构建通知的邮件无法送达，请在「系统管理 → 用户管理」补全: %s",
+		logger.Warnf("以下用户缺少邮箱，构建通知的邮件无法送达，请在「系统管理 → 用户管理」补全: %s",
 			strings.Join(missing, ", "))
 	}
 
@@ -285,26 +314,26 @@ func main() {
 		if cfgErr != nil {
 			absConfig = cfg.ConfigFile
 		}
-		log.Printf("ci-platform listening on %s (data_home=%s, config=%s, workers=%d, queue=%d, pid=%d)",
+		logger.Infof("ci-platform listening on %s (data_home=%s, config=%s, workers=%d, queue=%d, pid=%d)",
 			cfg.Addr, absDataHome, absConfig, cfg.Workers, cfg.QueueSize, os.Getpid())
-		log.Printf("web console: %s", cfg.ListenURL())
+		logger.Infof("web console: %s", cfg.ListenURL())
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("http server: %v", err)
 		}
 	}()
 
 	<-ctx.Done()
-	log.Println("shutting down...")
+	logger.Infof("%s", "shutting down...")
 	scheduler.SetQuiet(true)
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("graceful shutdown failed: %v", err)
+		logger.Errorf("graceful shutdown failed: %v", err)
 	}
 	cancel()
 
 	if cfg.ShutdownTimeout > 0 {
-		log.Printf("waiting up to %s for running builds...", cfg.ShutdownTimeout)
+		logger.Infof("waiting up to %s for running builds...", cfg.ShutdownTimeout)
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		scheduler.Drain(drainCtx)
 		drainCancel()
@@ -313,17 +342,17 @@ func main() {
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	scheduler.Wait(waitCtx)
 	waitCancel()
-	log.Println("bye")
+	logger.Infof("%s", "bye")
 }
 
 // migrateWorkspaceDirs 把 data/workspace/{id} 迁移为可读的任务名目录。
 func migrateWorkspaceDirs(ctx context.Context, svc *service.PipelineService) {
 	n, err := svc.MigrateWorkspaceDirs(ctx)
 	if n > 0 {
-		log.Printf("workspace dirs migrated: %d", n)
+		logger.Infof("workspace dirs migrated: %d", n)
 	}
 	if err != nil {
-		log.Printf("WARN: 部分工作区目录名迁移失败（下次启动会重试）: %v", err)
+		logger.Warnf("部分工作区目录名迁移失败（下次启动会重试）: %v", err)
 	}
 }
 
@@ -333,19 +362,19 @@ func migrateWorkspacePolicy(ctx context.Context, dataHome string, svc *service.P
 	if _, err := os.Stat(marker); err == nil {
 		return
 	} else if !errors.Is(err, os.ErrNotExist) {
-		log.Printf("WARN: 检查工作区迁移标记失败: %v", err)
+		logger.Warnf("检查工作区迁移标记失败: %v", err)
 		return
 	}
 	n, err := svc.MigrateWorkspacePolicy(ctx)
 	if err != nil {
-		log.Printf("WARN: 迁移工作区策略失败: %v", err)
+		logger.Warnf("迁移工作区策略失败: %v", err)
 		return
 	}
 	if n > 0 {
-		log.Printf("workspace policy migrated: %d Git pipeline(s) now reuse workspace", n)
+		logger.Infof("workspace policy migrated: %d Git pipeline(s) now reuse workspace", n)
 	}
 	if err := os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644); err != nil {
-		log.Printf("WARN: 写入工作区迁移标记失败: %v", err)
+		logger.Warnf("写入工作区迁移标记失败: %v", err)
 	}
 }
 
@@ -356,19 +385,19 @@ func migrateArtifactConfig(ctx context.Context, dataHome string, svc *service.Pi
 	if _, err := os.Stat(marker); err == nil {
 		return
 	} else if !errors.Is(err, os.ErrNotExist) {
-		log.Printf("WARN: 检查产物归档迁移标记失败: %v", err)
+		logger.Warnf("检查产物归档迁移标记失败: %v", err)
 		return
 	}
 	n, err := svc.MigrateArtifactConfig(ctx)
 	if err != nil {
-		log.Printf("WARN: 迁移产物归档配置失败: %v", err)
+		logger.Warnf("迁移产物归档配置失败: %v", err)
 		return
 	}
 	if n > 0 {
-		log.Printf("artifact config migrated: %d pipeline(s)", n)
+		logger.Infof("artifact config migrated: %d pipeline(s)", n)
 	}
 	if err := os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644); err != nil {
-		log.Printf("WARN: 写入产物归档迁移标记失败: %v", err)
+		logger.Warnf("写入产物归档迁移标记失败: %v", err)
 	}
 }
 
@@ -459,11 +488,11 @@ func defaultToolCategories() []model.ToolCategory {
 	}
 }
 
-// defaultMavenSettings 提供最小的 settings.xml 样板，对应 Jenkins「Maven 配置」。
+// defaultMavenSettings 返回 Maven 全局配置的默认值（MAVEN_OPTS / 本地仓库留空，
+// 表示沿用服务器 ~/.m2 与 mvn 自身默认）。settings.xml 内容不在平台里维护：
+// 它不会被写入磁盘也不会被构建使用，摆在界面上只会让人误以为已经生效。
 func defaultMavenSettings() model.MavenSettings {
-	return model.MavenSettings{
-		DefaultSettings: "<settings xmlns=\"http://maven.apache.org/SETTINGS/1.0.0\">\n  <mirrors/>\n</settings>\n",
-	}
+	return model.MavenSettings{}
 }
 
 // progName 返回可执行文件名，仅用于拼装帮助提示，不参与业务流程。

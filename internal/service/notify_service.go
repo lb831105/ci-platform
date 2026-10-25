@@ -1,9 +1,9 @@
 package service
 
 import (
+	"ci-platform/internal/pkg/logger"
 	"context"
 	"fmt"
-	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -517,9 +517,9 @@ func (s *NotifyService) Notify(ctx context.Context, p *model.Pipeline, b *model.
 			subject = fmt.Sprintf("[%s] %s", label, subject)
 		}
 		body := renderNotifyMailBody(p, b, plan.event, settings.JenkinsURL, plan)
-		if err := executor.SendMailContext(mailCtx, settings.Email, plan.emails, subject, body); err != nil {
+		if err := executor.SendMailContext(mailCtx, effectiveEmail(settings), plan.emails, subject, body); err != nil {
 			res.Errors = append(res.Errors, "email: "+err.Error())
-			log.Printf("[notify] email failed (pipeline=%s build=%s): %v", p.ID, b.ID, err)
+			logger.Errorf("[notify] email failed (pipeline=%s build=%s): %v", p.ID, b.ID, err)
 			for _, addr := range plan.emails {
 				s.record(p, b, plan, model.NotifyRecord{
 					Channel:   "email",
@@ -569,7 +569,7 @@ func (s *NotifyService) Notify(ctx context.Context, p *model.Pipeline, b *model.
 			if err != nil {
 				res.Errors = append(res.Errors, t.channel+": "+err.Error())
 				mu.Unlock()
-				log.Printf("[notify] webhook failed (channel=%s pipeline=%s build=%s): %v",
+				logger.Errorf("[notify] webhook failed (channel=%s pipeline=%s build=%s): %v",
 					t.channel, p.ID, b.ID, err)
 				s.record(p, b, plan, model.NotifyRecord{
 					Channel:   t.channel,
@@ -614,7 +614,7 @@ func (s *NotifyService) record(p *model.Pipeline, b *model.Build, plan notifyPla
 	rec.Escalated = plan.escalated
 	rec.OnCall = plan.onCall
 	if err := s.records.Append([]model.NotifyRecord{rec}); err != nil {
-		log.Printf("[notify] record append failed: %v", err)
+		logger.Errorf("[notify] record append failed: %v", err)
 	}
 }
 
@@ -803,7 +803,7 @@ func (s *NotifyService) SendTest(ctx context.Context, p *model.Pipeline) NotifyR
 		subject := fmt.Sprintf("[测试] %s - 通知配置测试", p.Name)
 		body := fmt.Sprintf("这是一条来自 CI Platform 的测试通知。\n\n任务: %s（%s）\n接收人: %s\n",
 			p.Name, p.ID, strings.Join(emails, ", "))
-		if err := executor.SendMailContext(mailCtx, settings.Email, emails, subject, body); err != nil {
+		if err := executor.SendMailContext(mailCtx, effectiveEmail(settings), emails, subject, body); err != nil {
 			res.Errors = append(res.Errors, "email: "+err.Error())
 		} else {
 			res.Emails = emails
@@ -846,6 +846,18 @@ func mentionsForPeople(channel string, people []model.RbacUser) []string {
 		}
 	}
 	return out
+}
+
+// effectiveEmail 返回实际用于发信的邮件配置。
+//
+// SMTP 服务普遍要求 From 与登录账号同域，因此「系统配置 → 系统管理员邮件地址」在
+// 未单独填写发件人时作为兜底——否则界面上那一栏填了也不会有任何效果。
+func effectiveEmail(settings model.Settings) model.EmailSettings {
+	cfg := settings.Email
+	if strings.TrimSpace(cfg.From) == "" {
+		cfg.From = strings.TrimSpace(settings.AdminEmail)
+	}
+	return cfg
 }
 
 // notifyEventLabel 事件中文标签（与 executor 保持一致，供标题与摘要使用）。

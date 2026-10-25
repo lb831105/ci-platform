@@ -34,6 +34,12 @@ type PipelineService struct {
 	store     PipelineStore
 	settings  *SettingsService
 	workspace *WorkspaceManager
+	scoper    JobScoper // 任务可见性来源（RBAC），未装配时不做过滤
+}
+
+// JobScoper 提供某用户的任务可见性判定（由 RBACService 实现）。
+type JobScoper interface {
+	JobScope(user string) *JobScope
 }
 
 // NewPipelineService 构造 Pipeline 业务服务。
@@ -41,9 +47,44 @@ func NewPipelineService(store PipelineStore, settings *SettingsService, workspac
 	return &PipelineService{store: store, settings: settings, workspace: workspace}
 }
 
-// List 返回全部 pipeline。
+// SetJobScoper 装上任务级权限来源；装配顺序上 RBACService 晚于本服务创建。
+func (s *PipelineService) SetJobScoper(scoper JobScoper) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scoper = scoper
+}
+
+// List 返回全部 pipeline（内部使用：调度、系统统计）。
 func (s *PipelineService) List(ctx context.Context) ([]*model.Pipeline, error) {
 	return s.store.List(ctx)
+}
+
+// ListFor 返回指定用户可见的 pipeline。
+//
+// 列表/概览/全局构建历史走这里，任务角色 Pattern 之外的任务直接不出现：
+// 否则用户能看到「隔壁生产任务」的名字，只是在点进去时收到 403。
+func (s *PipelineService) ListFor(ctx context.Context, user string) ([]*model.Pipeline, error) {
+	items, err := s.store.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	scoper := s.scoper
+	s.mu.Unlock()
+	if scoper == nil {
+		return items, nil
+	}
+	scope := scoper.JobScope(user)
+	if scope.All() {
+		return items, nil
+	}
+	visible := make([]*model.Pipeline, 0, len(items))
+	for _, p := range items {
+		if scope.Allows(p.Name) {
+			visible = append(visible, p)
+		}
+	}
+	return visible, nil
 }
 
 // Get 返回单个 pipeline。
@@ -90,7 +131,7 @@ func (s *PipelineService) MigrateWorkspacePolicy(ctx context.Context) (int, erro
 func (s *PipelineService) Create(ctx context.Context, in *model.Pipeline) (*model.Pipeline, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := normalizeAndValidate(in, s.nameRegex()); err != nil {
+	if err := normalizeAndValidate(in, s.nameRegex(), s.defaultGitBranch()); err != nil {
 		return nil, err
 	}
 	if err := s.validateSshServer(in); err != nil {
@@ -121,7 +162,7 @@ func (s *PipelineService) Create(ctx context.Context, in *model.Pipeline) (*mode
 func (s *PipelineService) Validate(_ context.Context, in *model.Pipeline) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := normalizeAndValidate(in, s.nameRegex()); err != nil {
+	if err := normalizeAndValidate(in, s.nameRegex(), s.defaultGitBranch()); err != nil {
 		return err
 	}
 	return s.validateSshServer(in)
@@ -154,7 +195,7 @@ func (s *PipelineService) Update(ctx context.Context, id string, in *model.Pipel
 	// 否则 auth_type=password 的任务保存会被“密码必填”误拦截。
 	mergeSensitive(old, in)
 	mergeNotifyURLs(old, in)
-	if err = normalizeAndValidate(in, s.nameRegex()); err != nil {
+	if err = normalizeAndValidate(in, s.nameRegex(), s.defaultGitBranch()); err != nil {
 		return nil, err
 	}
 	if err = s.validateSshServer(in); err != nil {
@@ -390,8 +431,21 @@ func (s *PipelineService) nameRegex() string {
 	return s.settings.Current().JobNameRegex
 }
 
+// maxApprovalTimeoutMinutes 是发布审批等待上限（7 天）。
+const maxApprovalTimeoutMinutes = 7 * 24 * 60
+
+// defaultGitBranch 返回「系统配置 → 默认构建参数 → 默认分支」，未配置时回退 main。
+// 任务留空分支时用它补齐：该配置项既然放在界面上，就必须真的影响新建任务。
+func (s *PipelineService) defaultGitBranch() string {
+	if s.settings == nil {
+		return ""
+	}
+	return s.settings.Current().DefaultBranch
+}
+
 // normalizeAndValidate 做字段归一化与必填校验（业务规则只允许出现在 service）。
-func normalizeAndValidate(p *model.Pipeline, nameRegex string) error {
+// defaultBranch 可选：任务未填分支时用它兜底（缺省 main）。
+func normalizeAndValidate(p *model.Pipeline, nameRegex string, defaultBranch ...string) error {
 	p.Name = strings.TrimSpace(p.Name)
 	p.Description = strings.TrimSpace(p.Description)
 	p.Image = strings.TrimSpace(p.Image)
@@ -401,6 +455,10 @@ func normalizeAndValidate(p *model.Pipeline, nameRegex string) error {
 	p.WebhookSecret = strings.TrimSpace(p.WebhookSecret)
 	// 平台已改为纯本地构建；executor/image 字段保留仅为兼容旧数据，不再参与调度。
 	p.Executor = model.ExecutorLocal
+	// Webhook 触发器策略（事件 / 分支 / 回写），业务规则只在这里校验。
+	if err := normalizeWebhookTrigger(p); err != nil {
+		return err
+	}
 	// 定时构建：保存前校验 cron 语法，避免任务保存成功但永不触发。
 	p.CronSpec = strings.TrimSpace(p.CronSpec)
 	if p.CronSpec != "" {
@@ -443,6 +501,20 @@ func normalizeAndValidate(p *model.Pipeline, nameRegex string) error {
 	}
 	if p.GitBranch == "" {
 		p.GitBranch = "main"
+		if len(defaultBranch) > 0 && strings.TrimSpace(defaultBranch[0]) != "" {
+			p.GitBranch = strings.TrimSpace(defaultBranch[0])
+		}
+	}
+	// 发布审批：超时上限 7 天，避免笔误把发布卡很久；不开审批时不保留超时值。
+	if p.RequireApproval {
+		if p.ApprovalTimeoutMinutes < 0 {
+			return pkg.ErrBadRequest("审批超时时间不能为负数")
+		}
+		if p.ApprovalTimeoutMinutes > maxApprovalTimeoutMinutes {
+			return pkg.ErrBadRequest("审批超时时间不能超过 %d 分钟", maxApprovalTimeoutMinutes)
+		}
+	} else {
+		p.ApprovalTimeoutMinutes = 0
 	}
 	if p.BuildRetentionMaxPerJob < 0 {
 		p.BuildRetentionMaxPerJob = 0
@@ -1179,4 +1251,78 @@ func normalizeStepControls(step *model.Step) error {
 		return pkg.ErrBadRequest("step %q: when=failure 的步骤不能同时设置 allow_failure", step.Name)
 	}
 	return nil
+}
+
+// maxWebhookBranches 是分支白名单上限：条目过多通常意味着该拆任务了。
+const maxWebhookBranches = 30
+
+// normalizeWebhookTrigger 归一化并校验 Webhook 触发器配置。
+//
+// 为什么要在这里硬校验：分支白名单写错（比如写成 "release-*" 却期望匹配 "release/1.0"）
+// 的症状是"Webhook 返回成功但从不构建"，排查成本远高于保存时直接报错。
+func normalizeWebhookTrigger(p *model.Pipeline) error {
+	p.WebhookBranchMode = strings.ToLower(strings.TrimSpace(p.WebhookBranchMode))
+	switch p.WebhookBranchMode {
+	case "", "payload", "fixed":
+	default:
+		return pkg.ErrBadRequest("Webhook 分支策略只能是 payload 或 fixed")
+	}
+	// 事件白名单：去重、只允许 push / tag_push。
+	events := make([]string, 0, len(p.WebhookEvents))
+	for _, raw := range p.WebhookEvents {
+		e := strings.ToLower(strings.TrimSpace(raw))
+		if e == "" {
+			continue
+		}
+		if e != "push" && e != "tag_push" {
+			return pkg.ErrBadRequest("不支持的 Webhook 事件类型 %q（可选 push / tag_push）", raw)
+		}
+		if !containsFold(events, e) {
+			events = append(events, e)
+		}
+	}
+	p.WebhookEvents = events
+
+	// 分支白名单：去空、去重、长度与合法性校验。
+	branches := make([]string, 0, len(p.WebhookBranches))
+	for _, raw := range p.WebhookBranches {
+		b := strings.TrimSpace(raw)
+		if b == "" {
+			continue
+		}
+		if len(b) > maxBranchNameLen {
+			return pkg.ErrBadRequest("分支匹配模式过长：%s", b)
+		}
+		if strings.ContainsAny(b, " 	") {
+			return pkg.ErrBadRequest("分支匹配模式不能包含空白字符：%q", b)
+		}
+		if !containsFold(branches, b) {
+			branches = append(branches, b)
+		}
+	}
+	if len(branches) > maxWebhookBranches {
+		return pkg.ErrBadRequest("Webhook 分支白名单最多 %d 条（当前 %d）", maxWebhookBranches, len(branches))
+	}
+	p.WebhookBranches = branches
+
+	// 状态回写：启用时必须指定凭据（没有 token 无法写 GitLab）。
+	p.CommitStatus.CredentialID = strings.TrimSpace(p.CommitStatus.CredentialID)
+	p.CommitStatus.Project = strings.TrimSpace(p.CommitStatus.Project)
+	if p.CommitStatus.Enabled && p.CommitStatus.CredentialID == "" {
+		return pkg.ErrBadRequest("开启「回写构建状态」需要选择 GitLab 凭据（Personal Access Token）")
+	}
+	return nil
+}
+
+// maxBranchNameLen 是分支名的合理上限（git 允许 255，这里留余量）。
+const maxBranchNameLen = 200
+
+// containsFold 大小写不敏感地判断切片中是否已存在该值。
+func containsFold(list []string, want string) bool {
+	for _, item := range list {
+		if strings.EqualFold(item, want) {
+			return true
+		}
+	}
+	return false
 }

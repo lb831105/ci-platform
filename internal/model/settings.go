@@ -32,10 +32,8 @@ type ToolCategory struct {
 
 // MavenSettings 对应 Jenkins「Maven 项目配置」。
 type MavenSettings struct {
-	DefaultSettings string `json:"default_settings"` // 默认 settings.xml 内容
-	GlobalSettings  string `json:"global_settings"`  // 全局 settings.xml 内容
-	MavenOpts       string `json:"maven_opts"`       // 全局 MAVEN_OPTS
-	LocalRepo       string `json:"local_repo"`       // Local Maven Repository（服务器路径）
+	MavenOpts string `json:"maven_opts"` // 全局 MAVEN_OPTS
+	LocalRepo string `json:"local_repo"` // Local Maven Repository（服务器路径）
 }
 
 // ToolMount 为旧版 Docker 构建的挂载配置。
@@ -125,6 +123,9 @@ type Settings struct {
 
 	// 构建结果 Webhook 通知（钉钉 / 企业微信 / Slack）。
 	WebhookNotify WebhookNotifySettings `json:"webhook_notify"`
+
+	// GitLab 站点地址（如 https://gitlab.example.com），用于「回写构建状态」。
+	GitlabBaseURL string `json:"gitlab_base_url,omitempty"`
 
 	// 全局属性
 	GlobalEnv    []EnvVar `json:"global_env"`

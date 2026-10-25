@@ -28,6 +28,7 @@ function defaultForm(): Settings {
     display_name: '',
     system_message: '',
     jenkins_url: '',
+    gitlab_base_url: '',
     admin_email: '',
     default_branch: 'main',
     job_name_regex: '',
@@ -45,7 +46,7 @@ function defaultForm(): Settings {
     git_user_email: '',
     tool_categories: [],
     ssh_servers: [],
-    maven: { default_settings: '', global_settings: '', maven_opts: '', local_repo: '' },
+    maven: { maven_opts: '', local_repo: '' },
     email: {
       enabled: false,
       smtp_host: '',
@@ -309,11 +310,22 @@ async function onTestWebhook(): Promise<void> {
         </el-collapse-item>
 
         <el-collapse-item name="location">
-          <template #title>Jenkins Location</template>
+          <template #title>系统地址（Jenkins Location）</template>
           <el-form label-width="200px" label-position="right">
             <el-form-item label="Jenkins URL">
               <el-input v-model="form.jenkins_url" placeholder="如 https://ci.example.com" style="max-width: 480px" />
               <div class="form-tip">用于生成回显链接（Webhook、通知中的地址）。</div>
+            </el-form-item>
+            <el-form-item label="GitLab 地址">
+              <el-input
+                v-model="form.gitlab_base_url"
+                class="mono"
+                placeholder="如 https://gitlab.example.com（不要带 /api/v4）"
+                style="max-width: 480px"
+              />
+              <div class="form-tip">
+                任务开启「回写构建状态」时用它调 GitLab API（commit status），让 Merge Request 里直接看到构建结果。
+              </div>
             </el-form-item>
             <el-form-item label="系统管理员邮件地址">
               <el-input v-model="form.admin_email" placeholder="admin@example.com" style="max-width: 480px" />
@@ -342,10 +354,6 @@ async function onTestWebhook(): Promise<void> {
         <el-collapse-item name="behavior">
           <template #title>执行器与构建行为</template>
           <el-form label-width="200px" label-position="right">
-            <el-form-item label="执行器数量">
-              <el-input-number :model-value="info?.workers ?? 0" disabled />
-              <span class="muted" style="margin-left: 10px">启动参数，修改需重启</span>
-            </el-form-item>
             <el-form-item label="静默期（秒）">
               <el-input-number v-model="form.quiet_period_seconds" :min="0" :max="3600" />
               <div class="form-tip">构建触发后等待若干秒再开始，便于合并连续提交。</div>
@@ -353,11 +361,11 @@ async function onTestWebhook(): Promise<void> {
             <el-form-item label="SCM 签出重试次数">
               <el-input-number v-model="form.scm_retry_count" :min="0" :max="10" />
             </el-form-item>
-            <el-form-item label="Shell executable">
+            <el-form-item label="Shell 解释器">
               <el-input v-model="form.shell" class="mono" style="max-width: 320px" />
               <div class="form-tip">本地执行构建步骤使用的 shell。Windows 默认 cmd.exe（可填 powershell.exe 或 Git Bash 的 bash.exe 完整路径）；Linux 默认 /bin/sh。</div>
             </el-form-item>
-            <el-form-item label="Global Time Out（分钟）">
+            <el-form-item label="全局构建超时（分钟）">
               <el-input-number v-model="form.global_build_timeout_minutes" :min="0" :max="1440" />
               <div class="form-tip">0 表示不限制；超时后构建失败。</div>
             </el-form-item>
@@ -365,7 +373,7 @@ async function onTestWebhook(): Promise<void> {
         </el-collapse-item>
 
         <el-collapse-item name="discarders">
-          <template #title>Global Build Discarders</template>
+          <template #title>全局构建保留策略（Global Build Discarders）</template>
           <el-form label-width="200px" label-position="right">
             <el-form-item label="每个任务最多保留">
               <el-input-number v-model="form.build_retention_max_per_job" :min="0" :max="10000" />
@@ -424,26 +432,8 @@ async function onTestWebhook(): Promise<void> {
           />
         </el-collapse-item>
 
-        <el-collapse-item name="maven">
-          <template #title>Maven 项目配置</template>
-          <el-form label-width="200px" label-position="right">
-            <el-form-item label="全局 MAVEN_OPTS">
-              <el-input v-model="form.maven.maven_opts" class="mono" placeholder="如 -Xmx1024m" style="max-width: 560px" />
-            </el-form-item>
-            <el-form-item label="Local Maven Repository">
-              <el-input
-                v-model="form.maven.local_repo"
-                class="mono"
-                placeholder="如 C:/Users/you/.m2/repository 或 /root/.m2/repository"
-                style="max-width: 560px"
-              />
-              <div class="form-tip">服务器上的 Maven 本地仓库绝对路径，将以 <span class="mono">-Dmaven.repo.local</span> 注入构建，由服务器上的 mvn 直接使用。</div>
-            </el-form-item>
-          </el-form>
-        </el-collapse-item>
-
         <el-collapse-item name="git">
-          <template #title>Git plugin</template>
+          <template #title>Git 全局身份（Git plugin）</template>
           <el-form label-width="240px" label-position="right">
             <el-form-item label="Global Config user.name Value">
               <el-input v-model="form.git_user_name" style="max-width: 360px" />
@@ -628,18 +618,21 @@ async function onTestWebhook(): Promise<void> {
           <template #title>启动参数（只读，修改后需重启）</template>
           <el-form label-width="200px" label-position="right">
             <el-form-item label="构建 worker 数">
-              <el-input-number :model-value="form.workers" disabled />
+              <el-input-number :model-value="info?.workers ?? form.workers" disabled />
             </el-form-item>
             <el-form-item label="队列容量">
-              <el-input-number :model-value="form.queue_size" disabled />
+              <el-input-number :model-value="info?.queue_capacity ?? form.queue_size" disabled />
             </el-form-item>
             <el-form-item label="孤儿工作区保留（分钟）">
-              <el-input-number :model-value="form.workspace_ttl_minutes" disabled />
+              <el-input-number :model-value="info?.workspace_ttl_minutes ?? 0" disabled />
               <div class="form-tip">仅清理已删除任务遗留的孤儿工作区；仍存在的任务会保留工作区以支持增量构建。</div>
             </el-form-item>
             <el-form-item label="清理扫描间隔（分钟）">
-              <el-input-number :model-value="form.clean_interval_minutes" disabled />
+              <el-input-number :model-value="info?.clean_interval_minutes ?? 0" disabled />
             </el-form-item>
+            <div class="form-tip" style="margin-left: 200px">
+              以上为启动参数的实际生效值（来自命令行参数 / 环境变量），修改需重启服务。
+            </div>
           </el-form>
         </el-collapse-item>
 
@@ -648,8 +641,8 @@ async function onTestWebhook(): Promise<void> {
           <ul class="unsupported-list">
             <li>Disk Space Monitoring Thresholds、Metrics / Access keys、Fingerprints、管理监控</li>
             <li>GitLab / GitHub / Generic Webhook Trigger、Develocity、Timestamper</li>
-            <li>HTTP Proxy、Resource Root URL、使用统计、Pipeline 库、Job Import</li>
-            <li>Publish over SSH 全局服务器（发布配置在单个任务中维护）</li>
+            <li>HTTP Proxy、Resource Root URL、使用统计、Pipeline 库</li>
+            <li>Maven settings.xml 托管（把文件放在服务器的 ~/.m2/ 下，或在步骤里用 -s 指定）</li>
           </ul>
         </el-collapse-item>
       </el-collapse>

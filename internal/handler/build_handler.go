@@ -1,8 +1,8 @@
 package handler
 
 import (
+	"ci-platform/internal/pkg/logger"
 	"fmt"
-	"log"
 	"mime"
 	"net/http"
 	"path/filepath"
@@ -118,7 +118,7 @@ func (h *BuildHandler) DownloadArtifactsZip(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Disposition", attachmentName(fmt.Sprintf("build-%s-artifacts.zip", buildID)))
 	if err = h.artifacts.WriteZip(r.Context(), pipelineID, buildID, manifest, w); err != nil {
 		// 响应体可能已开始写入，无法再改状态码；记录日志便于排查。
-		log.Printf("download artifacts zip %s/%s: %v", pipelineID, buildID, err)
+		logger.Infof("download artifacts zip %s/%s: %v", pipelineID, buildID, err)
 	}
 }
 

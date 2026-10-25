@@ -38,6 +38,17 @@ type SshPublishConfig struct {
 	ExecTimeoutSec int  `json:"exec_timeout_sec,omitempty"`
 }
 
+// CommitStatusConfig 配置「构建状态回写代码平台」（目前实现 GitLab）。
+// 为什么放在任务上：同一个 GitLab 项目可能对应多个任务（构建/部署），
+// 状态名与凭据需要按任务区分。
+type CommitStatusConfig struct {
+	Enabled bool `json:"enabled"`
+	// CredentialID 引用凭据（secret_text 存 Personal Access Token），需要 api 权限。
+	CredentialID string `json:"credential_id,omitempty"`
+	// Project 是 GitLab 项目 ID 或 group/app 路径；留空时使用 Webhook payload 里带的项目。
+	Project string `json:"project,omitempty"`
+}
+
 // ArtifactConfig 描述构建产物的归档规则，语义对齐 Jenkins "Archive the artifacts"。
 // 构建步骤成功后，按 Files 中的 glob（相对工作区）复制到
 // data/jobs/{pid}/builds/{bid}/artifacts/，每次构建独立保留。
@@ -111,9 +122,29 @@ type Pipeline struct {
 	GitCredential string `json:"git_credential_id"` // 引用的凭据 ID（账号密码 / 令牌）
 	WebhookSecret string `json:"webhook_secret"`
 
+	// Webhook 分支策略：Webhook 触发时用哪个分支构建。
+	//   ""      / "payload" → 用推送事件里的分支（默认，对齐 GitLab CI：推哪个分支就构建哪个）
+	//   "fixed"            → 始终构建上面 git_branch 配置的分支
+	WebhookBranchMode string `json:"webhook_branch_mode,omitempty"`
+	// WebhookBranches 是允许触发的分支白名单（精确或 release/* / hotfix/** 通配），空表示任意分支。
+	WebhookBranches []string `json:"webhook_branches,omitempty"`
+	// WebhookEvents 是允许触发的事件类型（push / tag_push），空表示只接受 push。
+	// 默认只认 push：MR/评论等事件触发构建几乎总是误配置。
+	WebhookEvents []string `json:"webhook_events,omitempty"`
+	// CommitStatus 把构建状态回写到代码平台（GitLab commit status），便于 MR 里看到结果。
+	CommitStatus CommitStatusConfig `json:"commit_status"`
+
 	// 定时构建（对齐 Jenkins Build periodically）：5 字段 cron 规格，
 	// 支持 H 散列均衡；为空表示不定时触发。
 	CronSpec string `json:"cron_spec,omitempty"`
+	// RequireApproval 为 true 时，构建触发后先进入 pending_approval 状态，
+	// 必须由拥有 job.approve 权限的人放行才会真正执行。
+	// 典型用法：生产发布任务开启，测试环境任务不开启。
+	RequireApproval bool `json:"require_approval"`
+	// ApprovalTimeoutMinutes 审批等待上限（0 表示不超时），超时自动按「拒绝」落 aborted，
+	// 避免没人处理的发布把构建历史永远挂在「待审批」。
+	ApprovalTimeoutMinutes int `json:"approval_timeout_minutes"`
+
 	// Params 是构建参数定义；为空则是普通「立即构建」，不弹参数表单。
 	Params []ParamDef `json:"params,omitempty"`
 	// SshPublish 是旧版单目标配置（向后兼容，读取时由 EffectiveSshPublishes 归一为列表）。

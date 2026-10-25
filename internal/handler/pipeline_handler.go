@@ -77,7 +77,7 @@ func maskNotifyTargets(in []model.NotifyTarget) []model.NotifyTarget {
 
 // List GET /api/pipelines
 func (h *PipelineHandler) List(w http.ResponseWriter, r *http.Request) {
-	items, err := h.pipelines.List(r.Context())
+	items, err := h.pipelines.ListFor(r.Context(), pkg.UserFromContext(r.Context()))
 	if err != nil {
 		pkg.Fail(w, err)
 		return
@@ -92,7 +92,7 @@ func (h *PipelineHandler) List(w http.ResponseWriter, r *http.Request) {
 //
 // 返回带构建聚合信息的任务列表，供 Jenkins 风格作业列表一次性渲染。
 func (h *PipelineHandler) Overview(w http.ResponseWriter, r *http.Request) {
-	pipelines, err := h.pipelines.List(r.Context())
+	pipelines, err := h.pipelines.ListFor(r.Context(), pkg.UserFromContext(r.Context()))
 	if err != nil {
 		pkg.Fail(w, err)
 		return
@@ -112,7 +112,7 @@ func (h *PipelineHandler) Overview(w http.ResponseWriter, r *http.Request) {
 //
 // 返回跨任务的构建历史，按开始时间倒序，供全局「构建历史」页使用。
 func (h *PipelineHandler) AllBuilds(w http.ResponseWriter, r *http.Request) {
-	pipelines, err := h.pipelines.List(r.Context())
+	pipelines, err := h.pipelines.ListFor(r.Context(), pkg.UserFromContext(r.Context()))
 	if err != nil {
 		pkg.Fail(w, err)
 		return
@@ -211,7 +211,7 @@ func (h *PipelineHandler) Rename(w http.ResponseWriter, r *http.Request) {
 
 // trigger 是手动与 Webhook 共用的触发入口。
 func (h *PipelineHandler) trigger(w http.ResponseWriter, r *http.Request, pipelineID string, t model.TriggerType, triggeredBy string, params map[string]string) {
-	b, err := h.builds.Trigger(r.Context(), pipelineID, t, triggeredBy, params)
+	b, err := h.builds.Trigger(r.Context(), pipelineID, t, triggeredBy, service.TriggerOptions{Params: params})
 	if err != nil {
 		pkg.Fail(w, err)
 		return

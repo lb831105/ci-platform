@@ -131,8 +131,12 @@ func normalizeCredential(in *model.Credential) error {
 		if in.Username == "" {
 			return pkg.ErrBadRequest("用户名/密码类型需要填写用户名")
 		}
-	case model.CredentialSecretText, model.CredentialSSHKey:
+	case model.CredentialSecretText:
 		// 仅需 secret
+	case model.CredentialSSHKey:
+		// 平台没有「凭据 → 私钥文件」的使用方（Git 走 HTTPS，SSH 发布的私钥路径配在服务器上），
+		// 存下来只会是一份永远不会被使用的密钥。
+		return pkg.ErrBadRequest("暂不支持 SSH 私钥类型凭据：请在「系统配置 → SSH 服务器」中填写私钥路径")
 	default:
 		return pkg.ErrBadRequest("不支持的凭据类型: %s", in.Type)
 	}

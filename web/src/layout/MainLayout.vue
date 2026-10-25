@@ -116,7 +116,7 @@ async function onUserCommand(command: string): Promise<void> {
             <AppIcon name="settings" />
             <span>系统管理</span>
           </RouterLink>
-          <RouterLink v-if="auth.hasPerm('overall.read')" class="menu-item" :class="{ 'menu-item--active': isBuildsActive }" :to="{ name: 'global-build-history' }">
+          <RouterLink v-if="auth.authenticated || !auth.enabled" class="menu-item" :class="{ 'menu-item--active': isBuildsActive }" :to="{ name: 'global-build-history' }">
             <AppIcon name="history" />
             <span>构建历史</span>
           </RouterLink>

@@ -3,14 +3,26 @@ package pkg
 import (
 	"strings"
 	"sync"
+	"time"
 )
+
+// LogEntry 是「系统日志」页面展示的一条日志。
+type LogEntry struct {
+	At      time.Time `json:"at"`
+	Level   string    `json:"level"`
+	Message string    `json:"message"`
+}
 
 // LogBuffer 是一个定长环形日志缓冲：实现 io.Writer，可接在标准 log 后面，
 // 用于「系统日志」页面回看最近日志而不落盘。
+//
+// 除了 Lines()（兼容旧用法），还实现 logger.EntrySink，把带级别的条目存下来，
+// 让页面可以按级别过滤与着色——没有级别的"一坨文本"在排障时几乎不可用。
 type LogBuffer struct {
 	mu      sync.Mutex
 	max     int
 	lines   []string
+	entries []LogEntry
 	partial []byte
 }
 
@@ -19,7 +31,7 @@ func NewLogBuffer(max int) *LogBuffer {
 	if max <= 0 {
 		max = 1000
 	}
-	return &LogBuffer{max: max, lines: make([]string, 0, max)}
+	return &LogBuffer{max: max, lines: make([]string, 0, max), entries: make([]LogEntry, 0, max)}
 }
 
 // Write 按行拆分输入并写入缓冲，返回写入字节数。
@@ -43,6 +55,28 @@ func (b *LogBuffer) Write(p []byte) (int, error) {
 		b.partial = b.partial[:0]
 	}
 	return len(p), nil
+}
+
+// Push 实现 logger.EntrySink：记录带级别的条目。
+func (b *LogBuffer) Push(at time.Time, level, message string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.entries = append(b.entries, LogEntry{At: at, Level: level, Message: message})
+	if len(b.entries) > b.max {
+		b.entries = b.entries[len(b.entries)-b.max:]
+	}
+}
+
+// Entries 返回最近 n 条结构化日志（n<=0 表示全部），按时间正序。
+func (b *LogBuffer) Entries(n int) []LogEntry {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]LogEntry, len(b.entries))
+	copy(out, b.entries)
+	if n > 0 && len(out) > n {
+		out = out[len(out)-n:]
+	}
+	return out
 }
 
 // Lines 返回最近 n 行（n<=0 表示全部），按时间正序。

@@ -29,7 +29,7 @@ dist\ci-platform-windows-amd64.exe
 默认监听 `:8080`，数据目录 `./data`。
 
 数据目录（任务、构建记录、凭据、设置）可在**系统配置 → 主目录**中修改，修改后写入引导配置 `ci-platform.json`，**重启服务后生效**；保存时可选择把现有任务/凭据/设置迁移到新目录。也可在启动时通过 `-data-home` 或 `CI_DATA_HOME` 指定（优先级高于引导配置），或用 `-config` / `CI_CONFIG_FILE` 改变引导配置文件位置。
-默认开启登录校验，初始账号 **`admin` / `admin`**，首次登录后请通过启动参数或环境变量修改：
+默认开启登录校验，初始账号 `admin`。**部署时请通过启动参数或环境变量指定初始密码**（仅首次初始化生效）：
 
 ```bash
 ./dist/ci-platform-linux-amd64 -auth-user ops -auth-password 'your-password'
@@ -37,10 +37,48 @@ dist\ci-platform-windows-amd64.exe
 # 仅本地调试可关闭登录：-no-auth（或 CI_AUTH_ENABLED=false）
 ```
 
-> 密码安全：管理员密码以 **bcrypt hash** 落盘（`auth_password_hash`），`data/settings.json` 中不再保存明文；
-> 旧版明文配置在首次启动时自动迁移。新设置的密码至少 8 个字符；使用默认密码 `admin` 时启动日志会给出 WARN 提示。
+> 密码安全：管理员密码以 **bcrypt hash** 落盘（`auth_password_hash`），`data/settings.json` 中不保存明文；
+> 旧版明文配置在首次启动时自动迁移。新密码至少 8 个字符。
+>
+> **改密码有两条路**：① 任何登录用户在「个人资料 → 修改密码」自助改（需填当前密码，改完其他会话立即失效）；
+> ② 管理员在「系统管理 → 全局安全配置」直接设置。**初始密码只影响首次初始化**——改过之后，即使再次带着
+> `-auth-password` 启动也不会被覆盖（以 `data/settings.json` 里的 hash 为准）。
+> 登录页不展示任何初始凭据提示；若仍在使用初始密码，启动日志会提醒（不写出具体口令）。
 
 浏览器访问 <http://127.0.0.1:8080>。
+
+### 平台日志（分级 + 按月轮转）
+
+运行日志同时写到三处，级别分 `DEBUG / INFO / WARN / ERROR` 四档：
+
+| 位置 | 内容 | 保留 |
+|---|---|---|
+| `data/logs/YYYY-MM/app-YYYY-MM-DD.log` | 全量平台日志（**每天一个文件**，一行一条；**每月一个目录**，满月即轮换） | 默认 **12 个月**，可用 `-log-retain-months` 调整（`0` = 永久保留）；过期月份目录整月删除 |
+| 控制台（stderr） | 同上，便于 systemd / journald 收集 | 由 journald 决定 |
+| 内存环形缓冲（最近 2000 条） | 「系统管理 → 系统日志」页面，可按级别过滤 / 搜索 | 进程内存，重启清空 |
+
+```bash
+-log-level debug|info|warn|error     # 默认 info；debug 额外输出 Webhook 解析、RBAC 拒绝、调度入队、SSH 逐文件上传等
+-log-retain-months 12                # 默认 12；0 表示永久保留（按月目录整体清理）
+# 等价环境变量：CI_LOG_LEVEL / CI_LOG_RETAIN_MONTHS
+```
+
+目录结构（按天记录、按月轮换）：
+
+```
+data/logs/
+├── 2026-10/                      ← 当月
+│   ├── app-2026-10-24.log
+│   └── app-2026-10-25.log        ← 今天，tail -f 这个
+└── 2026-09/                      ← 上个月（已轮换归档，保留 12 个月）
+    └── app-2026-09-30.log
+```
+
+日志行格式：`2026-10-25 20:30:01.123 INFO  消息`（多行消息自动缩进续行，保证仍能按行 grep）。
+「系统日志」页面顶部会显示当前落盘文件与级别，方便直接去服务器 `tail -f`。
+
+> 排查构建问题看**构建日志**（`data/jobs/{id}/builds/{n}/log.txt`）；平台日志记录的是"平台自己发生了什么"
+> （启动、调度、Webhook、通知、状态回写等），两者不要混用。
 
 > **构建依赖服务器本地工具链**：平台直接在运行服务的机器上执行构建步骤，不使用 Docker。
 > 请确保服务器已安装 Go / JDK / Maven / Node.js / Gradle 等所需工具，并在「系统管理 → 全局工具配置」
@@ -186,7 +224,7 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | POST | `/api/auth/login` | 登录，返回 Bearer token（公开） |
 | POST | `/api/auth/logout` | 登出 |
 | GET | `/api/auth/me` | 当前用户 |
-| POST | `/api/auth/password` | 修改密码（校验旧密码） |
+| POST | `/api/auth/password` | 修改**当前登录账号**的密码（校验旧密码；内置管理员与平台内用户都走这里，改密后其他会话失效） |
 | GET | `/api/overview` | 带构建聚合的任务列表（Jenkins 作业列表） |
 | GET | `/api/builds` | 跨任务构建历史 |
 | GET | `/api/pipelines` | 任务列表 |
@@ -196,7 +234,7 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | DELETE | `/api/pipelines/{pid}` | 删除任务（递归删目录） |
 | POST | `/api/pipelines/{pid}/build` | 手动触发；body 可带 `{"params":{"VERSION":"1.2.3"}}`（参数化构建），body 可省略 |
 | POST | `/api/pipelines/{pid}/rename` | 重命名任务（受工程命名限制约束） |
-| POST | `/api/webhook/{pipeline_id}` | Webhook 触发（密钥兼容 `X-Webhook-Secret` / GitLab `X-Gitlab-Token` / GitHub `X-Hub-Signature-256`，任一匹配即通过）；查询串可覆盖已定义的构建参数（`?VERSION=1.2.3`） |
+| POST | `/api/webhook/{pipeline_id}` | Webhook 触发：密钥兼容 `X-Webhook-Secret` / GitLab `X-Gitlab-Token` / GitHub `X-Hub-Signature-256`；按**事件与分支白名单**过滤、`[ci skip]` 跳过、按投递 UUID **幂等去重**、按推送分支构建；查询串可覆盖已定义参数。**该接口返回真实 HTTP 状态码**（401/404/409/429），被策略忽略时返回 200 + `{ignored:true,reason}` |
 | GET | `/api/pipelines/{pid}/builds` | 构建历史（遍历目录，编号倒序） |
 | GET | `/api/pipelines/{pid}/builds/{bid}` | 构建详情 |
 | GET | `/api/pipelines/{pid}/builds/{bid}/log` | 拉取日志全文 |
@@ -221,7 +259,7 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | PUT | `/api/security/users/contact` | 设置用户通知联系方式（邮箱/企微 ID/手机号，管理员） |
 | GET | `/api/system/audit?limit=300` | 操作审计日志（最近 N 条，时间倒序，管理员） |
 | GET | `/api/system/notify?limit=&pipeline=&recipient=&status=` | 通知投递记录（按收件人粒度，排查漏收） |
-| GET/PUT | `/api/profile` `/api/profile/contact` | 个人资料：查看 / 自助维护联系方式（任何登录用户） |
+| GET/PUT | `/api/profile` `/api/profile/contact` | 个人资料：查看 / 自助维护联系方式（任何登录用户）；**修改密码**在「个人资料」页自助完成 |
 | POST | `/api/profile/email/verify` `/api/profile/email/confirm` | 发送邮箱验证码 / 提交验证码确认 |
 | GET | `/api/security/users` | 用户管理页数据：内置管理员 + 平台用户 + 联系方式 + 角色摘要 |
 | POST | `/api/security/users` | 创建平台内用户（bcrypt，管理员） |
@@ -468,9 +506,13 @@ bash ./build.sh         # ✅ 双平台产物 + UPX 压缩
 | 参数化构建 | ✅ `VERSION/DEBUG(bool)/ENV(choice)` 注入 `VERSION` 与 `CI_PARAM_VERSION`；未传取默认值；未知参数与越界 choice 被拒绝且不产生构建；Webhook 查询串覆盖参数 |
 | 从 Jenkins 导入任务 | ✅ 32 项 e2e：预览不落盘、Git/分支/步骤/cron/参数/产物/保留策略/SSH 自动匹配、源 XML 落盘、重名 create/update/skip、Jenkinsfile 与非法 XML/cron 拒绝、multipart 文件名兜底、导入后能带参数真实构建成功 |
 | SSH 发布选项 | ✅ cleanRemote / flatten / execTimeout(毫秒→秒) 从 Jenkins 导入后落盘、导出、再导入一致；`usePty` 等逐条告警；`clean_remote` 未填远程目录被拒 |
+| 配置页编辑兼容 | ✅ `npm run test`（`web/tests/pipelineConfig.test.mts`）：复现并修复「绑定 SSH 服务器的任务保存时报 `reading 'trim'`」——服务端 `omitempty` 字段缺失时前端统一归一化 |
 | 配置导出 / 导入 | ✅ 36 项 e2e：导出为裸 JSON（无 `code` 包装、带下载文件名）、不含 SSH 密码/Webhook 密钥/群 token、只带服务器与凭据**名称**；导入预览不落盘、按名对齐到另一实例的 `server_id`/凭据、缺失服务器时停用+error 告警、原生 config.json 可导入、update 覆盖、坏文档/版本过高 40000 |
 | 步骤级控制 | ✅ `allow_failure` 失败继续；`timeout_sec=1` 杀掉 sleep 并记 124；`when=failure/always` 在失败后执行；致命失败跳过 `when=success`；`retry=2` 共 3 次尝试 |
 | 通知记录 | ✅ 按收件人粒度落盘，可过滤 `sent` / `failed` / `suppressed`，失败带错误原因 |
+| 平台日志分级轮转 | ✅ 14 项 e2e + 5 例单测：默认 info 下无 DEBUG、`-log-level debug` 后出现 DEBUG、按天文件 `YYYY-MM/app-YYYY-MM-DD.log`、同一天复用同一文件 / 跨天换文件 / 跨月换目录、级别列落盘、API 返回结构化条目与文件信息、`-log-retain-months 2` 整月删除过期目录（且不误删非月份目录） |
+| Webhook × GitLab | ✅ 22 项 e2e：按推送分支构建（真实 git 签出 `release/1.2`）、MR 事件忽略、白名单外分支忽略、`[ci skip]` 忽略、tag 事件需勾选、重复投递去重、错误密钥 401、任务不存在 404、`fixed` 模式仍构建指定分支 |
+| 修改密码（自助） | ✅ 15 项 e2e：管理员与平台内用户各自改密、旧密码失效、新密码可登录、当前会话保留而其他会话失效、管理员重置密码仍可用 |
 | 个人资料与邮箱验证 | ✅ 迷你 SMTP 实测：发码 → 错误码拒绝 → 正确码标记已验证 → 改邮箱失效 → 60s 限流 `42900` |
 | 邮箱必填 | ✅ 无邮箱创建/改资料 `40000`；历史空邮箱启动 WARN + 构建日志警告 |
 | 删除单次构建 | ✅ 目录（含产物）一并删除、其它构建保留、运行中 `40900`、重复删除幂等、编号不回退 |
@@ -517,25 +559,25 @@ ci-platform/
 
 | 分类 | 页面 | 能力 |
 |---|---|---|
-| 系统配置 | 系统配置 | 主目录、系统消息、Jenkins Location、默认分支、工程命名限制、静默期/SCM 重试/Shell/超时、Global Build Discarders（含日志上限）、全局环境变量、Maven 项目配置、Git plugin、SSH 服务器（Publish Over SSH）、邮件通知、Webhook 通知（钉钉/企微/Slack）、准备关机、读取设置 |
-| 系统配置 | 全局工具配置 | 按 JDK / Git / Gradle / Ant / Maven / NodeJS 分类维护安装项（工具主目录），以及 Maven settings.xml 提供者 |
-| 系统配置 | 插件管理 | 内置能力清单（只读，单二进制交付无插件生态） |
-| 系统配置 | 节点和云管理 | 执行器数量、构建队列、工作区 |
-| 安全 | 全局安全配置 | 登录开关、管理员账号、修改密码 |
-| 安全 | 凭据管理 | 用户名密码 / 密钥文本 / SSH 私钥的增删改查（密钥不回传） |
+| 系统配置 | 系统配置 | 数据目录、系统消息、系统地址（Jenkins Location）、默认分支、工程命名限制、静默期/SCM 重试/Shell/全局超时、全局构建保留策略（含日志上限）、全局环境变量、Git 全局身份、SSH 服务器（Publish Over SSH）、邮件通知、Webhook 通知（钉钉/企微/Slack）、静默模式（安全关机窗口）、读取设置 |
+| 系统配置 | 全局工具配置 | 按 JDK / Git / Gradle / Ant / Maven / NodeJS 分类维护安装项（工具主目录），Maven 的 `MAVEN_OPTS` / 本地仓库；**每类只有第一个填了主目录的安装项生效**（表格逐行标注「生效 / 仅记录」） |
+| 系统配置 | 内置能力 | 编译进二进制的组件清单（只读；平台没有插件机制，不能动态安装/停用） |
+| 系统配置 | 执行器 | 本机执行器数量、构建队列、工作区（单机执行，无节点/云编排） |
+| 安全 | 全局安全配置 | 登录开关、管理员账号；修改密码（内置管理员） |
+| 安全 | 凭据管理 | 用户名密码 / 密钥文本的增删改查（密钥不回传）；SSH 私钥类型被明确拒绝——私钥路径配在「SSH 服务器」里 |
 | 安全 | 用户管理 | 账号本身：新建（**邮箱必填**）/ 删除 / 重置密码（撤销会话）/ 联系方式；列表显示角色摘要与邮箱验证状态；内置管理员只读 |
-| 安全 | Manage and Assign Roles | 全局角色 + 任务角色（Pattern 匹配任务名、Template 模板继承）与用户/组授权；**权限真实生效**：未授权用户访问 API 返回 `code=40300`，前端隐藏对应入口；数据存 `data/rbac.json`，内置主体 `anonymous` / `authenticated`，代理/SCM/Metrics 列禁用（平台不支持） |
+| 安全 | 管理角色 / 分配角色（对齐 Role-Based Strategy 插件） | 两页都是**一行一个主体**的紧凑布局，几十个角色也不会铺成表格。「管理角色」：全局角色 / 任务角色（Pattern 正则匹配任务名、Template 权限模板继承）+ 权限 chip 横排，分类名可点整组开关，Pattern 旁**实时预览匹配到哪些任务**；「分配角色」：按用户/角色双向筛选 + 角色 chip 勾选 + 行尾**生效预览**（该主体实际能看到几个任务）。**用户 → 角色 → 任务**真正连通：只被授予任务角色的用户，任务列表/概览/全局构建历史里只剩匹配的任务，不匹配的任务既看不到也打不开（`code=40300`），前端按钮也用 `/auth/me` 的 `job_roles` 按行判断。Pattern 支持 Jenkins 写法（`(?i)前缀.+`、`a|b`）。Agent roles / Add Group 不提供：平台无代理节点、无外部安全域。数据存 `data/rbac.json` |
 | 视图 | 新建视图 / 编辑视图 | 列表视图（显式任务 + 任务名正则）与我的视图（自动显示当前用户有权限访问的任务）；数据存 `data/views.json`；展示列与 Widgets（过滤构建队列/执行器）可配置 |
 | 状态信息 | 系统信息 / 系统日志 / 负载统计 / 关于 | 运行时信息、内存环形日志、队列与磁盘占用、版本 |
 | 状态信息 | 操作日志 | 变更类操作审计（登录/登出/触发/增删改），数据存 `data/audit.log` |
 | 状态信息 | 通知记录 | 每次告警按收件人/群的投递结果（已送达/失败/已合并），数据存 `data/notify.log`；按任务、收件人、状态过滤 |
 | 系统配置 | 导入任务 | 两个来源：Jenkins `config.xml`（XML → 平台任务）与平台导出的 `config.json`（实例间搬迁）；都是**先预览（含告警分级）再导入**。详见第十六节 |
 | 问题排查 | 管理旧数据 | 扫描并清理无主工作区与孤儿任务目录（仍存在任务的工作区保留） |
-| 工具和动作 | 读取设置 / 准备关机 / REST API | 重载 settings.json、进入静默模式、接口说明 |
 
 说明：
 - 系统配置持久化到 `data/settings.json`；启动参数 / 环境变量仅在文件缺失或字段为空时提供默认值。
-- `workers`、`queue_size`、TTL 等属启动期参数，界面只读，修改需重启。
+- `workers`、`queue_size`、`workspace-ttl`、`clean-interval` 属启动期参数，界面只读并显示**实际生效值**（来自命令行参数，而非 `settings.json` 里的副本），修改需重启。
+- 界面上的每一项都真的影响构建：默认分支会补齐任务空分支、系统管理员邮件地址作为发件人兜底；反过来说，**不会被使用的东西不放界面**（例如 Maven `settings.xml` 内容不再收纳，单元测试般的「仅记录」项会明确标注）。
 - 认证默认只有系统配置里的单管理员账号（密码 bcrypt 落盘，改后重启仍生效，至少 8 个字符）；
   需要多人协作时在「系统管理 → 用户管理」创建平台用户，并在「Assign Roles」分配角色（邮箱必填）。
 - 系统配置中的「单次产物大小上限（MB）」「单次产物文件数上限」会在归档时强制执行，防止异常产物写满磁盘。
@@ -551,6 +593,9 @@ ci-platform/
   填外部邮箱、添加钉钉/企微/Slack 群机器人，并勾选通知事件（失败 / 成功 / **修复**（上次失败→本次成功）/ 取消）。
   任务未配置时沿用「系统配置」的全局默认；勾选「同时发送全局默认」可叠加。用户联系方式在
   「系统管理 → 用户管理」维护（用户也可在「个人资料」页自助维护并验证邮箱）。发送结果会写入构建日志（`[notify] ...`）。
+- **密码修改是自助的**：任何登录用户在「个人资料 → 修改密码」里填当前密码即可改自己的密码（内置管理员写在
+  `settings.json`，平台内用户写在 `data/rbac.json`）；改密后除当前浏览器外的会话立即失效。管理员在
+  「用户管理」里的「重置密码」仍然保留，用于用户忘记密码时兜底。
 - **值班轮值（on-call）**：任务里配置轮值人员与周期，失败时自动 @ 当周值班人；轮值由日期推算，重启不影响。
 - **升级策略（escalation）**：连续失败达到阈值（默认 3 次）追加通知上级/更大群；升级优先于抑制窗口。
 - **失败抑制与聚合**：设置抑制窗口（分钟，默认关闭）后，同一任务的重复失败只发首条，后续合并为
@@ -596,7 +641,7 @@ ci-platform/
 |---|---|
 | General | 任务名称、描述、丢弃旧的构建（任务级保留策略）、参数化构建（参数个数 + 快捷跳转）、并发构建（说明：平台同任务固定串行）、禁用任务（说明：用清空 cron + 撤销 Webhook 代替） |
 | 源码管理 | 无 / Git、Repository URL、Credentials（选择已保存的账号密码 / 令牌，支持现场新增）、指定分支、额外行为（说明） |
-| 构建触发器 | 远程触发 Webhook 地址（可复制）+ 密钥；GitLab/GitHub 事件说明（Push 可用，MR/ciSkip 等不区分）；**定时构建**（5 字段 cron，支持 Jenkins `H` 散列）；SCM 轮询/上下游任务链说明 |
+| 构建触发器 | 远程触发 Webhook 地址（可复制）+ 密钥；**允许的事件**（默认只接受 push，tag_push 需勾选；MR/评论/Test 事件返回 200 但不构建）；**构建分支**（按推送分支构建 / 始终构建指定分支）；**允许的分支**（精确或 `release/*`、`hotfix/**` 通配）；`[ci skip]` 跳过；**回写构建状态**（GitLab commit status，需凭据 + GitLab 地址）；**定时构建**（5 字段 cron，支持 `H` 散列）；SCM 轮询/上下游任务链说明 |
 | 构建环境 | Delete workspace before build starts；**构建工具版本**：显示全局工具配置里生效的 JDK/NodeJS/Maven/Go 主目录（对应 Jenkins 的 per-job JDK/NodeJS 选择） |
 | 构建步骤 | 执行方式（本地服务器）、执行 shell（步骤编辑器，含超时/重试/允许失败/when） |
 | 参数化构建 | 定义参数（string / bool / choice / text），触发时弹表单；值注入同名环境变量与 `CI_PARAM_<大写名>`，并快照进构建记录 |

@@ -1,8 +1,8 @@
 package service
 
 import (
+	"ci-platform/internal/pkg/logger"
 	"context"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +29,7 @@ type CronTrigger struct {
 
 // BuildTriggerer 与 BuildService.Trigger 对齐（避免依赖具体类型）。
 type BuildTriggerer interface {
-	Trigger(ctx context.Context, pipelineID string, trigger model.TriggerType, triggeredBy string, params map[string]string) (*model.Build, error)
+	Trigger(ctx context.Context, pipelineID string, trigger model.TriggerType, triggeredBy string, opts TriggerOptions) (*model.Build, error)
 }
 
 // NewCronTrigger 创建定时触发器；interval 为扫描周期，<=0 时取默认 30s。
@@ -92,10 +92,10 @@ func (c *CronTrigger) scan(ctx context.Context) {
 		// 静默模式（准备关机）时不触发，计划时刻顺延到下个周期重试。
 		if planned && !now.Before(next) {
 			if c.triggerer != nil {
-				if _, err := c.triggerer.Trigger(ctx, p.ID, model.TriggerTimer, "timer", nil); err != nil {
-					log.Printf("[cron] trigger %s failed: %v", p.ID, err)
+				if _, err := c.triggerer.Trigger(ctx, p.ID, model.TriggerTimer, "timer", TriggerOptions{}); err != nil {
+					logger.Errorf("[cron] trigger %s failed: %v", p.ID, err)
 				} else {
-					log.Printf("[cron] triggered %s (spec: %s)", p.ID, spec)
+					logger.Infof("[cron] triggered %s (spec: %s)", p.ID, spec)
 				}
 			}
 			c.reschedule(p.ID, spec, now)
@@ -121,7 +121,7 @@ func (c *CronTrigger) reschedule(pipelineID, spec string, now time.Time) {
 	c.specs[pipelineID] = spec
 	if err != nil {
 		if !c.skipped[pipelineID] {
-			log.Printf("[cron] pipeline %s spec %q skipped: %v", pipelineID, spec, err)
+			logger.Infof("[cron] pipeline %s spec %q skipped: %v", pipelineID, spec, err)
 			c.skipped[pipelineID] = true
 		}
 		delete(c.next, pipelineID)

@@ -203,7 +203,7 @@ function updateSourceFiles(value: string[]): void {
               :min="0"
               :max="86400"
               :step="30"
-              :disabled="!config.exec_command.trim()"
+              :disabled="!(config.exec_command ?? '').trim()"
               controls-position="right"
               @update:model-value="(value: number | undefined) => patch({ exec_timeout_sec: value ?? 0 })"
             />

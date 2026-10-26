@@ -1,6 +1,10 @@
 package service
 
-import "regexp"
+import (
+	"regexp"
+
+	"ci-platform/internal/model"
+)
 
 // JobScope 是「当前用户能看到哪些任务」的判定器。
 //
@@ -71,4 +75,38 @@ func (s *JobScope) Filter(names []string) []string {
 		}
 	}
 	return out
+}
+
+// HasAnyOf 判断用户是否拥有「任一全局权限」或「对任意任务拥有任一任务权限」。
+//
+// 用途：配置任务的人需要读凭据清单（不含密钥）与通知联系人，但这两个接口
+// 不属于任何一个具体任务，没法用 RequireJobPerm。用「只要对某个任务有配置权
+// 就允许」既满足普通用户管自己任务的需求，也不放宽到"人人可看"。
+func (s *RBACService) HasAnyOf(user string, globalPerms, jobPerms []string) bool {
+	if s.authDisabled() || s.IsAdmin(user) {
+		return true
+	}
+	for _, perm := range globalPerms {
+		if s.HasPermission(user, perm) {
+			return true
+		}
+	}
+	if len(jobPerms) == 0 {
+		return false
+	}
+	for _, role := range s.rolesFor(user, model.RoleKindGlobal) {
+		for _, perm := range jobPerms {
+			if role.Has(perm, s.resolveTemplate, 0) {
+				return true
+			}
+		}
+	}
+	for _, role := range s.rolesFor(user, model.RoleKindItem) {
+		for _, perm := range jobPerms {
+			if role.Has(perm, s.resolveTemplate, 0) {
+				return true
+			}
+		}
+	}
+	return false
 }

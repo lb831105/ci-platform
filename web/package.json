@@ -8,7 +8,7 @@
     "build": "vite build",
     "typecheck": "vue-tsc --noEmit",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types tests/pipelineConfig.test.mts"
+    "test": "node --experimental-strip-types tests/pipelineConfig.test.mts && node --experimental-strip-types tests/rolePattern.test.mts"
   },
   "dependencies": {
     "element-plus": "^2.7.8",

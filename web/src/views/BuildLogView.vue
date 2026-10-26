@@ -183,6 +183,11 @@ const republishServerId = ref('')
 const republishTarget = ref('')
 const republishing = ref(false)
 const pipelineConfig = ref<Pipeline | null>(null)
+// 任务级权限：普通用户可能只被授权某几个任务，按钮按「当前任务名」判断。
+const jobName = computed(() => pipelineConfig.value?.name ?? '')
+function can(perm: string): boolean {
+  return jobName.value !== '' && authStore.canJob(perm, jobName.value)
+}
 
 const canRepublish = computed(
   () => log.status.value === 'success' && artifacts.value.length > 0,
@@ -260,14 +265,14 @@ async function submitRepublish(): Promise<void> {
         <BuildStatusTag :status="log.status.value" />
         <el-tag :type="connectionType" effect="plain" disable-transitions>{{ connectionText }}</el-tag>
         <el-button
-          v-if="!log.finished.value && authStore.hasPerm('job.build')"
+          v-if="!log.finished.value && can('job.build')"
           type="danger"
           plain
           :loading="cancelling"
           @click="onCancel"
         >停止构建</el-button>
         <el-button
-          v-if="log.finished.value && authStore.hasPerm('job.delete')"
+          v-if="log.finished.value && can('job.delete')"
           type="danger"
           plain
           :loading="deleting"
@@ -311,7 +316,7 @@ async function submitRepublish(): Promise<void> {
           </div>
           <div class="artifact-card__buttons">
             <el-button size="small" @click="downloadAll">下载全部（ZIP）</el-button>
-            <el-button v-if="canRepublish && authStore.hasPerm('job.replay')" size="small" type="primary" plain @click="openRepublish">
+            <el-button v-if="canRepublish && can('job.replay')" size="small" type="primary" plain @click="openRepublish">
               重新发布
             </el-button>
           </div>

@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { RouterLink } from 'vue-router'
+import { useAuthStore } from '@/stores/authStore'
 import { useSettingsStore } from '@/stores/settingsStore'
 import type { SshPublishConfig } from '@/types/pipeline'
+
+const auth = useAuthStore()
 
 const props = defineProps<{
   modelValue: SshPublishConfig
@@ -87,7 +90,11 @@ function updateSourceFiles(value: string[]): void {
             </template>
             <el-alert v-else type="warning" :closable="false" show-icon title="还没有配置 SSH 服务器">
               <template #default>
-                <RouterLink :to="{ name: 'system-configure' }">前往系统配置添加 SSH 服务器</RouterLink>
+                <!-- 没有系统配置权限的人跳到系统配置也只会被挡住，直接给可执行的说明 -->
+                <RouterLink v-if="auth.hasPerm('system.read')" :to="{ name: 'system-configure' }">
+                  前往系统配置添加 SSH 服务器
+                </RouterLink>
+                <span v-else>请让管理员在「系统配置 → SSH 服务器」中添加后再选择。</span>
               </template>
             </el-alert>
           </el-form-item>

@@ -12,6 +12,7 @@ import { pipelineApi } from '@/api/pipeline'
 import { credentialApi } from '@/api/system'
 import { usePipeline } from '@/composables/usePipeline'
 import { useSettingsStore } from '@/stores/settingsStore'
+import { useAuthStore } from '@/stores/authStore'
 import {
   emptyPipeline,
   emptyEscalation,
@@ -37,8 +38,11 @@ const route = useRoute()
 const router = useRouter()
 const { loading, fetchOne, save } = usePipeline()
 const settingsStore = useSettingsStore()
+const auth = useAuthStore()
 
 const isEdit = ref(false)
+// 编辑既有任务时的配置权限（按任务名判断，普通用户可能只被授权部分任务）。
+const canEditExisting = ref(true)
 const saving = ref(false)
 const form = ref<PipelinePayload>(emptyPipeline())
 const credentials = ref<Credential[]>([])
@@ -296,6 +300,9 @@ onMounted(async () => {
   isEdit.value = true
   const pipeline = await fetchOne(props.pipelineId)
   if (pipeline !== null) {
+    // 任务级权限：普通用户可能只有「某一个任务」的配置权限。
+    canEditExisting.value = auth.canJob('job.configure', pipeline.name)
+
     form.value = toPayload(pipeline)
     scm.value = form.value.git_url ? 'git' : 'none'
   }
@@ -436,6 +443,10 @@ async function saveCredential(): Promise<void> {
 }
 
 async function onSave(): Promise<void> {
+  if (!canEditExisting.value) {
+    ElMessage.error('没有该任务的配置权限')
+    return
+  }
   const errors = validatePipeline(form.value, { keepSshPassword: isEdit.value })
   if (errors.length > 0) {
     ElMessage.error(errors[0])
@@ -505,9 +516,21 @@ function copyWebhook(): void {
       </div>
       <div>
         <el-button @click="onCancel">{{ isEdit ? '返回' : '上一步' }}</el-button>
-        <el-button type="primary" :loading="saving" @click="onSave">保存</el-button>
+        <el-button v-if="canEditExisting" type="primary" :loading="saving" @click="onSave">保存</el-button>
+        <el-tooltip v-else content="你对这个任务没有「配置」权限（任务角色的 job.configure）" placement="bottom">
+          <span><el-button type="primary" disabled>保存</el-button></span>
+        </el-tooltip>
       </div>
     </div>
+
+    <el-alert
+      v-if="isEdit && !canEditExisting"
+      type="warning"
+      :closable="false"
+      show-icon
+      title="你对当前任务没有配置权限，本页仅可查看；保存会被后端拒绝（403）。"
+      style="margin-bottom: 12px"
+    />
 
     <nav class="configure__nav">
       <a @click="scrollTo('general')">General</a>
@@ -599,8 +622,8 @@ function copyWebhook(): void {
                     :value="cred.id"
                   />
                 </el-select>
-                <el-button @click="openCredDialog">新增账号密码</el-button>
-                <RouterLink :to="{ name: 'system-credentials' }">
+                <el-button v-if="auth.hasPerm('credential.create')" @click="openCredDialog">新增账号密码</el-button>
+                <RouterLink v-if="auth.hasPerm('credential.view')" :to="{ name: 'system-credentials' }">
                   <el-button>管理凭据</el-button>
                 </RouterLink>
               </div>

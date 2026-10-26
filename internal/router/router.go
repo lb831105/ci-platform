@@ -185,15 +185,19 @@ func New(d Deps) http.Handler {
 			})
 
 			r.Route("/credentials", func(r chi.Router) {
-				r.With(perm(model.PermCredentialView)).Get("/", d.Credential.List)
+				// 凭据清单（不含密钥）：任务配置者也要能从下拉里选凭据，
+				// 因此除 credential.view 外，对任意任务有 job.configure 的人也可读。
+				r.With(middleware.RequireAnyOf(d.RBACService, []string{model.PermCredentialView}, []string{model.PermJobConfigure})).
+					Get("/", d.Credential.List)
 				r.With(perm(model.PermCredentialCreate)).Post("/", d.Credential.Create)
 				r.With(perm(model.PermCredentialView)).Get("/{cid}", d.Credential.Get)
 				r.With(perm(model.PermCredentialUpdate)).Put("/{cid}", d.Credential.Update)
 				r.With(perm(model.PermCredentialDelete)).Delete("/{cid}", d.Credential.Delete)
 			})
 
-			// 通知选人：需要任务配置权限（邮箱属于个人信息）。
-			r.With(perm(model.PermJobConfigure)).Get("/notify/contacts", d.Notify.Contacts)
+			// 通知选人：对任意任务有配置权即可（邮箱属于个人信息，仍需身份）。
+			r.With(middleware.RequireAnyOf(d.RBACService, nil, []string{model.PermJobConfigure})).
+				Get("/notify/contacts", d.Notify.Contacts)
 
 			r.Route("/pipelines", func(r chi.Router) {
 				// 任务列表同理：登录即可，内容按 JobScope 过滤（无任何 job.read 则返回空列表）。

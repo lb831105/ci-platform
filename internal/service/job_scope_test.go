@@ -1,6 +1,10 @@
 package service
 
-import "testing"
+import (
+	"testing"
+
+	"ci-platform/internal/model"
+)
 
 // 任务可见性：任务角色的 Pattern 决定列表里出现哪些任务。
 func TestJobScopeFiltersByItemRolePattern(t *testing.T) {
@@ -63,5 +67,33 @@ func TestJobScopeAcceptsJenkinsStylePatterns(t *testing.T) {
 		if got := scope.Allows(name); got != want {
 			t.Fatalf("Allows(%q) = %v, want %v", name, got, want)
 		}
+	}
+}
+
+// 任务配置者需要读凭据清单与通知联系人（这两个接口不属于具体任务）。
+func TestHasAnyOfAllowsJobConfigureUsers(t *testing.T) {
+	svc := newTestRBAC(t, []model.RbacRole{
+		{Name: "ops", Kind: model.RoleKindItem, Pattern: "as-doc-.+", Perms: []string{model.PermJobConfigure}},
+		{Name: "viewer", Kind: model.RoleKindGlobal, Perms: []string{model.PermSystemRead}},
+	}, []model.RbacAssignment{
+		{Role: "ops", Kind: model.RoleKindItem, Subject: "dev"},
+		{Role: "viewer", Kind: model.RoleKindGlobal, Subject: "auditor"},
+	})
+
+	// 有任意任务的 configure → 可以读凭据清单 / 联系人
+	if !svc.HasAnyOf("dev", []string{model.PermCredentialView}, []string{model.PermJobConfigure}) {
+		t.Fatal("job.configure user must pass HasAnyOf")
+	}
+	// 全局权限命中也可
+	if !svc.HasAnyOf("auditor", []string{model.PermSystemRead}, nil) {
+		t.Fatal("global perm must pass HasAnyOf")
+	}
+	// 什么都没有必须拒绝（普通只读用户不能读凭据清单）
+	if svc.HasAnyOf("nobody", []string{model.PermCredentialView}, []string{model.PermJobConfigure}) {
+		t.Fatal("unassigned user must be denied")
+	}
+	// 内置管理员始终通过
+	if !svc.HasAnyOf("root", []string{model.PermCredentialView}, nil) {
+		t.Fatal("builtin admin must pass")
 	}
 }

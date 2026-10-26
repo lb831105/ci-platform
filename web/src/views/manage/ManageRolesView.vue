@@ -5,6 +5,7 @@ import ManagePageHeader from '@/components/ManagePageHeader.vue'
 import { rbacApi } from '@/api/rbac'
 import { pipelineApi } from '@/api/pipeline'
 import { describeError } from '@/api/request'
+import { jobsFromPattern, patternFromJobs } from '@/utils/rolePattern'
 import type { RbacData, RbacPermissionGroup, RbacRole } from '@/types/rbac'
 
 const loading = ref(false)
@@ -52,6 +53,15 @@ function matchJobs(pattern?: string): string[] {
   } catch {
     return []
   }
+}
+
+// 勾选任务：把选择结果翻译成 Pattern（管一个任务就是单个名字，管多个就是并集）。
+function pickedJobs(role: RbacRole): string[] {
+  return jobsFromPattern(role.pattern ?? '', jobNames.value)
+}
+
+function setPickedJobs(role: RbacRole, names: string[]): void {
+  role.pattern = patternFromJobs(names)
 }
 
 function patternInvalid(pattern?: string): boolean {
@@ -196,7 +206,7 @@ onMounted(load)
       style="margin-bottom: 12px"
     >
       <template #title>
-        <b>全局角色</b>的权限作用于全部任务；<b>任务角色</b>用 Pattern（任务名正则，忽略大小写、完全匹配）
+        <b>全局角色</b>的权限作用于全部任务；<b>任务角色</b>用「按任务勾选」或 Pattern（任务名正则，忽略大小写、完全匹配）
         限定作用范围 —— 只被授予任务角色的用户，在任务列表里<b>只会看到匹配到的任务</b>，
         其它任务既看不到也打不开。<b>Template</b> 可复用无 Pattern 的模板角色的权限。
       </template>
@@ -276,6 +286,18 @@ onMounted(load)
           <span v-else-if="(role.pattern ?? '').trim()" class="role-row__match is-warn">
             没有匹配的任务（这个角色当前不会生效）
           </span>
+          <el-select
+            :model-value="pickedJobs(role)"
+            multiple
+            filterable
+            collapse-tags
+            collapse-tags-tooltip
+            placeholder="按任务勾选（可单个或多个）"
+            class="role-row__picker"
+            @update:model-value="(names: string[]) => setPickedJobs(role, names)"
+          >
+            <el-option v-for="name in jobNames" :key="name" :label="name" :value="name" />
+          </el-select>
           <el-select
             v-model="role.template"
             clearable
@@ -383,7 +405,7 @@ onMounted(load)
   display: flex;
   flex-direction: column;
   gap: 4px;
-  width: 240px;
+  width: 280px;
   flex: 0 0 auto;
 }
 
@@ -406,6 +428,10 @@ onMounted(load)
 }
 
 .role-row__template {
+  width: 100%;
+}
+
+.role-row__picker {
   width: 100%;
 }
 

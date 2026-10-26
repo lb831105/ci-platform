@@ -104,7 +104,7 @@ function goLog(row: BuildListItem): void {
           <template #default="{ row }">
             <el-button size="small" text type="primary" @click.stop="goLog(row)">控制台输出</el-button>
             <el-button
-              v-if="row.status !== 'running' && row.status !== 'pending' && auth.hasPerm('job.delete')"
+              v-if="row.status !== 'running' && row.status !== 'pending' && auth.canJob('job.delete', row.pipeline_name ?? '')"
               size="small"
               text
               type="danger"

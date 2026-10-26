@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/authStore'
 
 const routes: RouteRecordRaw[] = [
@@ -22,6 +23,7 @@ const routes: RouteRecordRaw[] = [
         path: 'pipelines/new',
         name: 'pipeline-create',
         component: () => import('@/views/JobCreateView.vue'),
+        meta: { perm: 'job.create' },
       },
       {
         path: 'pipelines/new/config',
@@ -55,6 +57,7 @@ const routes: RouteRecordRaw[] = [
         path: 'views/new',
         name: 'view-create',
         component: () => import('@/views/ViewCreateView.vue'),
+        meta: { perm: 'view.create' },
       },
       {
         path: 'views/:viewName',
@@ -72,31 +75,37 @@ const routes: RouteRecordRaw[] = [
         path: 'system',
         name: 'system-config',
         component: () => import('@/views/manage/ManageJenkinsView.vue'),
+        meta: { perm: 'system.read' },
       },
       {
         path: 'system/configure',
         name: 'system-configure',
         component: () => import('@/views/manage/ConfigureSystemView.vue'),
+        meta: { perm: 'system.read' },
       },
       {
         path: 'system/tools',
         name: 'system-tools',
         component: () => import('@/views/manage/GlobalToolsView.vue'),
+        meta: { perm: 'system.read' },
       },
       {
         path: 'system/plugins',
         name: 'system-plugins',
         component: () => import('@/views/manage/PluginManagerView.vue'),
+        meta: { perm: 'system.read' },
       },
       {
         path: 'system/nodes',
         name: 'system-nodes',
         component: () => import('@/views/manage/NodesView.vue'),
+        meta: { perm: 'system.read' },
       },
       {
         path: 'system/security',
         name: 'system-security',
         component: () => import('@/views/manage/SecurityView.vue'),
+        meta: { perm: 'system.read' },
       },
       {
         path: 'profile',
@@ -107,51 +116,61 @@ const routes: RouteRecordRaw[] = [
         path: 'system/notify-history',
         name: 'system-notify-history',
         component: () => import('@/views/manage/ManageNotifyView.vue'),
+        meta: { perm: 'system.read' },
       },
       {
         path: 'system/users',
         name: 'system-users',
         component: () => import('@/views/manage/ManageUsersView.vue'),
+        meta: { perm: 'overall.administer' },
       },
       {
         path: 'system/import',
         name: 'system-import',
         component: () => import('@/views/manage/ImportJobView.vue'),
+        meta: { perm: 'system.manage' },
       },
       {
         path: 'system/roles-manage',
         name: 'system-roles-manage',
         component: () => import('@/views/manage/ManageRolesView.vue'),
+        meta: { perm: 'overall.administer' },
       },
       {
         path: 'system/roles-assign',
         name: 'system-roles-assign',
         component: () => import('@/views/manage/AssignRolesView.vue'),
+        meta: { perm: 'overall.administer' },
       },
       {
         path: 'system/credentials',
         name: 'system-credentials',
         component: () => import('@/views/manage/CredentialsView.vue'),
+        meta: { perm: 'credential.view' },
       },
       {
         path: 'system/info',
         name: 'system-info',
         component: () => import('@/views/manage/SystemInfoView.vue'),
+        meta: { perm: 'system.read' },
       },
       {
         path: 'system/log',
         name: 'system-log',
         component: () => import('@/views/manage/SystemLogView.vue'),
+        meta: { perm: 'system.read' },
       },
       {
         path: 'system/audit',
         name: 'system-audit',
         component: () => import('@/views/manage/ManageAuditView.vue'),
+        meta: { perm: 'system.read' },
       },
       {
         path: 'system/load',
         name: 'system-load',
         component: () => import('@/views/manage/LoadStatsView.vue'),
+        meta: { perm: 'system.read' },
       },
       {
         path: 'system/about',
@@ -162,6 +181,7 @@ const routes: RouteRecordRaw[] = [
         path: 'system/old-data',
         name: 'system-old-data',
         component: () => import('@/views/manage/OldDataView.vue'),
+        meta: { perm: 'system.read' },
       },
     ],
   },
@@ -174,6 +194,8 @@ export const router = createRouter({
 })
 
 // 全局登录守卫：首次导航先探测登录态；未登录一律跳登录页并记录回跳地址。
+// meta.perm 表示该页面需要的前端权限：没有就直接回任务列表，
+// 避免"点进去一堆 403 报错"或看到不该看到的菜单内容（后端仍是最终裁决）。
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
   if (!auth.initialized) {
@@ -189,6 +211,12 @@ router.beforeEach(async (to) => {
 
   if (!auth.authenticated) {
     return { name: 'login', query: { redirect: to.fullPath } }
+  }
+
+  const need = to.meta.perm as string | undefined
+  if (need && !auth.hasPerm(need)) {
+    ElMessage.warning('没有访问该页面的权限')
+    return { name: 'pipeline-list' }
   }
   return true
 })

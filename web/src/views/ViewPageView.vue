@@ -187,7 +187,7 @@ async function onDelete(): Promise<void> {
 
         <el-table-column v-if="hasColumn('buildButton')" label="操作" width="120" align="right">
           <template #default="{ row }">
-            <el-button v-if="auth.hasPerm('job.build')" size="small" type="primary" @click.stop="onBuild(row)">构建</el-button>
+            <el-button v-if="auth.canJob('job.build', row.name)" size="small" type="primary" @click.stop="onBuild(row)">构建</el-button>
           </template>
         </el-table-column>
 

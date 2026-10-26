@@ -27,6 +27,12 @@ const overview = useOverviewStore()
 const loading = ref(false)
 const error = ref('')
 const job = ref<Pipeline | null>(null)
+// 任务级权限判断：普通用户可能只被授予某几个任务的角色，
+// 因此这里的按钮一律用 canJob(perm, 任务名) 而不是全局 hasPerm。
+const jobName = computed(() => job.value?.name ?? '')
+function can(perm: string): boolean {
+  return jobName.value !== '' && auth.canJob(perm, jobName.value)
+}
 const triggering = ref(false)
 const liveBuildId = ref('')
 
@@ -431,9 +437,9 @@ function showChanges(): void {
       </div>
       <div>
         <el-button @click="goList">返回列表</el-button>
-        <el-button v-if="auth.hasPerm('job.configure')" @click="goEdit">配置</el-button>
-        <el-button v-if="auth.hasPerm('job.read')" :loading="exporting" @click="onExport">导出配置</el-button>
-        <el-button v-if="auth.hasPerm('job.build')" type="primary" :loading="triggering" @click="onBuild">
+        <el-button v-if="can('job.configure')" @click="goEdit">配置</el-button>
+        <el-button v-if="can('job.read')" :loading="exporting" @click="onExport">导出配置</el-button>
+        <el-button v-if="can('job.build')" type="primary" :loading="triggering" @click="onBuild">
           {{ hasParams ? '参数化构建' : '立即构建' }}
         </el-button>
       </div>
@@ -444,20 +450,20 @@ function showChanges(): void {
     <div class="job__body">
       <aside class="job__side">
         <ul class="job__actions">
-          <li>
+          <li v-if="auth.hasPerm('system.read')">
             <RouterLink :to="{ name: 'system-config' }">系统管理</RouterLink>
           </li>
           <li><a @click="showChanges">状态</a></li>
           <li><a @click="showChanges">修改记录</a></li>
           <li><a @click="showWorkspace">工作空间</a></li>
-          <li v-if="auth.hasPerm('job.build')">
+          <li v-if="can('job.build')">
             <a @click="onBuild">{{ hasParams ? '参数化构建' : '立即构建' }}</a>
           </li>
-          <li v-if="auth.hasPerm('job.configure')"><a @click="goEdit">配置</a></li>
-          <li v-if="auth.hasPerm('job.read')"><a @click="onExport">导出配置</a></li>
-          <li v-if="auth.hasPerm('job.delete')"><a @click="onRemove">删除工程</a></li>
-          <li v-if="auth.hasPerm('job.configure')"><a @click="onRename">重命名</a></li>
-          <li>
+          <li v-if="can('job.configure')"><a @click="goEdit">配置</a></li>
+          <li v-if="can('job.read')"><a @click="onExport">导出配置</a></li>
+          <li v-if="can('job.delete')"><a @click="onRemove">删除工程</a></li>
+          <li v-if="can('job.configure')"><a @click="onRename">重命名</a></li>
+          <li v-if="auth.hasPerm('credential.view')">
             <RouterLink :to="{ name: 'system-credentials' }">凭据</RouterLink>
           </li>
         </ul>
@@ -467,7 +473,7 @@ function showChanges(): void {
         <el-card shadow="never" class="job__card">
           <div class="job__desc-head">
             <span class="job__desc-title">任务描述</span>
-            <el-button text type="primary" @click="onEditDescription">Edit description</el-button>
+            <el-button v-if="can('job.configure')" text type="primary" @click="onEditDescription">编辑描述</el-button>
           </div>
           <div v-if="job?.description" class="job__desc">{{ job.description }}</div>
           <div v-else class="muted">暂无描述</div>
@@ -497,12 +503,12 @@ function showChanges(): void {
                 <span class="build-row__cause">{{ causeText(build) }}</span>
                 <span class="build-row__time mono">{{ clockLabel(build.started_at) }}</span>
                 <span
-                  v-if="(build.status === 'running' || build.status === 'pending') && auth.hasPerm('job.build')"
+                  v-if="(build.status === 'running' || build.status === 'pending') && can('job.build')"
                   class="build-row__stop"
                   @click.stop="onCancel(build)"
                 >{{ cancellingId === build.id ? '停止中…' : '停止' }}</span>
                 <span
-                  v-if="build.status !== 'running' && build.status !== 'pending' && auth.hasPerm('job.delete')"
+                  v-if="build.status !== 'running' && build.status !== 'pending' && can('job.delete')"
                   class="build-row__stop"
                   @click.stop="onDeleteBuild(build)"
                 >{{ deletingId === build.id ? '删除中…' : '删除' }}</span>

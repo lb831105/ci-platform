@@ -26,6 +26,33 @@ type JobNameLookup interface {
 	JobName(ctx context.Context, id string) (string, error)
 }
 
+// AnyPermChecker 判定「任一全局权限 或 任意任务的任一任务权限」。
+type AnyPermChecker interface {
+	HasAnyOf(user string, globalPerms, jobPerms []string) bool
+}
+
+// RequireAnyOf 返回校验「任一权限」的中间件：
+// globalPerms 命中即放行；否则看用户是否对任意任务拥有 jobPerms 之一。
+// 用于不属于具体任务、但任务配置者必须访问的接口（凭据清单、通知联系人）。
+func RequireAnyOf(rbac AnyPermChecker, globalPerms, jobPerms []string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if rbac == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+			user := pkg.UserFromContext(r.Context())
+			if !rbac.HasAnyOf(user, globalPerms, jobPerms) {
+				logger.Debugf("[rbac] deny user=%q perms=%v job_perms=%v path=%s",
+					user, globalPerms, jobPerms, r.URL.Path)
+				pkg.Fail(w, pkg.NewError(pkg.CodeForbidden, "没有该操作所需的权限"))
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // RequirePerm 返回校验平台级权限的中间件。rbac 为 nil 时放行（兼容未装配场景）。
 func RequirePerm(rbac PermChecker, perm string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

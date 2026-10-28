@@ -13,7 +13,7 @@ const autoRefresh = ref(false)
 // 级别过滤：默认显示 info 以上（debug 只在排障时打开）。
 const levels = ref<string[]>(['INFO', 'WARN', 'ERROR'])
 const keyword = ref('')
-const fileInfo = ref<{ file: string; level: string; retain_months: number } | null>(null)
+const fileInfo = ref<{ file: string; level: string; retain_days: number } | null>(null)
 
 const LEVEL_OPTIONS = ['DEBUG', 'INFO', 'WARN', 'ERROR']
 
@@ -113,7 +113,7 @@ async function onClear(): Promise<void> {
   <div class="page">
     <ManagePageHeader
       title="系统日志"
-      description="平台运行日志（分级记录，按天一个文件、每月一个目录）；页面展示内存缓冲最近 2000 条"
+      description="平台运行日志（分级记录，一天一个文件，默认保留 30 天）；页面展示内存缓冲最近 2000 条"
     >
       <template #actions>
         <el-select
@@ -141,10 +141,10 @@ async function onClear(): Promise<void> {
       落盘文件 <span class="mono">{{ fileInfo.file }}</span>
       · 当前级别 <span class="mono">{{ fileInfo.level }}</span>
       · 保留
-      <span class="mono">{{ fileInfo.retain_months === 0 ? '永久' : fileInfo.retain_months + ' 个月' }}</span>
-      （目录为 <span class="mono">YYYY-MM/</span>，每月轮换一次；文件为
-      <span class="mono">app-YYYY-MM-DD.log</span>，每天一个。可用
-      <span class="mono">-log-level</span> / <span class="mono">-log-retain-months</span> 调整）
+      <span class="mono">{{ fileInfo.retain_days === 0 ? '永久' : fileInfo.retain_days + ' 天' }}</span>
+      （一天一个文件 <span class="mono">app-YYYY-MM-DD.log</span>，按月份目录分层
+      <span class="mono">YYYY-MM/</span>；过期文件逐日清理。可用
+      <span class="mono">-log-level</span> / <span class="mono">-log-retain-days</span> 调整）
     </div>
 
     <div v-loading="loading" class="log-view">

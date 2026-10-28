@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"ci-platform/internal/model"
@@ -39,6 +40,8 @@ func (c *ArtifactCollector) Collect(
 	buildDir string,
 	patterns []string,
 	limits ArtifactLimits,
+	// allowEmpty 为 true 时"没匹配到文件"只提示不失败（多模块项目常见）。
+	allowEmpty bool,
 	out io.Writer,
 ) ([]model.ArtifactFile, error) {
 	if ctx.Err() != nil {
@@ -47,12 +50,26 @@ func (c *ArtifactCollector) Collect(
 	if len(patterns) == 0 {
 		return nil, errors.New("artifact: files is empty")
 	}
-	files, err := matchWorkspaceFiles(workspace, patterns, "artifact")
+	files, notes, err := matchWorkspaceFilesDetailed(workspace, patterns, "artifact")
 	if err != nil {
 		return nil, err
 	}
+	// 自动按递归匹配兜底时要说清楚，否则用户会疑惑"我写的 target/*.jar 怎么归档了子目录的"。
+	for _, note := range notes {
+		fmt.Fprintf(out, "[artifact] %s", note)
+		fmt.Fprintln(out)
+	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("artifact: no files matched %v under the workspace", patterns)
+		// 没匹配到时给出「找到的相似文件 + 建议模式」，
+		// 而不是让用户对着 "no files matched" 猜（多模块项目最常见）。
+		noMatch := newNoMatchError(workspace, patterns)
+		if !allowEmpty {
+			return nil, fmt.Errorf("artifact: %w", noMatch)
+		}
+		fmt.Fprintf(out, "[artifact] WARN: %s", strings.ReplaceAll(noMatch.Error(), "\n", "\n[artifact] "))
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "[artifact] 已按「允许无产物」继续（构建不会因此失败）")
+		return nil, nil
 	}
 	if limits.MaxFiles > 0 && len(files) > limits.MaxFiles {
 		return nil, fmt.Errorf("artifact: matched %d files, exceeding artifact_max_files (%d); "+

@@ -26,7 +26,7 @@
 | 构建触发 | ✅ 手动 / Webhook / cron(`H`) | ✅ 全类型 | ✅ 全类型 + MR/merge train | ✅ 全类型 + `schedule` | ✅ cron/sensor | ✅ Trigger/EventListener | ✅ VCS trigger | ✅ |
 | SCM 回写（Commit Status / PR 检查） | ✗ | ◻ 插件 | ✅ 原生 | ✅ 原生（Checks API） | ◐ Argo CD 回写 | ◻ | ✅ | ✅ |
 | 多分支 / PR 流水线 | ✗（一分支一任务） | ✅ multibranch | ✅ MR pipeline | ✅ PR workflow | —（GitOps 侧） | ✅ | ✅ | ✅ |
-| 制品归档 | ✅ 按构建独立 + SHA256 + ZIP | ✅ | ✅ artifacts + reports | ✅ artifacts | ✅ artifact repo | ✅ results | ✅ | ✅ |
+| 制品归档 | ✅ 按构建独立 + SHA256 + ZIP + 模式自动递归兜底 | ✅ | ✅ artifacts + reports | ✅ artifacts | ✅ artifact repo | ✅ results | ✅ | ✅ |
 | 外部制品库 / 镜像仓库 | ✗ | ◻ | ✅ 内置 Registry | ✅ GHCR | ✅ S3/GCS/OSS | ✅ | ◻ | ◻ |
 | 测试报告 / 覆盖率 | ✗ | ◻ JUnit/coverage 插件 | ✅ 原生 reports | ◻ 需第三方 action | ◻ | ◻ | ✅ 原生 + flaky 检测 | ✅ Test Analytics |
 | 代码扫描 / 供应链安全（SBOM、签名、漏洞） | ✗ | ◻ 插件 | ✅ SAST/DAST/Dependency/SBOM | ✅ CodeQL/Dependabot/Attestation | ◻ Chains 项目 | ✅ Tekton Chains | ◻ | ◻ |

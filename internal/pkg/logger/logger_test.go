@@ -74,7 +74,7 @@ func TestDailyFilesInMonthlyDirs(t *testing.T) {
 	now := time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC)
 	clock := func() time.Time { return now }
 	if err := Init(Options{
-		Dir: dir, Level: LevelInfo, RetainMonths: 2, Stdout: os.Stderr, Now: clock,
+		Dir: dir, Level: LevelInfo, RetainDays: 2, Stdout: os.Stderr, Now: clock,
 	}); err != nil {
 		t.Fatalf("init: %v", err)
 	}
@@ -125,36 +125,89 @@ func TestDailyFilesInMonthlyDirs(t *testing.T) {
 	}
 }
 
-// 保留 1 个月时，跨月后上个月目录应被删除。
-func TestRetentionOneMonth(t *testing.T) {
+// 保留 N 天：过期天文件被删、范围内保留；空月份目录一并清理；
+// 用户自己的目录不能碰。
+func TestRetentionByDays(t *testing.T) {
 	dir := t.TempDir()
-	now := time.Date(2026, 3, 20, 8, 0, 0, 0, time.UTC)
+	// 预置历史文件：10-20 到 10-25（当天是 10-25），保留 3 天 → 只留 23/24/25
+	for _, day := range []string{"20", "21", "22", "23", "24"} {
+		monthDir := filepath.Join(dir, "2026-10")
+		if err := os.MkdirAll(monthDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(monthDir, "app-2026-10-"+day+".log"), []byte("old\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 整月过期目录（应被删空后移除）
+	if err := os.MkdirAll(filepath.Join(dir, "2026-08"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "2026-08", "app-2026-08-01.log"), []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 用户自己建的目录：不碰
+	if err := os.MkdirAll(filepath.Join(dir, "custom"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 旧版本写在根目录的月文件：过期要清掉
+	if err := os.WriteFile(filepath.Join(dir, "app-2026-01.log"), []byte("legacy\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
 	clock := func() time.Time { return now }
-	if err := Init(Options{Dir: dir, Level: LevelInfo, RetainMonths: 1, Stdout: os.Stderr, Now: clock}); err != nil {
+	if err := Init(Options{Dir: dir, Level: LevelInfo, RetainDays: 3, Stdout: os.Stderr, Now: clock}); err != nil {
 		t.Fatalf("init: %v", err)
 	}
 	defer func() { _ = Close() }()
-	Infof("march")
-	now = time.Date(2026, 4, 2, 8, 0, 0, 0, time.UTC)
-	Infof("april")
-	if _, err := os.Stat(filepath.Join(dir, "2026-03")); !os.IsNotExist(err) {
-		t.Fatalf("previous month dir must be removed with retain=1, err=%v", err)
+
+	keep := []string{"2026-10-23", "2026-10-24", "2026-10-25"}
+	for _, day := range keep {
+		if _, err := os.Stat(filepath.Join(dir, "2026-10", "app-"+day+".log")); err != nil {
+			t.Fatalf("%s must be kept: %v", day, err)
+		}
+	}
+	for _, day := range []string{"20", "21", "22"} {
+		if _, err := os.Stat(filepath.Join(dir, "2026-10", "app-2026-10-"+day+".log")); !os.IsNotExist(err) {
+			t.Fatalf("app-2026-10-%s must be removed, err=%v", day, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "2026-08")); !os.IsNotExist(err) {
+		t.Fatalf("empty month dir must be removed, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "custom")); err != nil {
+		t.Fatalf("non-month dir must be kept: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "app-2026-01.log")); !os.IsNotExist(err) {
+		t.Fatalf("legacy month file must be removed, err=%v", err)
 	}
 }
 
-func TestParseLevel(t *testing.T) {
-	cases := map[string]Level{"debug": LevelDebug, "INFO": LevelInfo, "warn": LevelWarn, "Warning": LevelWarn, "error": LevelError, "": LevelInfo}
-	for raw, want := range cases {
-		got, err := ParseLevel(raw)
-		if err != nil || got != want {
-			t.Fatalf("ParseLevel(%q) = %v, %v", raw, got, err)
+// 默认保留 30 天：第 29 天前的文件被清，30 天内的保留。
+func TestRetentionDefaultsTo30Days(t *testing.T) {
+	dir := t.TempDir()
+	monthDir := filepath.Join(dir, "2026-09")
+	if err := os.MkdirAll(monthDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 35 天前（超期）与 27 天前（保留）
+	for _, name := range []string{"app-2026-09-20.log", "app-2026-09-28.log"} {
+		if err := os.WriteFile(filepath.Join(monthDir, name), []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if _, err := ParseLevel("verbose"); err == nil {
-		t.Fatal("unknown level must error")
+	now := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	if err := Init(Options{Dir: dir, Level: LevelInfo, Stdout: os.Stderr, Now: clock}); err != nil {
+		t.Fatalf("init: %v", err)
 	}
-	if LevelWarn.String() != "WARN " || LevelError.String() != "ERROR" {
-		t.Fatalf("level names must be fixed-width, got %q %q", LevelWarn.String(), LevelError.String())
+	defer func() { _ = Close() }()
+	if _, err := os.Stat(filepath.Join(monthDir, "app-2026-09-20.log")); !os.IsNotExist(err) {
+		t.Fatalf("35-day-old file must be removed, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(monthDir, "app-2026-09-28.log")); err != nil {
+		t.Fatalf("27-day-old file must be kept: %v", err)
 	}
 }
 

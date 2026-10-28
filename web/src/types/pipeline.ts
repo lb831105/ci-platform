@@ -48,6 +48,8 @@ export type PipelineExecutor = 'docker' | 'local'
 export interface ArtifactConfig {
   enabled: boolean
   files: string[]
+  // 允许无产物：没匹配到文件只告警不失败（多模块项目常见）
+  allow_empty?: boolean
 }
 
 // 步骤级执行控制（与 Go model.Step 对齐）：
@@ -251,6 +253,9 @@ export interface Pipeline {
   build_retention_max_per_job: number
   build_retention_max_age_days: number
   delete_workspace_before_build: boolean
+  // 每个任务可选的工具版本：key=工具类别（jdk/nodejs/maven…），value=全局工具配置里的安装项名称。
+  // 未指定的类别用全局配置里第一个可用安装项。
+  tool_selections: Record<string, string>
   // 平台已统一为本地执行；字段保留兼容旧数据。
   executor?: PipelineExecutor
   // data/workspace 下的目录名，由后端根据任务名生成；前端只读。
@@ -284,7 +289,7 @@ export function emptySshPublish(): SshPublishConfig {
 }
 
 export function emptyArtifacts(): ArtifactConfig {
-  return { enabled: false, files: [] }
+  return { enabled: false, files: [], allow_empty: false }
 }
 
 export function emptyPipeline(): PipelinePayload {
@@ -310,6 +315,7 @@ export function emptyPipeline(): PipelinePayload {
     build_retention_max_per_job: 0,
     build_retention_max_age_days: 0,
     delete_workspace_before_build: false,
+    tool_selections: {},
     executor: 'local',
   }
 }

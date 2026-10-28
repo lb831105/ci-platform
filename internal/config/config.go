@@ -23,7 +23,8 @@ type Config struct {
 	CleanInterval   time.Duration // 工作区清理扫描间隔
 	LogBufferSize   int           // 单连接日志发送缓冲行数
 	LogLevel        string        // 平台日志级别（debug/info/warn/error）
-	LogRetainMonths int           // 平台日志保留月数：每天一个文件、每月一个目录，过期月份整月删除（0 = 永久保留）
+	LogRetainDays   int           // 平台日志保留天数：一天一个文件，超过天数的文件每天自动清理（0 = 永久保留）
+	ToolsMirror     string        // 工具下载镜像前缀（空 = 直连官方地址）
 	CORSOrigins     []string      // 允许跨域来源；空或 * 表示开放（生产应配置精确域名）
 	TrustProxy      bool          // 是否信任反向代理写入的 X-Forwarded-For（用于限流取真实 IP）
 	ShutdownTimeout time.Duration // 优雅停机等待运行中构建的最长时间
@@ -42,18 +43,21 @@ type Config struct {
 // Load 从环境变量装载配置。
 func Load() *Config {
 	return &Config{
-		Addr:            env("CI_ADDR", ":8080"),
-		DataHome:        env("CI_DATA_HOME", "./data"),
-		ConfigFile:      env("CI_CONFIG_FILE", "ci-platform.json"),
-		DataHomeSet:     os.Getenv("CI_DATA_HOME") != "",
-		WebDir:          env("CI_WEB_DIR", "./web/dist"),
-		Workers:         envInt("CI_WORKERS", 3),
-		QueueSize:       envInt("CI_QUEUE_SIZE", 100),
-		WorkspaceTTL:    time.Duration(envInt("CI_WORKSPACE_TTL_MINUTES", 60)) * time.Minute,
-		CleanInterval:   time.Duration(envInt("CI_CLEAN_INTERVAL_MINUTES", 5)) * time.Minute,
-		LogBufferSize:   envInt("CI_LOG_BUFFER", 512),
-		LogLevel:        env("CI_LOG_LEVEL", "info"),
-		LogRetainMonths: envInt("CI_LOG_RETAIN_MONTHS", 12),
+		Addr:          env("CI_ADDR", ":8080"),
+		DataHome:      env("CI_DATA_HOME", "./data"),
+		ConfigFile:    env("CI_CONFIG_FILE", "ci-platform.json"),
+		DataHomeSet:   os.Getenv("CI_DATA_HOME") != "",
+		WebDir:        env("CI_WEB_DIR", "./web/dist"),
+		Workers:       envInt("CI_WORKERS", 3),
+		QueueSize:     envInt("CI_QUEUE_SIZE", 100),
+		WorkspaceTTL:  time.Duration(envInt("CI_WORKSPACE_TTL_MINUTES", 60)) * time.Minute,
+		CleanInterval: time.Duration(envInt("CI_CLEAN_INTERVAL_MINUTES", 5)) * time.Minute,
+		LogBufferSize: envInt("CI_LOG_BUFFER", 512),
+		LogLevel:      env("CI_LOG_LEVEL", "info"),
+		LogRetainDays: envInt("CI_LOG_RETAIN_DAYS", 30),
+		// 自动安装的工具下载镜像前缀（如 https://mirrors.example.com）；
+		// 内网/国内环境无法直连 github/nodejs.org 时的逃生口。
+		ToolsMirror:     env("CI_TOOLS_MIRROR", ""),
 		CORSOrigins:     envList("CI_CORS_ORIGINS", []string{"*"}),
 		TrustProxy:      envBool("CI_TRUST_PROXY", false),
 		ShutdownTimeout: time.Duration(envInt("CI_SHUTDOWN_TIMEOUT_SECONDS", 30)) * time.Second,
@@ -88,8 +92,8 @@ func (c *Config) Validate() error {
 	if c.ShutdownTimeout < 0 {
 		return fmt.Errorf("shutdown timeout 不能为负数")
 	}
-	if c.LogRetainMonths < 0 {
-		c.LogRetainMonths = 0 // 负数归零：0 表示永久保留
+	if c.LogRetainDays < 0 {
+		c.LogRetainDays = 0 // 负数归零：0 表示永久保留
 	}
 	if c.LogBufferSize < 0 {
 		return fmt.Errorf("log buffer 不能为负数")
@@ -100,6 +104,11 @@ func (c *Config) Validate() error {
 // JobsDir 返回 pipeline 存储根目录 data/jobs。
 func (c *Config) JobsDir() string {
 	return filepath.Join(c.DataHome, "jobs")
+}
+
+// ToolsDir 返回自动安装的工具根目录 data/tools。
+func (c *Config) ToolsDir() string {
+	return filepath.Join(c.DataHome, "tools")
 }
 
 // WorkspaceDir 返回临时工作区根目录 data/workspace。

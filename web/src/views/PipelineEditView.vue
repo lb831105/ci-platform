@@ -135,6 +135,8 @@ function toPayload(pipeline: Pipeline): PipelinePayload {
     steps: pipeline.steps.map((step) => ({ ...step })),
     git_url: pipeline.git_url,
     git_branch: pipeline.git_branch,
+    // 每个任务的工具版本选择必须原样带回（只改描述也不能丢）
+    tool_selections: { ...(pipeline.tool_selections ?? {}) },
     git_credential_id: pipeline.git_credential_id ?? '',
     webhook_secret: pipeline.webhook_secret,
     // 触发器策略与状态回写：编辑/只改描述时都必须原样带回，否则保存会清空配置。
@@ -233,21 +235,58 @@ async function onExport(): Promise<void> {
 // 避免出现「页面写着不支持、其实已经支持」这类误导性提示。
 const paramCount = computed(() => form.value.params?.length ?? 0)
 
-// envTools 从全局工具配置里取出与本任务最相关的工具主目录（对齐 Jenkins 的 JDK / NodeJS 选择）。
+// envTools 列出与本任务相关的工具类别，以及全局工具配置里可选的安装项。
+// 对齐 Jenkins：每个任务自己选 JDK / NodeJS / Maven 版本，而不是全局一刀切。
 const envTools = computed(() => {
   const categories = settingsStore.data?.tool_categories ?? []
-  const wanted: Array<{ id: string; label: string }> = [
-    { id: 'jdk', label: 'JDK (JAVA_HOME)' },
-    { id: 'nodejs', label: 'NodeJS (NODE_HOME)' },
-    { id: 'maven', label: 'Maven (MAVEN_HOME)' },
-    { id: 'golang', label: 'Go (GOROOT)' },
+  const wanted: Array<{ id: string; label: string; env: string }> = [
+    { id: 'jdk', label: 'JDK', env: 'JAVA_HOME' },
+    { id: 'nodejs', label: 'NodeJS', env: 'NODE_HOME' },
+    { id: 'maven', label: 'Maven', env: 'MAVEN_HOME' },
+    { id: 'gradle', label: 'Gradle', env: 'GRADLE_HOME' },
+    { id: 'golang', label: 'Go', env: 'GOROOT' },
   ]
   return wanted.map((item) => {
     const category = categories.find((c) => c.id === item.id)
-    const withHome = category?.installations.find((i) => (i.home ?? '').trim() !== '')
-    return { id: item.id, label: item.label, home: withHome?.home ?? '' }
+    const installations = category?.installations ?? []
+    // 第一个可用的安装项 = 未选择时的实际生效项（与后端规则一致）
+    const fallback = installations.find((i) => i.install_mode === 'auto' || (i.home ?? '').trim() !== '')
+    const picked = form.value.tool_selections?.[item.id]
+    const effective = installations.find((i) => i.name === picked) ?? fallback
+    return { ...item, installations, fallback, effective, picked: picked ?? '' }
   })
 })
+
+// installationLabel 展示「名称 + 版本/路径」，让选择时就能看出用的是哪个版本。
+function installationLabel(item: { name: string; install_mode?: string; version?: string; home?: string }): string {
+  if (item.install_mode === 'auto') {
+    return `${item.name}（自动安装 ${item.version ?? ''}）`
+  }
+  return item.home ? `${item.name}（${item.home}）` : item.name
+}
+
+// effectiveToolText 显示该类别实际会用的东西：路径 / 自动安装 / 未配置。
+function effectiveToolText(tool: { effective?: { install_mode?: string; version?: string; home?: string }; env: string }): string {
+  if (!tool.effective) {
+    return `未配置（按系统 PATH 执行）`
+  }
+  if (tool.effective.install_mode === 'auto') {
+    return tool.effective.home
+      ? tool.effective.home
+      : `自动安装 ${tool.effective.version}（构建时下载）`
+  }
+  return tool.effective.home || '未填写路径（按系统 PATH 执行）'
+}
+
+function setToolSelection(categoryId: string, name: string): void {
+  const selections = { ...(form.value.tool_selections ?? {}) }
+  if (!name) {
+    delete selections[categoryId]
+  } else {
+    selections[categoryId] = name
+  }
+  form.value.tool_selections = selections
+}
 
 function addSshPublish(): void {
   const list = form.value.ssh_publishes ?? []
@@ -770,15 +809,32 @@ function copyWebhook(): void {
           <el-form-item label="构建工具版本">
             <div class="tool-homes">
               <div v-for="tool in envTools" :key="tool.id" class="tool-homes__item">
-                <span class="tool-homes__label">{{ tool.label }}</span>
-                <span v-if="tool.home" class="mono tool-homes__value">{{ tool.home }}</span>
-                <span v-else class="tool-homes__missing">未在「全局工具配置」中填写主目录，按系统 PATH 执行</span>
+                <span class="tool-homes__label">{{ tool.label }} <span class="mono">{{ tool.env }}</span></span>
+                <el-select
+                  :model-value="tool.picked"
+                  clearable
+                  placeholder="默认（全局第一个可用）"
+                  style="width: 260px"
+                  @update:model-value="(v: string) => setToolSelection(tool.id, v)"
+                >
+                  <el-option
+                    v-for="inst in tool.installations"
+                    :key="inst.name"
+                    :label="installationLabel(inst)"
+                    :value="inst.name"
+                  />
+                </el-select>
+                <span class="mono tool-homes__value">{{ effectiveToolText(tool) }}</span>
+                <span v-if="!tool.installations.length" class="tool-homes__missing">
+                  未在「全局工具配置」中配置，按系统 PATH 执行
+                </span>
               </div>
             </div>
             <div class="form-tip">
-              Jenkins 里每个任务可选 JDK / NodeJS 安装项；平台把版本收在「系统管理 → 全局工具配置」，
-              构建时把主目录注入 <span class="mono">JAVA_HOME</span>/<span class="mono">NODE_HOME</span> 等变量并前置到
-              <span class="mono">PATH</span>。需要不同版本请在该页面维护（或在该步骤里显式使用绝对路径）。
+              「用什么项目就用什么配置」：这里给当前任务单独选 JDK / NodeJS / Maven 版本，
+              不选则用「系统管理 → 全局工具配置」里第一个可用安装项。选中的版本在构建时注入
+              <span class="mono">JAVA_HOME</span>/<span class="mono">NODE_HOME</span> 等变量并前置到
+              <span class="mono">PATH</span>；标注「自动安装」的版本会在首次构建时自动下载（只下载本任务真正用到的工具）。
             </div>
           </el-form-item>
           <el-form-item label="其他环境配置">

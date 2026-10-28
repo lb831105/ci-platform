@@ -52,12 +52,16 @@ func (p *SshPublisher) Publish(ctx context.Context, cfg *model.SshPublishConfig,
 
 	fmt.Fprintf(out, "\n[ssh] === publish to %s@%s:%d ===\n", cfg.Username, cfg.Host, cfg.PortOf())
 
-	files, err := matchFiles(workspace, cfg.SourceFiles)
+	files, notes, err := matchFiles(workspace, cfg.SourceFiles)
 	if err != nil {
 		return err
 	}
+	for _, note := range notes {
+		fmt.Fprintf(out, "[ssh] %s", note)
+		fmt.Fprintln(out)
+	}
 	if len(files) == 0 {
-		return fmt.Errorf("ssh publish: no files matched %v under %s", cfg.SourceFiles, workspace)
+		return fmt.Errorf("SSH 发布：%w", newNoMatchError(workspace, cfg.SourceFiles))
 	}
 
 	if err := p.upload(ctx, client, cfg, workspace, files, out); err != nil {
@@ -99,7 +103,7 @@ func (p *SshPublisher) PublishArtifacts(ctx context.Context, cfg *model.SshPubli
 		return errors.New("ssh publish: host and username are required")
 	}
 	artifactsDir := filepath.Join(buildDir, model.ArtifactDirName)
-	files, err := matchFiles(artifactsDir, []string{"**"})
+	files, _, err := matchFiles(artifactsDir, []string{"**"})
 	if err != nil {
 		return fmt.Errorf("republish: %w", err)
 	}
@@ -339,8 +343,9 @@ func applyFlatten(rel string, flatten bool) string {
 
 // matchFiles 展开待上传文件，支持 Jenkins 风格的 ** 递归通配与目录模式。
 // matchFiles 是 SSH 发布对通用工作区 glob 匹配器的包装。
-func matchFiles(workspace string, patterns []string) ([]string, error) {
-	return matchWorkspaceFiles(workspace, patterns, "ssh publish")
+// notes（自动递归兜底的说明）由调用方打印到构建日志。
+func matchFiles(workspace string, patterns []string) ([]string, []string, error) {
+	return matchWorkspaceFilesDetailed(workspace, patterns, "ssh publish")
 }
 
 // relativeTo 计算文件相对工作区的斜杠路径。

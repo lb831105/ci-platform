@@ -55,6 +55,10 @@ type CommitStatusConfig struct {
 type ArtifactConfig struct {
 	Enabled bool     `json:"enabled"`
 	Files   []string `json:"files"`
+	// AllowEmpty 为 true 时，归档模式一个文件都没匹配到也不判定构建失败
+	// （只打一条 WARN）。多模块项目里"某个模块这次没产物"很常见，
+	// 不该让"编译成功"变成"构建失败"。
+	AllowEmpty bool `json:"allow_empty,omitempty"`
 }
 
 // 构建参数类型（对齐 Jenkins 的 String / Boolean / Choice / Text）。
@@ -159,6 +163,11 @@ type Pipeline struct {
 
 	// 构建环境：是否在构建前清空工作区。nil 视为 false（默认复用工作区）。
 	DeleteWorkspaceBeforeBuild *bool `json:"delete_workspace_before_build,omitempty"`
+
+	// ToolSelections 让每个任务选自己的工具版本（对齐 Jenkins 任务里的 JDK/NodeJS 选择）：
+	// key 是工具类别 ID（jdk/nodejs/maven/...），value 是「全局工具配置」里安装项的名称。
+	// 未指定的类别按全局配置里第一个可用的安装项。
+	ToolSelections map[string]string `json:"tool_selections,omitempty"`
 
 	// 执行方式：已统一为 local（服务器本地执行）。字段保留仅为兼容旧数据。
 	Executor string `json:"executor,omitempty"`

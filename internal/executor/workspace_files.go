@@ -13,25 +13,34 @@ import (
 	"ci-platform/internal/pkg"
 )
 
-// matchWorkspaceFiles 按 glob 收集工作区内文件，结果按路径排序。
+// matchWorkspaceFilesDetailed 按 glob 收集工作区内文件，结果按路径排序。
 // 约定：
 //   - "dist/**"          递归匹配 dist 下所有文件
 //   - "**/*.jar"         匹配任意层级的 jar
 //   - "dist" / "dist/"   目录模式，等价于 dist/**
 //   - "app.tar.gz"       精确文件名
+//   - "target/*.jar"     先按根目录匹配；根目录没有时**自动按 **/target/*.jar 再试一次**
+//
+// 最后一条是刻意的"宽容"：多模块 Maven 工程（ruoyi）的 jar 在
+// ruoyi-admin/target/ 下，用户写 target/*.jar 的意图显然不是"只看根目录"，
+// 让他因为目录层级而构建失败、还得自己发现 `**` 语法，属于产品缺陷而不是配置错误。
+// 根目录有匹配时仍然优先用根目录结果（保持 Jenkins 语义可预期）。
 //
 // label 只用于错误前缀（ssh publish / artifact），不影响匹配语义。
-func matchWorkspaceFiles(workspace string, patterns []string, label string) ([]string, error) {
+// 返回值 notes 是"自动回退"的说明，调用方需要打进构建日志，
+// 否则用户会疑惑"我写的 target/*.jar 怎么归档了子目录的"。
+func matchWorkspaceFilesDetailed(workspace string, patterns []string, label string) ([]string, []string, error) {
 	if len(patterns) == 0 {
-		return nil, fmt.Errorf("%s: no patterns", label)
+		return nil, nil, fmt.Errorf("%s: no patterns", label)
 	}
 	seen := make(map[string]bool)
 	var out []string
+	var notes []string
 
 	for _, raw := range patterns {
 		pattern, err := normalizeWorkspacePattern(raw)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", label, err)
+			return nil, nil, fmt.Errorf("%s: %w", label, err)
 		}
 		if pattern == "" {
 			continue
@@ -40,11 +49,11 @@ func matchWorkspaceFiles(workspace string, patterns []string, label string) ([]s
 		// 目录模式：直接收集目录下全部文件。
 		dirCandidate := filepath.Join(workspace, filepath.FromSlash(pattern))
 		if !pkg.WithinDir(workspace, dirCandidate) {
-			return nil, fmt.Errorf("%s: pattern %q escapes workspace", label, raw)
+			return nil, nil, fmt.Errorf("%s: pattern %q escapes workspace", label, raw)
 		}
 		if pkgIsDir(dirCandidate) && !strings.ContainsAny(pattern, "*?[") {
 			if err = collectDir(dirCandidate, seen, &out); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			continue
 		}
@@ -58,31 +67,81 @@ func matchWorkspaceFiles(workspace string, patterns []string, label string) ([]s
 			}
 		}
 
-		re, err := globToRegexp(pattern)
+		matched, matchedPattern, err := scanWorkspaceForPattern(workspace, pattern, false)
 		if err != nil {
-			return nil, fmt.Errorf("%s: invalid pattern %q: %w", label, raw, err)
+			return nil, nil, fmt.Errorf("%s: invalid pattern %q: %w", label, raw, err)
 		}
-		err = filepath.WalkDir(workspace, func(p string, d fs.DirEntry, walkErr error) error {
-			if walkErr != nil || d.IsDir() {
-				return nil
+		if len(matched) == 0 {
+			// 根目录没匹配到：容易踩的就是多模块工程的嵌套目录，自动按递归再试一次。
+			if recursive := suggestPattern(pattern); recursive != "" {
+				// 兜底扫描跳过依赖缓存目录：快，且不会误抓 node_modules 里的同名文件。
+				recursiveMatched, _, scanErr := scanWorkspaceForPattern(workspace, recursive, true)
+				if scanErr != nil {
+					return nil, nil, fmt.Errorf("%s: invalid pattern %q: %w", label, raw, scanErr)
+				}
+				if len(recursiveMatched) > 0 {
+					matched = recursiveMatched
+					matchedPattern = recursive
+				}
 			}
-			rel, relErr := filepath.Rel(workspace, p)
-			if relErr != nil {
-				return nil
+		}
+		if matchedPattern != "" && matchedPattern != pattern {
+			notes = append(notes, fmt.Sprintf("模式 %s 在工作区根目录没有匹配，已按递归匹配 %s 处理（命中 %d 个文件）",
+				pattern, matchedPattern, len(matched)))
+		}
+		for _, file := range matched {
+			if !seen[file] {
+				seen[file] = true
+				out = append(out, file)
 			}
-			if re.MatchString(filepath.ToSlash(rel)) && !seen[p] {
-				seen[p] = true
-				out = append(out, p)
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
 		}
 	}
-
 	sort.Strings(out)
-	return out, nil
+	return out, notes, nil
+}
+
+// noiseDirs 是"找提示 / 自动兜底"时跳过的依赖与元数据目录。
+//
+// 只用于这两类**额外**扫描，显式配置的模式（含 **）仍然遍历全部目录，
+// 以免把用户明确写下的匹配语义偷偷改掉。
+var noiseDirs = map[string]bool{
+	".git": true, "node_modules": true, ".ci-tmp": true,
+	".gradle": true, ".mvn": true, ".idea": true,
+}
+
+// scanWorkspaceForPattern 遍历工作区，返回匹配的文件与"实际生效的模式"。
+//
+// skipNoise 仅由自动兜底使用：遍历 node_modules 既慢，又可能把依赖里的
+// 同名文件当成产物（比如 node_modules/x/target/app.jar）发到生产。
+func scanWorkspaceForPattern(workspace, pattern string, skipNoise bool) ([]string, string, error) {
+	var matched []string
+	re, err := globToRegexp(pattern)
+	if err != nil {
+		return nil, "", err
+	}
+	err = filepath.WalkDir(workspace, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if skipNoise && noiseDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, relErr := filepath.Rel(workspace, p)
+		if relErr != nil {
+			return nil
+		}
+		if re.MatchString(filepath.ToSlash(rel)) {
+			matched = append(matched, p)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return matched, pattern, nil
 }
 
 // normalizeWorkspacePattern 归一化并校验单个 glob：

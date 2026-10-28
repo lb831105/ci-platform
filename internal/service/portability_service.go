@@ -64,6 +64,9 @@ type PipelineExport struct {
 	BuildRetentionMaxPerJob    int   `json:"build_retention_max_per_job"`
 	BuildRetentionMaxAgeDays   int   `json:"build_retention_max_age_days"`
 	DeleteWorkspaceBeforeBuild *bool `json:"delete_workspace_before_build,omitempty"`
+	// ToolSelections 让每个任务选自己的工具版本（JDK/NodeJS/Maven…），
+	// 搬迁到另一实例时按「安装项名称」对齐，缺失的会在导入告警里指出。
+	ToolSelections map[string]string `json:"tool_selections,omitempty"`
 
 	// Notify 已脱敏：群机器人 URL 被清空（token 不落导出文件）。
 	Notify *model.JobNotify `json:"notify,omitempty"`
@@ -156,6 +159,12 @@ func (s *PortabilityService) Export(ctx context.Context, pipelineID string) (*Pi
 			}
 		}
 		doc.CommitStatus = status
+	}
+	if len(p.ToolSelections) > 0 {
+		doc.ToolSelections = make(map[string]string, len(p.ToolSelections))
+		for key, value := range p.ToolSelections {
+			doc.ToolSelections[key] = value
+		}
 	}
 	if p.DeleteWorkspaceBeforeBuild != nil {
 		keep := *p.DeleteWorkspaceBeforeBuild
@@ -399,6 +408,7 @@ var knownDocFields = map[string]bool{
 	"cron_spec": true, "params": true, "ssh_publishes": true, "artifacts": true,
 	"build_retention_max_per_job": true, "build_retention_max_age_days": true,
 	"delete_workspace_before_build": true, "notify": true, "warnings": true,
+	"tool_selections":     true,
 	"webhook_branch_mode": true, "webhook_branches": true, "webhook_events": true,
 	"commit_status": true,
 	// 原生 config.json 里的触发器/审批字段（导入时按需读取）
@@ -458,6 +468,11 @@ func (s *PortabilityService) toPipeline(ctx context.Context, exported *PipelineE
 	}
 	p.BuildRetentionMaxPerJob = firstIntValue(exported.BuildRetentionMaxPerJob, raw.BuildRetentionMaxPerJob)
 	p.BuildRetentionMaxAgeDays = firstIntValue(exported.BuildRetentionMaxAgeDays, raw.BuildRetentionMaxAgeDays)
+	if len(exported.ToolSelections) > 0 {
+		p.ToolSelections = exported.ToolSelections
+	} else if len(raw.ToolSelections) > 0 {
+		p.ToolSelections = raw.ToolSelections
+	}
 	if exported.DeleteWorkspaceBeforeBuild != nil {
 		p.DeleteWorkspaceBeforeBuild = exported.DeleteWorkspaceBeforeBuild
 	} else {

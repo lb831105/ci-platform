@@ -12,7 +12,8 @@ const config = computed(() => props.modelValue)
 
 const PRESETS: Array<{ label: string; files: string[] }> = [
   { label: 'Go 可执行文件', files: ['app', 'app.exe'] },
-  { label: 'Maven JAR', files: ['target/*.jar'] },
+  { label: 'Maven JAR', files: ['**/target/*.jar'] },
+  { label: 'Maven 单模块 JAR', files: ['target/*.jar'] },
   { label: 'Java JAR', files: ['*.jar'] },
   { label: 'Node 前端 dist', files: ['dist/**'] },
 ]
@@ -80,8 +81,10 @@ function applyPreset(files: string[]): void {
               <el-option v-for="pattern in config.files" :key="pattern" :label="pattern" :value="pattern" />
             </el-select>
             <div class="form-tip">
-              相对构建工作区的 glob，支持 <span class="mono">*</span>、<span class="mono">**</span>、<span class="mono">?</span>；
-              至少匹配一个文件，否则构建会失败并提示，避免“构建成功但没有产物”。
+              相对构建工作区的 glob：<span class="mono">*</span> 不跨目录、<span class="mono">**</span> 匹配任意层级。
+              根目录有匹配时优先用根目录结果；根目录没有时会**自动按 <span class="mono">**/模式</span> 再匹配一次**
+              （多模块 Maven 工程 jar 在子模块 <span class="mono">ruoyi-admin/target/</span> 下也能归档，
+              日志里会说明"已按递归匹配处理"）。真的什么都没找到才判定失败，并列出工作区里的同名文件。
             </div>
             <div class="artifact-config__presets">
               <span class="muted">快捷填充：</span>
@@ -97,10 +100,22 @@ function applyPreset(files: string[]): void {
             </div>
           </el-form-item>
 
+          <el-form-item label="没匹配到产物">
+            <el-switch
+              :model-value="!!config.allow_empty"
+              @update:model-value="(value: boolean) => patch({ allow_empty: value })"
+            />
+            <span class="form-tip">
+              开启后「没匹配到文件」只打 WARN 不算构建失败（多模块里某模块这次没产物时很有用）；
+              关闭则视为配置错误，构建失败并给出建议（默认）。
+            </span>
+          </el-form-item>
+
           <el-form-item label="路径示例">
             <div class="artifact-config__examples">
               <div><span class="mono">app.exe</span> / <span class="mono">app</span>：Go 编译出的可执行文件</div>
-              <div><span class="mono">target/*.jar</span>：Maven 打包结果</div>
+              <div><span class="mono">**/target/*.jar</span>：多模块 Maven 所有子模块的 jar</div>
+              <div><span class="mono">target/*.jar</span>：优先根目录；根目录没有时自动按 <span class="mono">**/target/*.jar</span> 兜底</div>
               <div><span class="mono">dist/**</span>：Node 前端构建目录（递归）</div>
               <div><span class="mono">*.jar</span>：工作区根目录下的 jar</div>
             </div>

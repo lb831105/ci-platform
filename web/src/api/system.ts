@@ -7,6 +7,8 @@ import type {
   Feature,
   LoadStats,
   SystemLogResponse,
+  ToolCatalogTool,
+  ToolInstallTask,
   NotifyHistoryQuery,
   NotifyRecord,
   OldDataReport,
@@ -29,6 +31,21 @@ export const systemApi = {
 
   clearLog(): Promise<null> {
     return http.del<null>('/system/log')
+  },
+
+  // 全局工具配置：自动安装的可选版本与安装状态。
+  toolCatalog(): Promise<ToolCatalogTool[]> {
+    return http.get<ToolCatalogTool[]>('/system/tools/catalog')
+  },
+
+  // 启动后台安装任务（立刻返回，不等下载完成）：关掉页面也会继续装。
+  installTool(type: string, version: string): Promise<ToolInstallTask> {
+    return http.post<ToolInstallTask>('/system/tools/install', { type, version })
+  },
+
+  // 后台安装任务进度：前端轮询它显示百分比。
+  toolTasks(): Promise<ToolInstallTask[]> {
+    return http.get<ToolInstallTask[]>('/system/tools/tasks')
   },
 
   features(): Promise<Feature[]> {

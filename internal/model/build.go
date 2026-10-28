@@ -83,12 +83,29 @@ type Build struct {
 	// 由 Webhook payload 带入：任务里没固定写项目路径时，回写状态用它定位。
 	CommitProject string `json:"commit_project,omitempty"`
 
+	// Advice 是给用户的可执行修复建议（目前用于"产物模式没匹配到文件"）：
+	// 光在日志里说"匹配不到"还得让人自己去翻日志、改配置、再跑一次，
+	// 前端据此直接提供「一键改成建议模式」。
+	Advice *BuildAdvice `json:"advice,omitempty"`
+
 	// SCM 现场信息：从实际签出的工作区读取，供「按分支路由」与「通知提交者」使用。
 	// 非 Git 任务为空。
 	Branch       string `json:"branch,omitempty"`
 	Commit       string `json:"commit,omitempty"`        // 短 SHA
 	CommitAuthor string `json:"commit_author,omitempty"` // 提交人姓名
 	CommitEmail  string `json:"commit_email,omitempty"`  // 提交人邮箱（路由到提交者用）
+}
+
+// BuildAdvice 是一次构建失败时给出的结构化修复建议。
+type BuildAdvice struct {
+	// Kind 目前只有 artifact_pattern（归档模式没匹配到文件）。
+	Kind    string `json:"kind"`
+	Message string `json:"message"`
+	// Patterns 是本次配置的模式，Suggested 是建议改成什么。
+	Patterns  []string `json:"patterns,omitempty"`
+	Suggested []string `json:"suggested,omitempty"`
+	// Files 是工作区里找到的同名文件（相对工作区路径），让用户确认"是不是这些"。
+	Files []string `json:"files,omitempty"`
 }
 
 // LogKey 返回日志 Hub 的订阅键，格式 pipeline_id/build_id。

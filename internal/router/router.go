@@ -34,6 +34,7 @@ type Deps struct {
 	Profile     *handler.ProfileHandler
 	Import      *handler.ImportHandler
 	Portability *handler.PortabilityHandler
+	Tools       *handler.ToolsHandler
 
 	// AuthService 同时供中间件校验会话。为 nil 或未启用时接口不鉴权。
 	AuthService *service.AuthService
@@ -158,6 +159,12 @@ func New(d Deps) http.Handler {
 				r.With(perm(model.PermSystemRead)).Get("/log", d.System.Log)
 				r.With(perm(model.PermSystemManage)).Delete("/log", d.System.ClearLog)
 				r.With(perm(model.PermSystemRead)).Get("/features", d.System.Features)
+				// 全局工具配置的自动安装：版本清单只读，下载需要系统管理权限。
+				if d.Tools != nil {
+					r.With(perm(model.PermSystemRead)).Get("/tools/catalog", d.Tools.Catalog)
+					r.With(perm(model.PermSystemManage)).Post("/tools/install", d.Tools.Install)
+					r.With(perm(model.PermSystemRead)).Get("/tools/tasks", d.Tools.Tasks)
+				}
 				r.With(perm(model.PermSystemRead)).Get("/settings", d.System.GetSettings)
 				r.With(perm(model.PermSystemManage)).Put("/settings", d.System.UpdateSettings)
 				r.With(perm(model.PermSystemManage)).Post("/reload", d.System.ReloadSettings)

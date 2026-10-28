@@ -32,7 +32,7 @@ func TestArtifactCollectorArchivesEachBuild(t *testing.T) {
 
 	buildDir := t.TempDir()
 	var out bytes.Buffer
-	files, err := NewArtifactCollector().Collect(context.Background(), workspace, buildDir, []string{"app.exe", "dist/**"}, ArtifactLimits{}, &out)
+	files, err := NewArtifactCollector().Collect(context.Background(), workspace, buildDir, []string{"app.exe", "dist/**"}, ArtifactLimits{}, false, &out)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestArtifactCollectorArchivesEachBuild(t *testing.T) {
 
 func TestArtifactCollectorRejectsInvalidPattern(t *testing.T) {
 	workspace := t.TempDir()
-	_, err := NewArtifactCollector().Collect(context.Background(), workspace, t.TempDir(), []string{"../secret"}, ArtifactLimits{}, &bytes.Buffer{})
+	_, err := NewArtifactCollector().Collect(context.Background(), workspace, t.TempDir(), []string{"../secret"}, ArtifactLimits{}, false, &bytes.Buffer{})
 	if err == nil {
 		t.Fatal("path traversal pattern must be rejected")
 	}
@@ -77,7 +77,7 @@ func TestArtifactCollectorRejectsInvalidPattern(t *testing.T) {
 
 func TestArtifactCollectorRequiresMatch(t *testing.T) {
 	workspace := t.TempDir()
-	_, err := NewArtifactCollector().Collect(context.Background(), workspace, t.TempDir(), []string{"missing/*.jar"}, ArtifactLimits{}, &bytes.Buffer{})
+	_, err := NewArtifactCollector().Collect(context.Background(), workspace, t.TempDir(), []string{"missing/*.jar"}, ArtifactLimits{}, false, &bytes.Buffer{})
 	if err == nil {
 		t.Fatal("no matching artifacts must fail the build")
 	}
@@ -92,15 +92,15 @@ func TestArtifactCollectorEnforcesLimits(t *testing.T) {
 	}
 	collector := NewArtifactCollector()
 	if _, err := collector.Collect(context.Background(), workspace, t.TempDir(), []string{"*.bin"},
-		ArtifactLimits{MaxFiles: 1}, &bytes.Buffer{}); err == nil {
+		ArtifactLimits{MaxFiles: 1}, false, &bytes.Buffer{}); err == nil {
 		t.Fatal("max files limit must reject the archive")
 	}
 	if _, err := collector.Collect(context.Background(), workspace, t.TempDir(), []string{"*.bin"},
-		ArtifactLimits{MaxTotalBytes: 5}, &bytes.Buffer{}); err == nil {
+		ArtifactLimits{MaxTotalBytes: 5}, false, &bytes.Buffer{}); err == nil {
 		t.Fatal("max total size limit must reject the archive")
 	}
 	if _, err := collector.Collect(context.Background(), workspace, t.TempDir(), []string{"*.bin"},
-		ArtifactLimits{MaxFiles: 2, MaxTotalBytes: 20}, &bytes.Buffer{}); err != nil {
+		ArtifactLimits{MaxFiles: 2, MaxTotalBytes: 20}, false, &bytes.Buffer{}); err != nil {
 		t.Fatalf("limits should allow this archive: %v", err)
 	}
 }

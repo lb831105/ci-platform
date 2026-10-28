@@ -1,1 +1,0 @@
-import{O as t}from"./index-BWuJA1z9.js";const r={list(){return t.get("/views")},jobs(e){return t.get(`/views/${encodeURIComponent(e)}/jobs`)},create(e){return t.post("/views",e)},update(e,o){return t.put(`/views/${encodeURIComponent(e)}`,o)},remove(e){return t.del(`/views/${encodeURIComponent(e)}`)}};export{r as v};

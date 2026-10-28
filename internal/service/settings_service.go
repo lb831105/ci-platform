@@ -11,6 +11,7 @@ import (
 
 	"ci-platform/internal/model"
 	"ci-platform/internal/pkg"
+	"ci-platform/internal/tools"
 )
 
 // SettingsStore 是 service 依赖的系统配置存储抽象。
@@ -367,8 +368,35 @@ func validateSettings(in *model.Settings) error {
 			item.Name = strings.TrimSpace(item.Name)
 			item.Home = strings.TrimSpace(item.Home)
 			item.Note = strings.TrimSpace(item.Note)
+			item.InstallMode = strings.ToLower(strings.TrimSpace(item.InstallMode))
+			item.Version = strings.TrimSpace(item.Version)
 			if item.Name == "" {
 				return pkg.ErrBadRequest("工具 %q 下的安装项 name 为必填", category.Title)
+			}
+			switch item.InstallMode {
+			case "", model.ToolInstallManual:
+				item.InstallMode = model.ToolInstallManual
+				item.Version = ""
+			case model.ToolInstallAuto:
+				// 自动安装：只要类别人认可、版本在预置清单里即可，主目录由平台下载后填写。
+				tool, version, ok := tools.FindVersion(category.ID, item.Version)
+				if !ok {
+					hint := ""
+					if tool.VersionHint != "" {
+						hint = "，可填：" + tool.VersionHint
+					}
+					return pkg.ErrBadRequest("工具 %q 不支持自动安装该版本：%s%s（也可改用手动填写主目录）",
+						category.Title, item.Version, hint)
+				}
+				if !tool.AutoInstall {
+					return pkg.ErrBadRequest("工具 %q 不支持自动安装，请手动填写主目录", category.Title)
+				}
+				if !hasPlatformURL(version) {
+					return pkg.ErrBadRequest("工具 %q 的版本 %s 没有预置下载地址", category.Title, item.Version)
+				}
+				item.Home = "" // 以磁盘上的实际安装结果为准，避免保存过期路径
+			default:
+				return pkg.ErrBadRequest("工具 %q 的安装方式只能是 manual 或 auto：%s", category.Title, item.InstallMode)
 			}
 			if item.Home != "" {
 				if !isAbsoluteToolPath(item.Home) {
@@ -450,4 +478,10 @@ func isAbsoluteToolPath(p string) bool {
 		return true
 	}
 	return len(s) >= 3 && s[1] == ':' && s[2] == '/'
+}
+
+// hasPlatformURL 判断版本是否有任意平台的下载地址（保存时不做平台限定的硬校验：
+// 用户可能在别的机器上编辑配置，真正下载时才按当前平台挑选）。
+func hasPlatformURL(v tools.Version) bool {
+	return len(v.URLs) > 0
 }

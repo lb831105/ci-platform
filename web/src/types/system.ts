@@ -11,13 +11,55 @@ export interface SystemLogResponse {
   lines: string[]
   entries: LogEntry[]
   // 当前落盘文件与保留策略（运维可据此直接去服务器上 grep）
-  file?: { file: string; level: string; retain_months: number }
+  file?: { file: string; level: string; retain_days: number }
 }
 
 export interface ToolInstallation {
   name: string
   home?: string
   note?: string
+  // manual（默认，兼容旧数据）：用服务器上已装好的工具，只认 home
+  // auto：由平台按 version 下载安装到 data/tools，home 由平台回填
+  install_mode?: 'manual' | 'auto'
+  version?: string
+}
+
+// 自动安装候选版本（GET /system/tools/catalog）
+// 后台安装任务：离开页面也在服务端继续跑，重新打开还能看到进度。
+export interface ToolInstallTask {
+  type: string
+  version: string
+  state: 'queued' | 'downloading' | 'extracting' | 'done' | 'failed'
+  downloaded: number
+  total: number
+  home?: string
+  error?: string
+  started_at: string
+  updated_at: string
+}
+
+export interface ToolCatalogVersion {
+  version: string
+  note?: string
+  /** 当前服务器平台是否有预置下载包 */
+  supported: boolean
+  installed: boolean
+  home?: string
+  /** 用户手填的版本（按下载地址模板推导，如 Node 18.20.4） */
+  custom?: boolean
+  /** 正在进行的安装任务（含进度） */
+  task?: ToolInstallTask
+}
+
+export interface ToolCatalogTool {
+  type: string
+  title: string
+  home_env?: string
+  hint?: string
+  auto_install: boolean
+  versions: ToolCatalogVersion[]
+  /** 手填版本的格式说明，如「任意补丁版本，如 18.20.4」 */
+  version_hint?: string
 }
 
 export interface ToolCategory {

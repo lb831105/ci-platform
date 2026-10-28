@@ -17,8 +17,26 @@ func DefaultShell() string {
 // 平台直接使用运行服务的服务器上已安装的工具，home 为工具主目录（如 GOROOT / JAVA_HOME）。
 type ToolInstallation struct {
 	Name string `json:"name"`
-	Home string `json:"home,omitempty"` // 宿主机上的工具主目录
+	Home string `json:"home,omitempty"` // 宿主机上的工具主目录（手动模式必填，自动模式由平台下载后写入）
 	Note string `json:"note,omitempty"`
+
+	// InstallMode 对齐 Jenkins 的「自动安装」开关：
+	//   manual（默认，兼容旧数据）：使用服务器上已装好的工具，只认 Home
+	//   auto：由平台按 Version 下载安装到 data/tools，Home 由平台填写
+	InstallMode string `json:"install_mode,omitempty"`
+	// Version 是自动安装模式下的版本号（来自 /api/system/tools/catalog）。
+	Version string `json:"version,omitempty"`
+}
+
+// 工具安装方式常量。
+const (
+	ToolInstallManual = "manual"
+	ToolInstallAuto   = "auto"
+)
+
+// IsAutoInstall 判断是否为自动安装模式（空值视为手动，兼容旧配置）。
+func (t ToolInstallation) IsAutoInstall() bool {
+	return t.InstallMode == ToolInstallAuto
 }
 
 // ToolCategory 是一个工具类别（JDK / Git / Gradle / Ant / Maven / NodeJS），

@@ -3,6 +3,7 @@ package service
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -37,21 +38,23 @@ func TestInjectLocalToolHomes(t *testing.T) {
 		t.Fatal("installation without home must not set MAVEN_HOME")
 	}
 	sep := string(os.PathListSeparator)
-	if !strings.HasPrefix(env["PATH"], filepath.Join(goHome, "bin")+sep) {
-		t.Fatalf("PATH must start with go bin: %q", env["PATH"])
+	// PATH 的键名在 Windows 上是 Path，用 envPath 读取以兼容两种写法。
+	pathValue := envPath(env)
+	if !strings.HasPrefix(pathValue, filepath.Join(goHome, "bin")+sep) {
+		t.Fatalf("PATH must start with go bin: %q", pathValue)
 	}
-	if !strings.Contains(env["PATH"], filepath.Join(jdkHome, "bin")) {
-		t.Fatalf("PATH missing jdk bin: %q", env["PATH"])
+	if !strings.Contains(pathValue, filepath.Join(jdkHome, "bin")) {
+		t.Fatalf("PATH missing jdk bin: %q", pathValue)
 	}
 	// Node（尤其 Windows）可执行文件可能在主目录本身。
-	if !strings.Contains(env["PATH"], filepath.FromSlash("/opt/node")) {
-		t.Fatalf("PATH missing node home: %q", env["PATH"])
+	if !strings.Contains(pathValue, filepath.FromSlash("/opt/node")) {
+		t.Fatalf("PATH missing node home: %q", pathValue)
 	}
-	if strings.Contains(env["PATH"], "go-other") {
-		t.Fatalf("only first installation per category should be used: %q", env["PATH"])
+	if strings.Contains(pathValue, "go-other") {
+		t.Fatalf("only first installation per category should be used: %q", pathValue)
 	}
-	if !strings.HasSuffix(env["PATH"], sep+"/usr/bin") {
-		t.Fatalf("PATH must keep original entries: %q", env["PATH"])
+	if !strings.HasSuffix(pathValue, sep+"/usr/bin") {
+		t.Fatalf("PATH must keep original entries: %q", pathValue)
 	}
 }
 
@@ -95,5 +98,47 @@ func TestResolveSshConfig(t *testing.T) {
 	got, err = resolveSshConfig(legacy, settings)
 	if err != nil || got != legacy {
 		t.Fatalf("legacy config should pass through unchanged")
+	}
+}
+
+// Windows 上 PATH 的键名是 Path，且不能同时存在 PATH/Path（子进程取哪个未定义）。
+func TestInjectLocalToolHomesUsesPlatformPathKey(t *testing.T) {
+	settings := model.Settings{ToolCategories: []model.ToolCategory{
+		{ID: "jdk", Installations: []model.ToolInstallation{{Name: "JDK", Home: "/opt/jdk-17"}}},
+	}}
+	env := map[string]string{"PATH": "/usr/bin", "Path": "/usr/bin"}
+	injectLocalToolHomes(settings, env)
+
+	pathKeys := 0
+	for key := range env {
+		if strings.EqualFold(key, "PATH") {
+			pathKeys++
+		}
+	}
+	if pathKeys != 1 {
+		t.Fatalf("exactly one PATH-like key expected, got %d (%v)", pathKeys, env)
+	}
+	wantKey := "PATH"
+	if runtime.GOOS == "windows" {
+		wantKey = "Path"
+	}
+	if _, ok := env[wantKey]; !ok {
+		t.Fatalf("expected key %q on %s, got %v", wantKey, runtime.GOOS, env)
+	}
+}
+
+// Git 在 Windows 上的可执行文件在 cmd/ 下，PATH 要包含它。
+func TestToolBinDirsPerCategory(t *testing.T) {
+	dirs := toolBinDirs("git", filepath.FromSlash("/opt/git"))
+	if runtime.GOOS == "windows" {
+		if filepath.Base(dirs[0]) != "cmd" {
+			t.Fatalf("windows git must put cmd first: %v", dirs)
+		}
+	} else if filepath.Base(dirs[0]) != "bin" {
+		t.Fatalf("linux git must put bin first: %v", dirs)
+	}
+	nodeDirs := toolBinDirs("nodejs", filepath.FromSlash("/opt/node"))
+	if nodeDirs[0] != filepath.FromSlash("/opt/node") {
+		t.Fatalf("node home itself must come first: %v", nodeDirs)
 	}
 }

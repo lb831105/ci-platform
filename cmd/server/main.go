@@ -23,6 +23,7 @@ import (
 	"ci-platform/internal/router"
 	"ci-platform/internal/service"
 	"ci-platform/internal/store"
+	"ci-platform/internal/tools"
 )
 
 // 以下变量由构建脚本通过 -ldflags "-X main.buildVersion=..." 注入，
@@ -81,8 +82,8 @@ func main() {
 	if err := logger.Init(logger.Options{
 		Dir:           filepath.Join(cfg.DataHome, "logs"),
 		Level:         level,
-		RetainMonths:  cfg.LogRetainMonths,
-		RetainForever: cfg.LogRetainMonths == 0,
+		RetainDays:    cfg.LogRetainDays,
+		RetainForever: cfg.LogRetainDays == 0,
 		Stdout:        os.Stderr,
 		Sink:          logBuffer,
 	}); err != nil {
@@ -91,8 +92,8 @@ func main() {
 	}
 	defer func() { _ = logger.Close() }()
 
-	logger.Infof("ci-platform version=%s commit=%s built=%s level=%s log_dir=%s retain_months=%d",
-		buildVersion, buildCommit, buildDate, level, logger.CurrentFile(), cfg.LogRetainMonths)
+	logger.Infof("ci-platform version=%s commit=%s built=%s level=%s log_file=%s retain_days=%d",
+		buildVersion, buildCommit, buildDate, level, logger.CurrentFile(), cfg.LogRetainDays)
 
 	// 1. 运行时目录（文件即数据库）
 	for _, dir := range []string{cfg.JobsDir(), cfg.WorkspaceDir()} {
@@ -206,6 +207,15 @@ func main() {
 	authHandler.SetRBAC(rbacSvc)
 	systemHandler := handler.NewSystemHandler(systemSvc, authSvc)
 	credentialHandler := handler.NewCredentialHandler(credentialSvc)
+	// 工具自动安装：下载到 data/tools，构建时按需调用（首次会下载）。
+	toolInstaller := tools.NewInstaller(cfg.ToolsDir(), cfg.ToolsMirror, func(format string, args ...any) {
+		logger.Infof(format, args...)
+	})
+	buildSvc.SetToolInstaller(toolInstaller)
+	// 后台安装任务随进程结束而中止（下载中的半成品不会写标记，下次会重下）。
+	defer toolInstaller.Close()
+	toolsHandler := handler.NewToolsHandler(toolInstaller)
+
 	rbacHandler := handler.NewRbacHandler(rbacSvc, authSvc)
 	rbacHandler.SetPipelines(pipelineSvc)
 	// 历史用户可能没有邮箱（旧版本允许留空）：启动时显式告警，
@@ -252,6 +262,7 @@ func main() {
 		Portability:     portabilityHandler,
 		AuthService:     authSvc,
 		RBACService:     rbacSvc,
+		Tools:           toolsHandler,
 		PipelineService: pipelineSvc,
 		AuditService:    auditSvc,
 		WebAssets:       webAssets,
@@ -431,14 +442,23 @@ func defaultSettings(cfg *config.Config) model.Settings {
 
 // defaultToolCategories 预置常用工具类别，对应 Jenkins「全局工具配置」。
 // 平台直接使用服务器上已安装的工具，安装项填写工具主目录（JAVA_HOME / GOROOT 等）。
+// defaultToolCategories 返回默认的「全局工具配置」。
+//
+// 默认就按**自动安装**填好（Jenkins 里对应「Install automatically」）：
+// 新部署的机器上不用先去装 JDK/Node，第一次构建时平台自己下载解压。
+// 只有被任务真正用到的工具才会下载（任务里选了该工具，或步骤里调用了对应命令），
+// 所以预置这些条目不会让首次构建凭空下载几百 MB。
 func defaultToolCategories() []model.ToolCategory {
 	return []model.ToolCategory{
 		{
 			ID:    "jdk",
 			Title: "JDK 安装",
-			Hint:  "填写服务器上的 JDK 主目录（JAVA_HOME），如 C:/Program Files/Java/jdk-17",
+			Hint:  "构建 Java 项目需要；也可改用手动路径指向服务器已装的 JDK",
 			Installations: []model.ToolInstallation{
-				{Name: "JDK 17"},
+				{Name: "JDK 17", InstallMode: model.ToolInstallAuto, Version: "17.0.12+7",
+					Note: "Temurin 17 LTS"},
+				{Name: "JDK 8", InstallMode: model.ToolInstallAuto, Version: "8u422-b05",
+					Note: "老项目用（1.8）"},
 			},
 		},
 		{
@@ -452,37 +472,42 @@ func defaultToolCategories() []model.ToolCategory {
 		{
 			ID:    "golang",
 			Title: "Golang 安装",
-			Hint:  "填写服务器上的 Go 主目录（GOROOT），如 C:/Program Files/Go",
+			Hint:  "Go 项目；也可改用手动路径指向服务器已装的 Go",
 			Installations: []model.ToolInstallation{
-				{Name: "Go"},
+				{Name: "Go 1.23.2", InstallMode: model.ToolInstallAuto, Version: "1.23.2"},
 			},
 		},
 		{
-			ID:            "gradle",
-			Title:         "Gradle 安装",
-			Hint:          "填写服务器上的 Gradle 主目录（GRADLE_HOME）",
-			Installations: []model.ToolInstallation{},
+			ID:    "gradle",
+			Title: "Gradle 安装",
+			Hint:  "Gradle 项目；也可改用手动路径",
+			Installations: []model.ToolInstallation{
+				{Name: "Gradle 8.10.2", InstallMode: model.ToolInstallAuto, Version: "8.10.2"},
+			},
 		},
 		{
-			ID:            "ant",
-			Title:         "Ant 安装",
-			Hint:          "填写服务器上的 Ant 主目录（ANT_HOME）",
-			Installations: []model.ToolInstallation{},
+			ID:    "ant",
+			Title: "Ant 安装",
+			Hint:  "Ant 项目；也可改用手动路径",
+			Installations: []model.ToolInstallation{
+				{Name: "Ant 1.10.14", InstallMode: model.ToolInstallAuto, Version: "1.10.14"},
+			},
 		},
 		{
 			ID:    "maven",
 			Title: "Maven 安装",
-			Hint:  "填写服务器上的 Maven 主目录（MAVEN_HOME）",
+			Hint:  "Maven 项目；也可改用手动路径指向服务器已装的 Maven",
 			Installations: []model.ToolInstallation{
-				{Name: "Maven"},
+				{Name: "Maven 3.9.9", InstallMode: model.ToolInstallAuto, Version: "3.9.9"},
 			},
 		},
 		{
 			ID:    "nodejs",
 			Title: "NodeJS 安装",
-			Hint:  "填写服务器上的 Node 主目录（NODE_HOME），如 C:/Program Files/nodejs",
+			Hint:  "前端项目；也可改用手动路径指向服务器已装的 Node.js",
 			Installations: []model.ToolInstallation{
-				{Name: "NodeJS"},
+				{Name: "Node 20", InstallMode: model.ToolInstallAuto, Version: "20.18.0",
+					Note: "LTS"},
 			},
 		},
 	}

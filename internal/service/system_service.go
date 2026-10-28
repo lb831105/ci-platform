@@ -175,9 +175,9 @@ func (s *SystemService) LogEntries(n int) []pkg.LogEntry {
 // LogFile 返回当前正在写入的日志文件与保留策略，便于运维直接去服务器上看。
 func (s *SystemService) LogFile() map[string]interface{} {
 	return map[string]interface{}{
-		"file":          logger.CurrentFile(),
-		"level":         logger.LevelOf().String(),
-		"retain_months": s.cfg.LogRetainMonths,
+		"file":        logger.CurrentFile(),
+		"level":       logger.LevelOf().String(),
+		"retain_days": s.cfg.LogRetainDays,
 	}
 }
 

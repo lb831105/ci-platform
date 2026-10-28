@@ -15,6 +15,17 @@ export interface Build {
   exit_code: number
   // 本次构建实际使用的参数值（触发时快照）；非参数化任务为空。
   params?: Record<string, string>
+  // 构建失败时后端给出的可执行修复建议（目前用于产物模式没匹配到文件）
+  advice?: BuildAdvice
+}
+
+export interface BuildAdvice {
+  // 目前只有 'artifact_pattern'，后续新增种类时前端按字符串匹配即可
+  kind: string
+  message: string
+  patterns?: string[]
+  suggested?: string[]
+  files?: string[]
 }
 
 export interface BuildLogPayload {

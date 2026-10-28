@@ -1,12 +1,13 @@
-// Package logger 提供带级别的文件日志：**按天切文件、按月轮换**。
+// Package logger 提供带级别的文件日志：**一天一个文件，按天数保留（默认 30 天）**。
 //
 // 目录结构：
 //
-//	data/logs/2026-10/app-2026-10-25.log    ← 当月的每天一个文件
-//	data/logs/2026-09/app-2026-09-30.log    ← 上个月（满一个月后整体归档）
+//	data/logs/2026-10/app-2026-10-25.log    ← 每天一个文件
+//	data/logs/2026-09/app-2026-09-30.log    ← 上个月（仍按天分文件）
 //
 // 为什么"天文件 + 月目录"：排障是按天定位的（`grep 2026-10-25`），
-// 而清理与归档是按月的（否则一年就是 365 个文件堆在一个目录里）。
+// 但一年 365 个文件堆在一个目录里翻起来难受，所以用月份目录分层；
+// 清理按天算（保留最近 N 天），过期文件逐日删除，空的月份目录一并清掉。
 //
 // 为什么不引入 zap/zerolog：本平台定位是零依赖单二进制，日志量级是"单机 CI"，
 // 需要的能力只有三项——级别过滤、按月切文件、保留 N 个月。标准库 + 200 行足够，
@@ -18,7 +19,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -75,9 +75,9 @@ type Options struct {
 	Dir string
 	// Level 是最低输出级别。
 	Level Level
-	// RetainMonths 是保留的月份数（<=0 时默认 12，<=0 且显式 -1 表示永久保留）。
-	RetainMonths int
-	// RetainForever 为 true 时不清理历史月份文件。
+	// RetainDays 是保留的天数（<=0 时默认 30）。
+	RetainDays int
+	// RetainForever 为 true 时不清理历史文件（RetainForever 优先）。
 	RetainForever bool
 	// Stdout 是控制台输出目标（默认 os.Stderr，保持与原 log 包一致）。
 	Stdout io.Writer
@@ -259,37 +259,89 @@ func (l *Logger) ensureFileLocked(now time.Time) error {
 	return nil
 }
 
-// dropOldLocked 按月清理：整月目录一起删。
-// 按月轮换的前提是有人清理，否则一年后就是 12 个目录堆积（每个都可能很大）。
+// dropOldLocked 按天清理：删除保留期之外的日志文件，并清掉变空的月份目录。
+//
+// 保留策略是"最近 N 天"（默认 30），所以清理也按天判定；
+// 月份目录只是分层存放，不再作为清理单位（否则会出现"想要 30 天，却按整月删/留"）。
 func (l *Logger) dropOldLocked(now time.Time) {
-	if l.opt.Dir == "" || l.opt.RetainForever || l.opt.RetainMonths <= 0 {
+	if l.opt.Dir == "" || l.opt.RetainForever {
 		return
 	}
-	// 保留到 now 往前推 RetainMonths-1 个月（含当月）。
-	cutoff := now.AddDate(0, -(l.opt.RetainMonths - 1), 0).Format("2006-01")
+	retain := l.opt.RetainDays
+	if retain <= 0 {
+		retain = 30
+	}
+	// 保留今天在内的最近 retain 天。
+	cutoff := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, -(retain - 1))
 	entries, err := os.ReadDir(l.opt.Dir)
 	if err != nil {
 		return
 	}
-	var months []string
-	for _, e := range entries {
-		name := e.Name()
-		// 只处理形如 2026-10 的月目录，其它内容（人工放的文件）一律不碰。
-		if !e.IsDir() || len(name) != len("2006-01") || name[4] != '-' {
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() {
+			// 兼容旧版本写在根目录的 app-YYYY-MM.log：按名字里的月份判断是否过期。
+			if month, ok := monthFromFileName(name); ok && month < cutoff.Format("2006-01") {
+				_ = os.Remove(filepath.Join(l.opt.Dir, name))
+			}
 			continue
 		}
 		if !isMonthName(name) {
+			continue // 用户自己建的目录不碰
+		}
+		dir := filepath.Join(l.opt.Dir, name)
+		files, readErr := os.ReadDir(dir)
+		if readErr != nil {
 			continue
 		}
-		months = append(months, name)
-	}
-	sort.Strings(months)
-	for _, name := range months {
-		// 月份是定长字符串，字典序即时间序。
-		if name < cutoff {
-			_ = os.RemoveAll(filepath.Join(l.opt.Dir, name))
+		remaining := 0
+		for _, file := range files {
+			if file.IsDir() {
+				remaining++
+				continue
+			}
+			day, ok := dayFromFileName(file.Name())
+			if !ok {
+				remaining++
+				continue
+			}
+			// 只比较日期（文件名里的日期没有时区信息），用格式化后的字符串比较。
+			if day.Format("2006-01-02") < cutoff.Format("2006-01-02") {
+				_ = os.Remove(filepath.Join(dir, file.Name()))
+				continue
+			}
+			remaining++
+		}
+		// 整月都过期后目录变空：顺手删掉，避免 logs 下堆一堆空目录。
+		if remaining == 0 {
+			_ = os.Remove(dir)
 		}
 	}
+}
+
+// dayFromFileName 从 app-YYYY-MM-DD.log 解析日期。
+func dayFromFileName(name string) (time.Time, bool) {
+	if !strings.HasPrefix(name, "app-") || !strings.HasSuffix(name, ".log") {
+		return time.Time{}, false
+	}
+	raw := strings.TrimSuffix(strings.TrimPrefix(name, "app-"), ".log")
+	day, err := time.Parse("2006-01-02", raw)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return day, true
+}
+
+// monthFromFileName 从旧版 app-YYYY-MM.log 解析月份（返回 2006-01 形式的字符串）。
+func monthFromFileName(name string) (string, bool) {
+	if !strings.HasPrefix(name, "app-") || !strings.HasSuffix(name, ".log") {
+		return "", false
+	}
+	raw := strings.TrimSuffix(strings.TrimPrefix(name, "app-"), ".log")
+	if len(raw) != len("2006-01") || raw[4] != '-' {
+		return "", false
+	}
+	return raw, true
 }
 
 // isMonthName 判断目录名是否是 YYYY-MM（避免误删用户自己建的目录）。

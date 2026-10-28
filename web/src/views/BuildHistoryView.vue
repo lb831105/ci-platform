@@ -77,6 +77,43 @@ onMounted(async () => {
   }
 })
 
+// latestAdvice 取**最近一次构建**的修复建议（目前是"产物模式没匹配到文件"）。
+//
+// 必须只看最新一条：按"最近一次带建议的失败"取会把已经修好、
+// 后续构建都成功的历史失败一直挂在页面顶部，看起来像还没修。
+const latestAdvice = computed(() => {
+  const newest = history.value[0]
+  if (!newest || newest.status !== 'failed') {
+    return null
+  }
+  return newest.advice ?? null
+})
+
+const applyingAdvice = ref(false)
+
+async function applyAdvice(): Promise<void> {
+  const advice = latestAdvice.value
+  const current = job.value
+  if (!advice?.suggested?.length || !current) {
+    return
+  }
+  applyingAdvice.value = true
+  try {
+    const payload = toPayload(current)
+    payload.artifacts = { ...payload.artifacts, files: advice.suggested }
+    const updated = await save(props.pipelineId, payload)
+    if (updated) {
+      job.value = updated
+    }
+    ElMessage.success(`产物模式已改为 ${advice.suggested.join(', ')}，重新构建即可`)
+    await overview.fetch(true)
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    applyingAdvice.value = false
+  }
+}
+
 // ---- 构建列表按日期分组（对齐 Jenkins 的 Builds 时间线） ----
 
 interface BuildGroup {
@@ -311,6 +348,54 @@ async function onRename(): Promise<void> {
   }
 }
 
+// toPayload 把任务配置转成完整保存负载：
+// 描述编辑、产物建议修正等「只改一处」的操作都必须原样带回其它字段，
+// 否则后端会把未提交的配置清空（触发器、参数、发布、工具版本…）。
+function toPayload(pipeline: Pipeline, description = pipeline.description): PipelinePayload {
+  return {
+    name: pipeline.name,
+    description,
+    image: '',
+    steps: pipeline.steps.map((step) => ({ ...step })),
+    git_url: pipeline.git_url,
+    git_branch: pipeline.git_branch,
+    // 每个任务的工具版本选择必须原样带回（只改描述也不能丢）
+    tool_selections: { ...(pipeline.tool_selections ?? {}) },
+    git_credential_id: pipeline.git_credential_id ?? '',
+    webhook_secret: pipeline.webhook_secret,
+    // 触发器策略与状态回写：编辑/只改描述时都必须原样带回，否则保存会清空配置。
+    webhook_branch_mode: pipeline.webhook_branch_mode ?? '',
+    webhook_branches: [...(pipeline.webhook_branches ?? [])],
+    webhook_events: [...(pipeline.webhook_events ?? [])],
+    commit_status: {
+      enabled: pipeline.commit_status?.enabled ?? false,
+      credential_id: pipeline.commit_status?.credential_id ?? '',
+      project: pipeline.commit_status?.project ?? '',
+    },
+    build_retention_max_per_job: pipeline.build_retention_max_per_job ?? 0,
+    build_retention_max_age_days: pipeline.build_retention_max_age_days ?? 0,
+    cron_spec: pipeline.cron_spec ?? '',
+    notify: pipeline.notify ?? null,
+    delete_workspace_before_build: pipeline.delete_workspace_before_build ?? false,
+    artifacts: {
+      enabled: pipeline.artifacts?.enabled ?? false,
+      files: [...(pipeline.artifacts?.files ?? [])],
+      allow_empty: pipeline.artifacts?.allow_empty ?? false,
+    },
+    ssh_publish: pipeline.ssh_publish
+      ? { ...pipeline.ssh_publish, password: '', source_files: [...pipeline.ssh_publish.source_files] }
+      : null,
+    // 只改描述也要带回参数定义，否则后端会把参数化构建「清空」。
+    params: (pipeline.params ?? []).map((def) => ({ ...def, options: [...(def.options ?? [])] })),
+    // 只改描述也要带回发布配置，否则后端会把多目标当成「全部删除」。
+    ssh_publishes: (pipeline.ssh_publishes ?? []).map((item) => ({
+      ...item,
+      password: '',
+      source_files: [...(item.source_files ?? [])],
+    })),
+  }
+}
+
 async function onEditDescription(): Promise<void> {
   if (!job.value) {
     return
@@ -327,46 +412,7 @@ async function onEditDescription(): Promise<void> {
   } catch {
     return
   }
-  const p = job.value
-  const payload: PipelinePayload = {
-    name: p.name,
-    description: value,
-    image: '',
-    steps: p.steps.map((step) => ({ ...step })),
-    git_url: p.git_url,
-    git_branch: p.git_branch,
-    git_credential_id: p.git_credential_id ?? '',
-    webhook_secret: p.webhook_secret,
-    // 触发器策略与状态回写：编辑/只改描述时都必须原样带回，否则保存会清空配置。
-    webhook_branch_mode: p.webhook_branch_mode ?? '',
-    webhook_branches: [...(p.webhook_branches ?? [])],
-    webhook_events: [...(p.webhook_events ?? [])],
-    commit_status: {
-      enabled: p.commit_status?.enabled ?? false,
-      credential_id: p.commit_status?.credential_id ?? '',
-      project: p.commit_status?.project ?? '',
-    },
-    build_retention_max_per_job: p.build_retention_max_per_job ?? 0,
-    build_retention_max_age_days: p.build_retention_max_age_days ?? 0,
-    cron_spec: p.cron_spec ?? '',
-    notify: p.notify ?? null,
-    delete_workspace_before_build: p.delete_workspace_before_build ?? false,
-    artifacts: {
-      enabled: p.artifacts?.enabled ?? false,
-      files: [...(p.artifacts?.files ?? [])],
-    },
-    ssh_publish: p.ssh_publish
-      ? { ...p.ssh_publish, password: '', source_files: [...p.ssh_publish.source_files] }
-      : null,
-    // 只改描述也要带回参数定义，否则后端会把参数化构建「清空」。
-    params: (p.params ?? []).map((def) => ({ ...def, options: [...(def.options ?? [])] })),
-    // 只改描述也要带回发布配置，否则后端会把多目标当成「全部删除」。
-    ssh_publishes: (p.ssh_publishes ?? []).map((item) => ({
-      ...item,
-      password: '',
-      source_files: [...(item.source_files ?? [])],
-    })),
-  }
+  const payload = toPayload(job.value, value)
   try {
     job.value = await save(props.pipelineId, payload)
     await overview.fetch(true)
@@ -477,6 +523,32 @@ function showChanges(): void {
           </div>
           <div v-if="job?.description" class="job__desc">{{ job.description }}</div>
           <div v-else class="muted">暂无描述</div>
+        </el-card>
+
+        <!-- 修复建议：产物模式没匹配到时，直接给出找到的文件与「一键改模式」 -->
+        <el-card v-if="latestAdvice" shadow="never" class="job__card job__advice">
+          <template #header>
+            <div class="job__card-head">
+              <span>本次构建失败：产物归档没匹配到文件</span>
+              <el-button
+                v-if="latestAdvice.suggested?.length && can('job.configure')"
+                type="primary"
+                size="small"
+                :loading="applyingAdvice"
+                @click="applyAdvice"
+              >一键改为 {{ latestAdvice.suggested.join('、') }}</el-button>
+            </div>
+          </template>
+          <div class="job__advice-body">
+            <div class="muted">
+              当前模式 <span class="mono">{{ (latestAdvice.patterns ?? []).join(', ') }}</span>；
+              已先按根目录匹配、再自动按 <span class="mono">**/</span> 递归匹配，两者都没有命中。
+            </div>
+            <div v-if="latestAdvice.files?.length" class="job__advice-files">
+              工作区里找到：
+              <span v-for="file in latestAdvice.files" :key="file" class="mono job__advice-file">{{ file }}</span>
+            </div>
+          </div>
         </el-card>
 
         <el-card shadow="never" class="job__card" v-loading="loading">
@@ -614,6 +686,30 @@ function showChanges(): void {
 }
 .job__card {
   margin-bottom: 16px;
+}
+
+.job__advice {
+  border-color: var(--el-color-warning-light-5, #f3d19e);
+}
+
+.job__advice-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.job__advice-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.job__advice-file {
+  background: var(--el-fill-color-light);
+  border-radius: 4px;
+  padding: 1px 6px;
 }
 .job__desc-head {
   display: flex;

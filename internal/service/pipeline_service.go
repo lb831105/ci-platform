@@ -137,6 +137,9 @@ func (s *PipelineService) Create(ctx context.Context, in *model.Pipeline) (*mode
 	if err := s.validateSshServer(in); err != nil {
 		return nil, err
 	}
+	if err := s.validateToolSelections(in); err != nil {
+		return nil, err
+	}
 	in.ID = s.allocateID()
 	dir := workspaceDirName(in.Name, in.ID)
 	if err := s.ensureWorkspaceDirFree(ctx, in.Name, dir, ""); err != nil {
@@ -163,6 +166,9 @@ func (s *PipelineService) Validate(_ context.Context, in *model.Pipeline) error 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := normalizeAndValidate(in, s.nameRegex(), s.defaultGitBranch()); err != nil {
+		return err
+	}
+	if err := s.validateToolSelections(in); err != nil {
 		return err
 	}
 	return s.validateSshServer(in)
@@ -457,6 +463,10 @@ func normalizeAndValidate(p *model.Pipeline, nameRegex string, defaultBranch ...
 	p.Executor = model.ExecutorLocal
 	// Webhook 触发器策略（事件 / 分支 / 回写），业务规则只在这里校验。
 	if err := normalizeWebhookTrigger(p); err != nil {
+		return err
+	}
+	// 构建工具版本：只允许选「全局工具配置」里真实存在的安装项（Jenkins 也是从列表里选）。
+	if err := normalizeToolSelections(p); err != nil {
 		return err
 	}
 	// 定时构建：保存前校验 cron 语法，避免任务保存成功但永不触发。
@@ -1249,6 +1259,64 @@ func normalizeStepControls(step *model.Step) error {
 	if step.AllowFailure && step.When == model.StepWhenFailure {
 		// 「只在失败时执行」又「允许失败」是自相矛盾的配置，直接提示改配置。
 		return pkg.ErrBadRequest("step %q: when=failure 的步骤不能同时设置 allow_failure", step.Name)
+	}
+	return nil
+}
+
+// normalizeToolSelections 归一化并校验任务级的工具版本选择。
+//
+// 只做格式与"是否存在"的校验：值必须能在对应类别的安装项里找到，
+// 否则构建时会静默退回默认版本，用户以为选了 8 结果用 17 —— 这种坑必须保存时就报错。
+func normalizeToolSelections(p *model.Pipeline) error {
+	if len(p.ToolSelections) == 0 {
+		p.ToolSelections = nil
+		return nil
+	}
+	cleaned := make(map[string]string, len(p.ToolSelections))
+	for rawCategory, rawName := range p.ToolSelections {
+		categoryID := strings.ToLower(strings.TrimSpace(rawCategory))
+		name := strings.TrimSpace(rawName)
+		if categoryID == "" || name == "" {
+			continue // 空选择等于"用默认"，不当作错误
+		}
+		cleaned[categoryID] = name
+	}
+	if len(cleaned) == 0 {
+		p.ToolSelections = nil
+		return nil
+	}
+	p.ToolSelections = cleaned
+	return nil
+}
+
+// validateToolSelections 用当前全局工具配置校验选择（需要 settings，故单独一步）。
+func (s *PipelineService) validateToolSelections(p *model.Pipeline) error {
+	if len(p.ToolSelections) == 0 || s.settings == nil {
+		return nil
+	}
+	settings := s.settings.Current()
+	for categoryID, name := range p.ToolSelections {
+		var category *model.ToolCategory
+		for i := range settings.ToolCategories {
+			if settings.ToolCategories[i].ID == categoryID {
+				category = &settings.ToolCategories[i]
+				break
+			}
+		}
+		if category == nil {
+			return pkg.ErrBadRequest("构建工具版本：平台没有「%s」这个工具类别", categoryID)
+		}
+		found := false
+		for _, item := range category.Installations {
+			if item.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return pkg.ErrBadRequest("构建工具版本：%s 下没有名为「%s」的安装项（请在「系统管理 → 全局工具配置」中添加）",
+				category.Title, name)
+		}
 	}
 	return nil
 }

@@ -17,6 +17,7 @@ import (
 	"ci-platform/internal/executor"
 	"ci-platform/internal/model"
 	"ci-platform/internal/pkg"
+	"ci-platform/internal/tools"
 )
 
 // BuildStore 是 service 依赖的构建记录存储抽象（由 store 包实现）。
@@ -56,7 +57,8 @@ type ArtifactReader interface {
 
 // ArtifactCollector 把构建产物归档到 build 目录（由 executor.ArtifactCollector 实现）。
 type ArtifactCollector interface {
-	Collect(ctx context.Context, workspace, buildDir string, patterns []string, limits executor.ArtifactLimits, out io.Writer) ([]model.ArtifactFile, error)
+	// allowEmpty 表示"没匹配到文件"只告警不失败（见 model.ArtifactConfig.AllowEmpty）。
+	Collect(ctx context.Context, workspace, buildDir string, patterns []string, limits executor.ArtifactLimits, allowEmpty bool, out io.Writer) ([]model.ArtifactFile, error)
 }
 
 // SettingsProvider 提供当前系统配置（由 SettingsService 实现）。
@@ -86,11 +88,18 @@ type BuildService struct {
 	enqueuer       Enqueuer
 	// notifier 负责构建结果通知（项目 × 人员/群 × 事件）；为 nil 时跳过。
 	notifier *NotifyService
+	// toolInstaller 负责「自动安装」的工具（JDK/Maven/Node…）下载；为 nil 时只用已有主目录。
+	toolInstaller *tools.Installer
 
 	// 运行中构建的取消注册表（取消构建用）：key 为 LogKey(pipelineID, buildID)。
 	// 构建开始时注册，结束（含取消/panic）时注销。
 	cancelMu sync.Mutex
 	cancels  map[string]*cancelEntry
+}
+
+// SetToolInstaller 注入工具安装器（自动安装模式的下载/解压）。
+func (s *BuildService) SetToolInstaller(installer *tools.Installer) {
+	s.toolInstaller = installer
 }
 
 // cancelEntry 记录一次运行中构建的取消句柄；cancelled 标记用于区分
@@ -635,6 +644,8 @@ func (s *BuildService) executeStages(ctx context.Context, p *model.Pipeline, b *
 	s.reportCommitStatus(p, b, settings, "running", "构建中")
 
 	// 本地执行：把全局工具配置里填写的主目录注入 PATH/GOROOT/JAVA_HOME 等。
+	// 自动安装的工具先确保已下载（首次会在构建日志里看到下载进度）。
+	settings = s.materializeTools(ctx, p, settings, out)
 	injectLocalToolHomes(settings, env)
 
 	code, err := s.runner.RunSteps(ctx, executor.RunSpec{
@@ -661,8 +672,21 @@ func (s *BuildService) executeStages(ctx context.Context, p *model.Pipeline, b *
 			MaxFiles:      settings.ArtifactMaxFiles,
 			MaxTotalBytes: int64(settings.ArtifactMaxTotalMB) * 1024 * 1024,
 		}
-		if _, err = s.artifacts.Collect(ctx, absWorkspace, s.builds.BuildDir(job.PipelineID, job.BuildID), p.Artifacts.Files, limits, out); err != nil {
-			return 1, fmt.Errorf("archive artifacts: %w", err)
+		if _, err = s.artifacts.Collect(ctx, absWorkspace, s.builds.BuildDir(job.PipelineID, job.BuildID),
+			p.Artifacts.Files, limits, p.Artifacts.AllowEmpty, out); err != nil {
+			// 模式没匹配到是最常见的失败：把"当前模式 / 建议模式 / 找到的文件"
+			// 记进构建记录，前端直接给「一键改成建议模式」。
+			var noMatch *executor.NoMatchError
+			if errors.As(err, &noMatch) {
+				b.Advice = &model.BuildAdvice{
+					Kind:      "artifact_pattern",
+					Message:   noMatch.Error(),
+					Patterns:  noMatch.Patterns,
+					Suggested: noMatch.Suggested,
+					Files:     noMatch.Files,
+				}
+			}
+			return 1, fmt.Errorf("归档产物失败：%w", err)
 		}
 	}
 
@@ -698,6 +722,256 @@ func (s *BuildService) executeStages(ctx context.Context, p *model.Pipeline, b *
 	return 0, nil
 }
 
+// materializeTools 把「自动安装」的工具准备到本地，并检查手动填写的主目录是否存在。
+//
+// 这一步放在构建开始时（而不是保存配置时）：下载可能几十上百 MB，
+// 不该让保存设置这种轻操作卡住；构建日志里能看到进度，失败也能定位到具体工具。
+func (s *BuildService) materializeTools(ctx context.Context, p *model.Pipeline, settings model.Settings, out io.Writer) model.Settings {
+	if len(settings.ToolCategories) == 0 {
+		return settings
+	}
+	// 1) 先应用任务级的版本选择（把选中的安装项提到该类别第一位）
+	effective := applyToolSelections(settings, p)
+
+	// 2) 只准备「这个任务真的会用到」的工具：
+	//    任务里显式选了的类别 + 步骤脚本里出现对应命令的类别。
+	//    否则一个只跑 mvn 的任务会连带把 JDK/Node/Go/Gradle 全下载一遍（几百 MB）。
+	needed := neededToolCategories(effective, p)
+
+	updated := effective
+	updated.ToolCategories = make([]model.ToolCategory, len(effective.ToolCategories))
+	copy(updated.ToolCategories, effective.ToolCategories)
+
+	for i := range updated.ToolCategories {
+		category := &updated.ToolCategories[i]
+		category.Installations = make([]model.ToolInstallation, len(effective.ToolCategories[i].Installations))
+		copy(category.Installations, effective.ToolCategories[i].Installations)
+		used := needed[category.ID]
+		for j := range category.Installations {
+			item := &category.Installations[j]
+			if item.IsAutoInstall() && used {
+				if s.toolInstaller == nil {
+					fmt.Fprintf(out, "[tools] %s %s 配置为自动安装，但当前实例未启用安装器\n", category.Title, item.Version)
+					continue
+				}
+				home, err := s.toolInstaller.Ensure(ctx, category.ID, item.Version)
+				if err != nil {
+					// 下载失败不阻断构建：工具本来就可能用不到，
+					// 但要在日志里说清楚，避免后面 command not found 无从排查。
+					fmt.Fprintf(out, "[tools] 自动安装 %s %s 失败：%v\n", category.Title, item.Version, err)
+					continue
+				}
+				item.Home = home
+				fmt.Fprintf(out, "[tools] %s %s → %s\n", category.Title, item.Version, home)
+				continue
+			}
+			if item.Home != "" && used {
+				if info, err := os.Stat(item.Home); err != nil || !info.IsDir() {
+					fmt.Fprintf(out, "[tools] %s 的主目录不存在：%s（请检查「系统管理 → 全局工具配置」）\n", category.Title, item.Home)
+				}
+			}
+		}
+		// 没用到的类别不注入任何路径：避免"没用到也把 PATH 顶掉"。
+		if !used {
+			for j := range category.Installations {
+				category.Installations[j].Home = ""
+			}
+		}
+	}
+
+	// 步骤里用到的命令 vs 没配置的工具：提前提示，别等 command not found。
+	for _, hint := range missingToolHints(updated, p.Steps) {
+		fmt.Fprintf(out, "[tools] %s\n", hint)
+	}
+	return updated
+}
+
+// applyToolSelections 把任务选中的安装项提到所属类别第一位。
+// 后续注入逻辑统一"取每类第一个可用项"，因此调整顺序即可让选择生效，
+// 不必在多处判断"这个类别有没有被任务指定"。
+func applyToolSelections(settings model.Settings, p *model.Pipeline) model.Settings {
+	if p == nil || len(p.ToolSelections) == 0 {
+		return settings
+	}
+	out := settings
+	out.ToolCategories = make([]model.ToolCategory, len(settings.ToolCategories))
+	for i, category := range settings.ToolCategories {
+		selected, ok := p.ToolSelections[category.ID]
+		copied := model.ToolCategory{ID: category.ID, Title: category.Title, Hint: category.Hint}
+		copied.Installations = make([]model.ToolInstallation, len(category.Installations))
+		copy(copied.Installations, category.Installations)
+		if ok && selected != "" {
+			for j, item := range copied.Installations {
+				if item.Name != selected {
+					continue
+				}
+				picked := copied.Installations[j]
+				copied.Installations = append([]model.ToolInstallation{picked}, append(copied.Installations[:j:j], copied.Installations[j+1:]...)...)
+				break
+			}
+		}
+		out.ToolCategories[i] = copied
+	}
+	return out
+}
+
+// neededToolCategories 返回本任务需要准备好的工具类别集合。
+func neededToolCategories(settings model.Settings, p *model.Pipeline) map[string]bool {
+	needed := map[string]bool{}
+	if p != nil {
+		for categoryID, name := range p.ToolSelections {
+			if strings.TrimSpace(name) != "" {
+				needed[categoryID] = true
+			}
+		}
+	}
+	if p != nil && len(p.Steps) > 0 {
+		var script strings.Builder
+		for _, step := range p.Steps {
+			script.WriteString(step.Run)
+			script.WriteString("\n")
+		}
+		body := script.String()
+		for _, mapping := range toolCommandCategories {
+			for _, cmd := range mapping.commands {
+				if containsCommand(body, cmd) {
+					needed[mapping.categoryID] = true
+					break
+				}
+			}
+		}
+	}
+	return needed
+}
+
+// toolCommandCategories 把常见命令映射到工具类别，用于「用了但没配」的提示。
+var toolCommandCategories = []struct {
+	categoryID string
+	commands   []string
+}{
+	{"jdk", []string{"java", "javac", "keytool"}},
+	{"maven", []string{"mvn"}},
+	{"gradle", []string{"gradle"}},
+	{"ant", []string{"ant"}},
+	{"nodejs", []string{"node", "npm", "npx", "yarn", "pnpm"}},
+	{"golang", []string{"go", "gofmt"}},
+}
+
+// missingToolHints 返回「步骤里用到某个命令，但对应工具没配置主目录」的提示列表。
+func missingToolHints(settings model.Settings, steps []model.Step) []string {
+	configured := map[string]bool{}
+	for _, category := range settings.ToolCategories {
+		for _, item := range category.Installations {
+			if strings.TrimSpace(item.Home) != "" {
+				configured[category.ID] = true
+				break
+			}
+		}
+	}
+	// 把步骤脚本拼起来做关键字判断：比精确解析 shell 简单，且只用于提示。
+	var script strings.Builder
+	for _, step := range steps {
+		script.WriteString(step.Run)
+		script.WriteString("\n")
+	}
+	body := script.String()
+	var hints []string
+	for _, mapping := range toolCommandCategories {
+		if configured[mapping.categoryID] {
+			continue
+		}
+		for _, cmd := range mapping.commands {
+			if containsCommand(body, cmd) {
+				hints = append(hints, fmt.Sprintf(
+					"步骤里用到 %q，但「全局工具配置 → %s」没有可用的主目录（可能会 command not found）；可在那里填写服务器路径或选择自动安装",
+					cmd, toolCategoryTitle(settings, mapping.categoryID)))
+				break
+			}
+		}
+	}
+	return hints
+}
+
+// containsCommand 判断脚本里是否**以命令的形式**调用了某个可执行文件。
+//
+// 只认"命令的第一个词"：前面要么是行首/分隔符（; && || | ( ），
+// 要么是 sudo/env/nohup 这类包装命令。这样 `echo jar > app.jar` 这种
+// 把命令名当参数的写法不会被误判成"用到了 jar 工具"——误判会让构建
+// 白白去下载一个 190MB 的 JDK。
+func containsCommand(script, cmd string) bool {
+	idx := 0
+	for {
+		pos := strings.Index(script[idx:], cmd)
+		if pos < 0 {
+			return false
+		}
+		start := idx + pos
+		end := start + len(cmd)
+		idx = end
+		if start > 0 && !isCommandBoundary(script[start-1]) {
+			continue
+		}
+		if end < len(script) && !isCommandBoundary(script[end]) {
+			continue
+		}
+		if isCommandStart(script, start) {
+			return true
+		}
+	}
+}
+
+// commandWrappers 是可以出现在真正命令前面的包装命令。
+var commandWrappers = map[string]bool{
+	"sudo": true, "env": true, "nohup": true, "time": true,
+	"exec": true, "command": true, "builtin": true, "xargs": true,
+}
+
+// isCommandStart 判断 cmd 在 start 位置是否是"命令的第一个词"。
+// 做法：往前跳过空白，看上一个是行首/分隔符，还是包装命令。
+func isCommandStart(script string, start int) bool {
+	i := start - 1
+	for i >= 0 {
+		ch := script[i]
+		if ch == ' ' || ch == '\t' {
+			i--
+			continue
+		}
+		if ch == '\n' || ch == '\r' || ch == ';' || ch == '&' || ch == '|' || ch == '(' || ch == '`' {
+			return true
+		}
+		if ch == '=' {
+			// FOO=npm 这种变量赋值不是执行
+			return false
+		}
+		// 前面还有词：只有包装命令才算命令起点
+		wordEnd := i + 1
+		for i >= 0 && !isCommandBoundary(script[i]) {
+			i--
+		}
+		word := script[i+1 : wordEnd]
+		return commandWrappers[word]
+	}
+	return true
+}
+
+func isCommandBoundary(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\n', '\r', ';', '&', '|', '(', ')', '`', '$', '"', '\'', ':', '=', '/', '\\':
+		return true
+	}
+	return false
+}
+
+// toolCategoryTitle 返回类别标题，未知类别回退 ID。
+func toolCategoryTitle(settings model.Settings, categoryID string) string {
+	for _, category := range settings.ToolCategories {
+		if category.ID == categoryID {
+			return category.Title
+		}
+	}
+	return categoryID
+}
+
 // toolHomeEnvKey 返回工具类别对应的“主目录”环境变量名。
 func toolHomeEnvKey(categoryID string) string {
 	switch strings.ToLower(categoryID) {
@@ -718,8 +992,13 @@ func toolHomeEnvKey(categoryID string) string {
 }
 
 // injectLocalToolHomes 把全局工具配置中每个类别第一个填写了 home 的安装项
-// 注入为环境变量（JAVA_HOME/GOROOT/...），并把其 bin 目录前置到 PATH。
+// 注入为环境变量（JAVA_HOME/GOROOT/...），并把其可执行目录前置到 PATH。
 // 本地执行器据此使用服务器上指定路径的工具（例如指定 GOROOT 后直接用该 Go 编译）。
+//
+// Windows / Linux 差异集中在这里处理：
+//   - PATH 变量名在 Windows 上通常是 Path，写死 "PATH" 会让某些子进程读不到；
+//   - Windows 版 Git 的 git.exe 在 cmd/ 下（不是 bin/），Node 的 npm.cmd 在主目录本身；
+//   - Windows 上执行 .cmd/.bat 需要额外把主目录放进 PATH。
 func injectLocalToolHomes(settings model.Settings, env map[string]string) {
 	var bins []string
 	for _, category := range settings.ToolCategories {
@@ -729,29 +1008,83 @@ func injectLocalToolHomes(settings model.Settings, env map[string]string) {
 				continue
 			}
 			home = filepath.FromSlash(home)
-			if category.ID == "git" {
-				gitExe := filepath.Join(home, "bin", "git")
-				if runtime.GOOS == "windows" {
-					gitExe += ".exe"
+			switch category.ID {
+			case "git":
+				env["GIT_EXECUTABLE"] = gitExecutable(home)
+				bins = append(bins, toolBinDirs("git", home)...)
+			default:
+				if key := toolHomeEnvKey(category.ID); key != "" {
+					env[key] = home
 				}
-				env["GIT_EXECUTABLE"] = gitExe
-			} else if key := toolHomeEnvKey(category.ID); key != "" {
-				env[key] = home
+				bins = append(bins, toolBinDirs(category.ID, home)...)
 			}
-			// Windows 版 Node 的可执行文件直接位于主目录（node.exe/npm.cmd），
-			// 其他工具通常在 bin 下；两者都加入 PATH 可同时兼容。
-			bins = append(bins, filepath.Join(home, "bin"), home)
 			break // 每个类别取第一个配置了主目录的安装项
 		}
 	}
 	if len(bins) == 0 {
 		return
 	}
-	base := env["PATH"]
-	if base == "" {
-		base = os.Getenv("PATH")
+	base := envPath(env)
+	setEnvPath(env, strings.Join(bins, string(os.PathListSeparator))+string(os.PathListSeparator)+base)
+}
+
+// toolBinDirs 返回某个工具主目录下需要加入 PATH 的目录（按优先级）。
+func toolBinDirs(categoryID, home string) []string {
+	switch categoryID {
+	case "git":
+		// Git for Windows: git.exe 在 cmd/，bash 工具在 bin/；Linux 只有 bin/。
+		if runtime.GOOS == "windows" {
+			return []string{filepath.Join(home, "cmd"), filepath.Join(home, "bin"), home}
+		}
+		return []string{filepath.Join(home, "bin"), home}
+	case "nodejs":
+		// node/npm(.cmd) 直接位于 Node 主目录，部分发行版放在 bin/。
+		return []string{home, filepath.Join(home, "bin")}
+	default:
+		// JDK / Maven / Gradle / Ant / Go：可执行文件都在 bin/ 下。
+		return []string{filepath.Join(home, "bin"), home}
 	}
-	env["PATH"] = strings.Join(bins, string(os.PathListSeparator)) + string(os.PathListSeparator) + base
+}
+
+// gitExecutable 找到 git 可执行文件的实际位置（Windows 在 cmd/，Linux 在 bin/）。
+func gitExecutable(home string) string {
+	candidates := []string{filepath.Join(home, "bin", "git"), filepath.Join(home, "cmd", "git"), filepath.Join(home, "git")}
+	if runtime.GOOS == "windows" {
+		for i := range candidates {
+			candidates[i] += ".exe"
+		}
+	}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return candidates[0] // 都不存在时给出常规位置，让日志里的路径可读
+}
+
+// envPath 读取 PATH（Windows 上键名可能写作 Path）。
+func envPath(env map[string]string) string {
+	for key, value := range env {
+		if strings.EqualFold(key, "PATH") && value != "" {
+			return value
+		}
+	}
+	return os.Getenv("PATH")
+}
+
+// setEnvPath 写入 PATH 并清理大小写重复的键
+// （同时存在 PATH 与 Path 时，Windows 子进程取哪个是未定义的）。
+func setEnvPath(env map[string]string, value string) {
+	for key := range env {
+		if strings.EqualFold(key, "PATH") {
+			delete(env, key)
+		}
+	}
+	if runtime.GOOS == "windows" {
+		env["Path"] = value
+		return
+	}
+	env["PATH"] = value
 }
 
 // resolveSshConfig 把任务引用的全局 SSH 服务器与任务级发布参数合并成完整配置。

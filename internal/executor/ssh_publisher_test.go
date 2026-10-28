@@ -44,7 +44,7 @@ func TestMatchFiles(t *testing.T) {
 		}
 	}
 
-	files, err := matchFiles(workspace, []string{"target/*.jar"})
+	files, _, err := matchFiles(workspace, []string{"target/*.jar"})
 	if err != nil {
 		t.Fatalf("matchFiles: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestMatchFiles(t *testing.T) {
 	}
 
 	// 目录必须被过滤掉
-	dirs, err := matchFiles(workspace, []string{"target/*"})
+	dirs, _, err := matchFiles(workspace, []string{"target/*"})
 	if err != nil {
 		t.Fatalf("matchFiles: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestMatchFiles(t *testing.T) {
 		t.Fatalf("directories must be filtered out, got %d (%v)", len(dirs), dirs)
 	}
 
-	if _, err = matchFiles(workspace, nil); err == nil {
+	if _, _, err = matchFiles(workspace, nil); err == nil {
 		t.Fatalf("empty source_files must be rejected")
 	}
 }
@@ -89,7 +89,7 @@ func TestMatchFilesRecursive(t *testing.T) {
 		{"other.txt", 1},
 	}
 	for _, c := range cases {
-		files, err := matchFiles(workspace, []string{c.pattern})
+		files, _, err := matchFiles(workspace, []string{c.pattern})
 		if err != nil {
 			t.Fatalf("matchFiles(%q): %v", c.pattern, err)
 		}
@@ -132,7 +132,7 @@ func TestMatchFilesRejectsTraversal(t *testing.T) {
 		t.Fatalf("write outside: %v", err)
 	}
 	for _, pattern := range []string{"../secret.txt", "../../etc/passwd", "/etc/passwd", "..", "../"} {
-		if _, err := matchFiles(workspace, []string{pattern}); err == nil {
+		if _, _, err := matchFiles(workspace, []string{pattern}); err == nil {
 			t.Errorf("pattern %q should be rejected (path traversal)", pattern)
 		}
 	}

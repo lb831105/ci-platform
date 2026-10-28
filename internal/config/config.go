@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,10 +32,13 @@ type Config struct {
 	ShutdownTimeout time.Duration // 优雅停机等待运行中构建的最长时间
 
 	// 认证配置：基础版单管理员账号 + 内存会话。
-	AuthEnabled  bool          // 是否开启登录校验
-	AuthUser     string        // 管理员用户名
-	AuthPassword string        // 管理员密码
-	AuthTokenTTL time.Duration // 登录会话有效期
+	AuthEnabled  bool   // 是否开启登录校验
+	AuthUser     string // 管理员用户名
+	AuthPassword string // 管理员密码（未显式配置时首次启动随机生成）
+	// AuthPasswordGenerated 表示密码不是用户显式设置的；main 只在它确实生效时
+	// 输出一次，避免日志重复泄露。
+	AuthPasswordGenerated bool
+	AuthTokenTTL          time.Duration // 登录会话有效期
 
 	// ShowVersion 不是运行配置，而是「-version」这样的启动期一次性动作标记，
 	// 由 main 读取后打印版本并立即退出。
@@ -42,6 +47,14 @@ type Config struct {
 
 // Load 从环境变量装载配置。
 func Load() *Config {
+	authPassword := os.Getenv("CI_AUTH_PASSWORD")
+	generated := false
+	if authPassword == "" {
+		// 不再使用 admin/admin 作为默认口令：首次启动生成随机密码，
+		// 由 main 在确认它真的生效后输出一次。
+		authPassword = randomPassword(16)
+		generated = true
+	}
 	return &Config{
 		Addr:          env("CI_ADDR", ":8080"),
 		DataHome:      env("CI_DATA_HOME", "./data"),
@@ -62,11 +75,22 @@ func Load() *Config {
 		TrustProxy:      envBool("CI_TRUST_PROXY", false),
 		ShutdownTimeout: time.Duration(envInt("CI_SHUTDOWN_TIMEOUT_SECONDS", 30)) * time.Second,
 
-		AuthEnabled:  envBool("CI_AUTH_ENABLED", true),
-		AuthUser:     env("CI_AUTH_USER", "admin"),
-		AuthPassword: env("CI_AUTH_PASSWORD", "admin"),
-		AuthTokenTTL: time.Duration(envInt("CI_AUTH_TOKEN_TTL_MINUTES", 720)) * time.Minute,
+		AuthEnabled:           envBool("CI_AUTH_ENABLED", true),
+		AuthUser:              env("CI_AUTH_USER", "admin"),
+		AuthPassword:          authPassword,
+		AuthPasswordGenerated: generated,
+		AuthTokenTTL:          time.Duration(envInt("CI_AUTH_TOKEN_TTL_MINUTES", 720)) * time.Minute,
 	}
+}
+
+// randomPassword 生成十六进制随机初始密码（长度 2*n）。
+func randomPassword(n int) string {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		// 极少数系统熵源故障：回退到时间戳不可接受（可预测），直接 panic 让运维处理。
+		panic(fmt.Sprintf("generate initial admin password: %v", err))
+	}
+	return hex.EncodeToString(buf)
 }
 
 // Validate 在启动早期拒绝明显错误的参数，避免服务带病运行。

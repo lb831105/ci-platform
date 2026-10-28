@@ -2,6 +2,7 @@ package service
 
 import (
 	"regexp"
+	"strings"
 
 	"ci-platform/internal/model"
 )
@@ -102,6 +103,11 @@ func (s *RBACService) HasAnyOf(user string, globalPerms, jobPerms []string) bool
 		}
 	}
 	for _, role := range s.rolesFor(user, model.RoleKindItem) {
+		// 模板角色（无 Pattern）本身不覆盖任何任务，不能凭它拿到
+		// 凭据清单/通知联系人等「任意任务配置权」入口。
+		if strings.TrimSpace(role.Pattern) == "" {
+			continue
+		}
 		for _, perm := range jobPerms {
 			if role.Has(perm, s.resolveTemplate, 0) {
 				return true

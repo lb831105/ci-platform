@@ -29,7 +29,7 @@ dist\ci-platform-windows-amd64.exe
 默认监听 `:8080`，数据目录 `./data`。
 
 数据目录（任务、构建记录、凭据、设置）可在**系统配置 → 主目录**中修改，修改后写入引导配置 `ci-platform.json`，**重启服务后生效**；保存时可选择把现有任务/凭据/设置迁移到新目录。也可在启动时通过 `-data-home` 或 `CI_DATA_HOME` 指定（优先级高于引导配置），或用 `-config` / `CI_CONFIG_FILE` 改变引导配置文件位置。
-默认开启登录校验，初始账号 `admin`。**部署时请通过启动参数或环境变量指定初始密码**（仅首次初始化生效）：
+默认开启登录校验，初始账号 `admin`。**部署时请通过启动参数或环境变量指定初始密码**（仅首次初始化生效）；未指定时首次启动会生成随机密码并在启动日志中输出一次，不再使用 `admin/admin`：
 
 ```bash
 ./dist/ci-platform-linux-amd64 -auth-user ops -auth-password 'your-password'
@@ -270,7 +270,7 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | `CI_LOG_BUFFER` | `512` | 单 WebSocket 连接日志缓冲行数 |
 | `CI_AUTH_ENABLED` | `true` | 是否开启登录校验（`false` 关闭） |
 | `CI_AUTH_USER` | `admin` | 管理员用户名 |
-| `CI_AUTH_PASSWORD` | `admin` | 管理员密码 |
+| `CI_AUTH_PASSWORD` | 随机生成 | 管理员初始密码；未设置时首次启动随机生成并在日志输出一次 |
 | `CI_AUTH_TOKEN_TTL_MINUTES` | `720` | 登录会话有效期（分钟），会话存内存、重启失效 |
 | `CI_CORS_ORIGINS` | `*` | 允许跨域与 WebSocket 的来源，逗号分隔；生产建议配置精确域名 |
 | `CI_TRUST_PROXY` | `false` | 是否信任反向代理的 `X-Forwarded-For`（服务不直接暴露公网时开启，登录/Webhook 限流取真实 IP） |
@@ -343,13 +343,13 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | POST | `/api/system/webhook/test` | 发送 Webhook 测试通知（钉钉/企微/Slack，管理员） |
 | GET | `/api/notify/contacts` | 平台用户联系方式（任务通知选人用，需任务配置权限） |
 | POST | `/api/pipelines/{pid}/notify/test` | 向该任务配置的人员/群发送测试通知 |
-| PUT | `/api/security/users/contact` | 设置用户通知联系方式（邮箱/企微 ID/手机号，管理员） |
+| PUT | `/api/security/users/contact` | 设置用户姓名与通知联系方式（姓名仅汉字；邮箱/企微 ID/手机号，管理员） |
 | GET | `/api/system/audit?limit=300` | 操作审计日志（最近 N 条，时间倒序，管理员） |
 | GET | `/api/system/notify?limit=&pipeline=&recipient=&status=` | 通知投递记录（按收件人粒度，排查漏收） |
 | GET/PUT | `/api/profile` `/api/profile/contact` | 个人资料：查看 / 自助维护联系方式（任何登录用户）；**修改密码**在「个人资料」页自助完成 |
 | POST | `/api/profile/email/verify` `/api/profile/email/confirm` | 发送邮箱验证码 / 提交验证码确认 |
 | GET | `/api/security/users` | 用户管理页数据：内置管理员 + 平台用户 + 联系方式 + 角色摘要 |
-| POST | `/api/security/users` | 创建平台内用户（bcrypt，管理员） |
+| POST | `/api/security/users` | 创建平台内用户（bcrypt；用户名 + 汉字姓名 + 邮箱，管理员） |
 | POST | `/api/security/users/delete` | 删除用户及授权（管理员） |
 | PUT | `/api/security/users/password` | 管理员重置用户密码（撤销会话） |
 | POST | `/api/system/reload` | 从磁盘重新读取设置 |
@@ -656,7 +656,7 @@ ci-platform/
 | 系统配置 | 执行器 | 本机执行器数量、构建队列、工作区（单机执行，无节点/云编排） |
 | 安全 | 全局安全配置 | 登录开关、管理员账号；修改密码（内置管理员） |
 | 安全 | 凭据管理 | 用户名密码 / 密钥文本的增删改查（密钥不回传）；SSH 私钥类型被明确拒绝——私钥路径配在「SSH 服务器」里 |
-| 安全 | 用户管理 | 账号本身：新建（**邮箱必填**）/ 删除 / 重置密码（撤销会话）/ 联系方式；列表显示角色摘要与邮箱验证状态；内置管理员只读 |
+| 安全 | 用户管理 | 账号本身：新建（**姓名仅汉字、邮箱必填**）/ 删除 / 重置密码（撤销会话）/ 姓名与联系方式；列表显示汉字姓名、角色摘要与邮箱验证状态；内置管理员只读 |
 | 安全 | 管理角色 / 分配角色（对齐 Role-Based Strategy 插件） | 两页都是**一行一个主体**的紧凑布局。「管理角色」：全局角色 / 任务角色（**按任务勾选**自动生成 Pattern，或直接写正则 + `Template` 权限模板继承）+ 权限 chip 横排，Pattern 旁实时预览匹配到哪些任务；「分配角色」：按用户/角色双向筛选 + 角色 chip + 行尾**生效预览**（后端计算实际可见任务数）。**普通用户可被授权管理一个或多个任务**：任务角色的 `job.read/build/configure/delete/replay` 精确生效到 Pattern 覆盖的任务，该用户任务列表只剩这些任务，任务页的「配置/构建/删除/重命名/导出/取消/删除构建/重新发布」按钮按任务名显示，系统管理、凭据、用户管理、角色管理一律拒绝（前端隐藏 + `40300`）。任务配置者额外可读凭据清单（不含密钥）与通知联系人。数据存 `data/rbac.json` |
 | 视图 | 新建视图 / 编辑视图 | 列表视图（显式任务 + 任务名正则）与我的视图（自动显示当前用户有权限访问的任务）；数据存 `data/views.json`；展示列与 Widgets（过滤构建队列/执行器）可配置 |
 | 状态信息 | 系统信息 / 系统日志 / 负载统计 / 关于 | 运行时信息、内存环形日志、队列与磁盘占用、版本 |
@@ -670,7 +670,7 @@ ci-platform/
 - `workers`、`queue_size`、`workspace-ttl`、`clean-interval` 属启动期参数，界面只读并显示**实际生效值**（来自命令行参数，而非 `settings.json` 里的副本），修改需重启。
 - 界面上的每一项都真的影响构建：默认分支会补齐任务空分支、系统管理员邮件地址作为发件人兜底；反过来说，**不会被使用的东西不放界面**（例如 Maven `settings.xml` 内容不再收纳，单元测试般的「仅记录」项会明确标注）。
 - 认证默认只有系统配置里的单管理员账号（密码 bcrypt 落盘，改后重启仍生效，至少 8 个字符）；
-  需要多人协作时在「系统管理 → 用户管理」创建平台用户，并在「Assign Roles」分配角色（邮箱必填）。
+  需要多人协作时在「系统管理 → 用户管理」创建平台用户，并在「Assign Roles」分配角色（姓名仅汉字、邮箱必填）。
 - 系统配置中的「单次产物大小上限（MB）」「单次产物文件数上限」会在归档时强制执行，防止异常产物写满磁盘。
 - 「准备关机（静默模式）」只拒绝**新的**构建入队，不影响正在运行的构建。
 - 以下配置会**直接作用于构建**：静默期（开始前等待）、SCM 重试次数、Shell、Global Time Out、构建保留策略、全局环境变量（含 Maven / Git 相关变量）、邮件通知、Webhook 通知（钉钉/企微/Slack）。
@@ -678,7 +678,8 @@ ci-platform/
   会连同 `data/jobs/{pid}/builds/{bid}` 目录（日志 + 已归档产物）一起删除，需二次确认；
   运行中/排队中的构建需先停止。删除最新构建后编号不会回退（`next_build` 记录）。
 - **用户邮箱必填**：创建用户 / 改联系方式 / 个人资料都要求填写有效邮箱——构建通知按人员发邮件，
-  没有邮箱等于收不到告警。历史遗留的空邮箱会在启动日志告警、用户管理页列出，并在构建日志中以
+  没有邮箱等于收不到告警。创建用户还必须填写 **2-20 个汉字的姓名**（用户名是登录标识，姓名用于界面展示）；
+  历史用户没有姓名时可在「用户管理 → 姓名与联系方式」中补填。历史遗留的空邮箱会在启动日志告警、用户管理页列出，并在构建日志中以
   `[notify] ... 警告：人员 X 未配置邮箱` 提示。
 - **通知按项目挂人/挂群**：在任务的「构建后操作 → 构建通知」里选择平台用户（自动解析其邮箱/企微 ID/手机号）、
   填外部邮箱、添加钉钉/企微/Slack 群机器人，并勾选通知事件（失败 / 成功 / **修复**（上次失败→本次成功）/ 取消）。
@@ -720,13 +721,15 @@ ci-platform/
 - 任务描述（支持 `Edit description` 内联编辑）
 - Builds 列表：按日期分组，每行显示状态球、`#N`、触发原因（`Started by user X` / `Started by webhook`）与时间；
   运行中的构建可「停止」（落 `aborted`），已结束的构建可「删除」（连带 `builds/{bid}` 目录，需 `job.delete` 权限）
+- 全局构建历史（Builds）：S 状态球、`任务名#编号` + 「命令行输出」、相对日期（可按日期排序）、Jenkins 风格状态
+  （稳定 / 返回到正常 / 自从构建 #N 后断开 / 断开很长时间 / 中断）
 - 相关链接：最近一次 / 稳定 / 成功 / 失败 / 未成功 / 完成的构建
 
 数据层：`Pipeline` 新增 `description`，`Build` 新增 `triggered_by`（手动触发记录登录用户名，Webhook 记为 `webhook`）；新增 `POST /api/pipelines/{pid}/rename`。
 
 ### 任务配置页（对齐 Jenkins Configure）
 
-配置页按 Jenkins 分区组织，并提供顶部锚点导航：
+配置页按 Jenkins 2.533 的 General / Triggers / 流水线 / Advanced 页签组织：
 
 | 分区 | 内容 |
 |---|---|

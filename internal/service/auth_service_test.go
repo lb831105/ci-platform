@@ -74,7 +74,7 @@ func TestAuthServiceChangeUserPassword(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new rbac: %v", err)
 	}
-	if err = rbac.AddUser("alice", "alice-pass-1", "alice@example.com"); err != nil {
+	if err = rbac.AddUser("alice", "alice-pass-1", "alice@example.com", "李斌"); err != nil {
 		t.Fatalf("add user: %v", err)
 	}
 	auth := NewAuthService(true, "root", "root-pass-1", time.Hour)

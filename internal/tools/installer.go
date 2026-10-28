@@ -5,6 +5,8 @@ import (
 	"archive/zip"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -284,13 +286,14 @@ func (i *Installer) run(state *taskState, tool Tool, ver Version) {
 
 	i.setState(state, TaskDownloading, 0, 0)
 	i.logf("开始下载 %s %s：%s", tool.Title, ver.Version, url)
-	archive, err := i.download(ctx, url, state)
+	wantSHA := ver.SHA256[platformKey()]
+	archive, err := i.download(ctx, url, wantSHA, state)
 	if err != nil {
 		// 老版本（Maven 3.6.3、Ant 1.9.16 等）已从 dlcdn 下架，只在归档站上；
 		// 有备用地址就再试一次，别让用户为了一个 URL 变更去手动填路径。
 		if fallback := ver.FallbackDownloadURL(i.mirror); fallback != "" {
 			i.logf("主地址下载失败，改用备用地址：%s", fallback)
-			archive, err = i.download(ctx, fallback, state)
+			archive, err = i.download(ctx, fallback, wantSHA, state)
 		}
 		if err != nil {
 			i.fail(state, err)
@@ -366,7 +369,8 @@ func (p *progressWriter) Write(data []byte) (int, error) {
 }
 
 // download 把 URL 下载到临时文件，返回其路径。
-func (i *Installer) download(ctx context.Context, url string, state *taskState) (string, error) {
+// wantSHA 非空时校验 SHA-256；发布清单没有内置校验和时跳过（兼容现有版本清单）。
+func (i *Installer) download(ctx context.Context, url, wantSHA string, state *taskState) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
@@ -407,8 +411,34 @@ func (i *Installer) download(ctx context.Context, url string, state *taskState) 
 		_ = os.Remove(f.Name())
 		return "", errors.New("工具包超过 1GB，已中止下载（检查镜像地址是否返回了错误的文件）")
 	}
+	if wantSHA != "" {
+		if err := verifySHA256(f.Name(), wantSHA); err != nil {
+			_ = os.Remove(f.Name())
+			return "", err
+		}
+		i.logf("SHA-256 校验通过")
+	}
 	i.logf("下载完成：%d 字节", written)
 	return f.Name(), nil
+}
+
+// verifySHA256 校验文件摘要，避免镜像/网络篡改工具包。
+func verifySHA256(path, want string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Errorf("计算 SHA-256: %w", err)
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	want = strings.ToLower(strings.TrimSpace(want))
+	if got != want {
+		return fmt.Errorf("工具包 SHA-256 校验失败：期望 %s，实际 %s", want, got)
+	}
+	return nil
 }
 
 // snapshot 返回线程安全的状态副本。
@@ -447,6 +477,10 @@ func extractZip(archive, dest string) error {
 	}
 	defer func() { _ = r.Close() }()
 	for _, file := range r.File {
+		// 符号链接可能指向安装目录外，后续写入会跟随链接逃逸；直接拒绝。
+		if file.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("压缩包包含符号链接，已拒绝：%s", file.Name)
+		}
 		target, err := safeJoin(dest, file.Name)
 		if err != nil {
 			return err
@@ -518,17 +552,41 @@ func extractTarGz(archive, dest string) error {
 				return err
 			}
 		case tar.TypeSymlink:
-			// Node/JDK 的压缩包里可能有符号链接；指向外部的一律跳过（防目录穿越）。
-			// Windows 非管理员建不了符号链接，失败就跳过，不影响整体安装。
-			if strings.Contains(header.Linkname, "..") {
+			// 保留发行版需要的符号链接（Node 的 bin/npm 等），但目标必须仍在
+			// 安装目录内；绝对路径或指向目录外的链接直接跳过。
+			if !symlinkWithin(dest, target, header.Linkname) {
 				continue
 			}
 			_ = os.Remove(target)
 			_ = os.Symlink(filepath.FromSlash(header.Linkname), target)
+		case tar.TypeLink:
+			// 硬链接目标语义在不同 tar 实现中不一致，直接跳过，避免链接到目录外。
 		default:
 			// 设备文件/硬链接等一律忽略。
 		}
 	}
+}
+
+// symlinkWithin 判断 tar 中的相对链接目标是否仍在安装目录内。
+func symlinkWithin(base, linkPath, linkname string) bool {
+	name := strings.TrimSpace(linkname)
+	if name == "" || filepath.IsAbs(filepath.FromSlash(name)) {
+		return false
+	}
+	resolved := filepath.Clean(filepath.Join(filepath.Dir(linkPath), filepath.FromSlash(name)))
+	baseAbs, err := filepath.Abs(base)
+	if err != nil {
+		return false
+	}
+	resolvedAbs, err := filepath.Abs(resolved)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(baseAbs, resolvedAbs)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
 }
 
 func writeFile(target string, r io.Reader, mode os.FileMode) error {

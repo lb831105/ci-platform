@@ -44,8 +44,13 @@ func DecideWebhook(p *model.Pipeline, ev webhook.Event) WebhookDecision {
 	if strings.EqualFold(p.WebhookBranchMode, "fixed") || ev.Branch == "" {
 		return WebhookDecision{Trigger: true}
 	}
-	if err := validateTriggerBranch(ev.Branch); err != nil {
+	branch := ev.Branch
+	if ev.Kind == webhook.KindTagPush {
+		// GitClient 用 refs/tags/ 前缀区分 tag 与同名分支。
+		branch = "refs/tags/" + branch
+	}
+	if err := validateTriggerBranch(branch); err != nil {
 		return WebhookDecision{Reason: err.Error()}
 	}
-	return WebhookDecision{Trigger: true, Branch: ev.Branch}
+	return WebhookDecision{Trigger: true, Branch: branch}
 }

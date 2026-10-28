@@ -29,6 +29,15 @@ function isEmail(value: string): boolean {
   return labels.length >= 2 && labels.every((l) => l.length > 0)
 }
 
+// 姓名只用于展示，用户名仍是登录标识；要求汉字，避免出现 libin / li bin 这类混杂称呼。
+// 少数民族姓名允许「·」分隔（如：阿依古丽·买买提）。
+function isChineseName(value: string): boolean {
+  const name = value.trim()
+  if (!/^\p{Script=Han}+(?:·\p{Script=Han}+)*$/u.test(name)) return false
+  const length = Array.from(name).length
+  return length >= 2 && length <= 20
+}
+
 async function load(): Promise<void> {
   loading.value = true
   try {
@@ -45,10 +54,10 @@ onMounted(load)
 // ---- 新建用户 ----
 const createVisible = ref(false)
 const creating = ref(false)
-const createForm = ref({ name: '', password: '', email: '' })
+const createForm = ref({ name: '', display_name: '', password: '', email: '' })
 
 function openCreate(): void {
-  createForm.value = { name: '', password: '', email: '' }
+  createForm.value = { name: '', display_name: '', password: '', email: '' }
   createVisible.value = true
 }
 
@@ -62,6 +71,11 @@ async function submitCreate(): Promise<void> {
     ElMessage.error('密码至少需要 8 个字符')
     return
   }
+  const displayName = createForm.value.display_name.trim()
+  if (!isChineseName(displayName)) {
+    ElMessage.error('请输入 2-20 个汉字的姓名（少数民族姓名可用「·」分隔）')
+    return
+  }
   const email = createForm.value.email.trim()
   if (!isEmail(email)) {
     ElMessage.error('请输入有效的邮箱：构建通知会用该邮箱发信')
@@ -69,7 +83,7 @@ async function submitCreate(): Promise<void> {
   }
   creating.value = true
   try {
-    await rbacApi.addUser(name, createForm.value.password, email)
+    await rbacApi.addUser(name, createForm.value.password, email, displayName)
     createVisible.value = false
     ElMessage.success(`用户 ${name} 已创建，请在「Assign Roles」为其分配角色`)
     await load()
@@ -84,11 +98,12 @@ async function submitCreate(): Promise<void> {
 // 任务通知按用户名引用人员时，用邮箱发信、用企微 ID/手机号 @ 提醒。
 const contactVisible = ref(false)
 const contactSaving = ref(false)
-const contactForm = ref({ name: '', email: '', wecom_id: '', phone: '' })
+const contactForm = ref({ name: '', display_name: '', email: '', wecom_id: '', phone: '' })
 
 function openContact(user: UserAccount): void {
   contactForm.value = {
     name: user.name,
+    display_name: user.display_name ?? '',
     email: user.email ?? '',
     wecom_id: user.wecom_id ?? '',
     phone: user.phone ?? '',
@@ -98,6 +113,11 @@ function openContact(user: UserAccount): void {
 
 async function submitContact(): Promise<void> {
   const name = contactForm.value.name
+  const displayName = contactForm.value.display_name.trim()
+  if (!isChineseName(displayName)) {
+    ElMessage.error('请输入 2-20 个汉字的姓名（少数民族姓名可用「·」分隔）')
+    return
+  }
   const email = contactForm.value.email.trim()
   if (!isEmail(email)) {
     ElMessage.error('邮箱不能为空且必须有效：构建通知会用该邮箱发信')
@@ -107,12 +127,13 @@ async function submitContact(): Promise<void> {
   try {
     await rbacApi.setUserContact({
       name,
+      display_name: displayName,
       email,
       wecom_id: contactForm.value.wecom_id.trim(),
       phone: contactForm.value.phone.trim(),
     })
     contactVisible.value = false
-    ElMessage.success(`已更新 ${name} 的联系方式`)
+    ElMessage.success(`已更新 ${name} 的姓名与联系方式`)
     await load()
   } catch (e) {
     ElMessage.error(describeError(e))
@@ -221,6 +242,12 @@ async function remove(user: UserAccount): Promise<void> {
           </template>
         </el-table-column>
 
+        <el-table-column label="姓名" width="120">
+          <template #default="{ row }">
+            <span :class="row.display_name ? '' : 'muted'">{{ row.display_name || '-' }}</span>
+          </template>
+        </el-table-column>
+
         <el-table-column label="角色" min-width="240">
           <template #default="{ row }">
             <el-tag
@@ -286,7 +313,7 @@ async function remove(user: UserAccount): Promise<void> {
               type="primary"
               size="small"
               @click="openContact(row)"
-            >联系方式</el-button>
+            >姓名/联系方式</el-button>
             <el-button
               v-if="!row.builtin"
               link
@@ -314,6 +341,9 @@ async function remove(user: UserAccount): Promise<void> {
         <el-form-item label="用户名">
           <el-input v-model="createForm.name" placeholder="如 dev1" />
         </el-form-item>
+        <el-form-item label="姓名">
+          <el-input v-model="createForm.display_name" placeholder="如：张三（仅汉字，2-20 字）" />
+        </el-form-item>
         <el-form-item label="邮箱">
           <el-input v-model="createForm.email" class="mono" placeholder="name@example.com（必填，用于构建通知）" />
         </el-form-item>
@@ -332,17 +362,20 @@ async function remove(user: UserAccount): Promise<void> {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="contactVisible" title="联系方式" width="480px">
+    <el-dialog v-model="contactVisible" title="姓名与联系方式" width="480px">
       <el-alert
         type="info"
         :closable="false"
         show-icon
         style="margin-bottom: 12px"
-        title="任务通知会按用户名引用人员：邮箱用于发信，企业微信 ID / 手机号用于群机器人 @ 提醒（仅失败/取消时提醒）。"
+        title="任务通知会按用户名引用人员：姓名用于界面展示，邮箱用于发信，企业微信 ID / 手机号用于群机器人 @ 提醒。"
       />
       <el-form label-width="100px">
         <el-form-item label="用户名">
           <el-input :model-value="contactForm.name" disabled />
+        </el-form-item>
+        <el-form-item label="姓名" required>
+          <el-input v-model="contactForm.display_name" placeholder="如：张三（仅汉字，2-20 字）" />
         </el-form-item>
         <el-form-item label="邮箱" required>
           <el-input v-model="contactForm.email" class="mono" placeholder="name@example.com（必填）" />

@@ -73,18 +73,41 @@ func TestRepublishPublishesArchivedArtifacts(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	err := svc.Republish(context.Background(), "p1", "1", "s2", "")
+	err := svc.Republish(context.Background(), "p1", "1", "s1", "")
 	if err != nil {
 		t.Fatalf("republish: %v", err)
 	}
 	if !publisher.called {
 		t.Fatal("publisher must be called")
 	}
-	if publisher.cfg == nil || publisher.cfg.ServerID != "s2" || !publisher.cfg.Enabled {
+	if publisher.cfg == nil || publisher.cfg.ServerID != "s1" || !publisher.cfg.Enabled {
 		t.Fatalf("unexpected cfg: %+v", publisher.cfg)
 	}
 	if filepath.Base(publisher.buildDir) != "1" {
 		t.Fatalf("buildDir = %q", publisher.buildDir)
+	}
+}
+
+func TestRepublishRejectsServerOutsideTask(t *testing.T) {
+	svc, publisher := newRepublishService(t)
+	svc.pipelines = &memPipelineStore{items: map[string]*model.Pipeline{
+		"p1": {ID: "p1", Name: "demo", SshPublish: &model.SshPublishConfig{
+			Enabled: true, ServerID: "s1", SourceFiles: []string{"*"},
+		}},
+	}}
+	builds := store.NewBuildStore(t.TempDir())
+	svc.builds = builds
+	started := time.Now().UTC()
+	if err := builds.Create(context.Background(), &model.Build{
+		ID: "1", PipelineID: "p1", Status: model.BuildSuccess, StartedAt: &started,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Republish(context.Background(), "p1", "1", "s2", ""); err == nil {
+		t.Fatal("server outside task targets must be rejected")
+	}
+	if publisher.called {
+		t.Fatal("publisher must not be called for a disallowed server")
 	}
 }
 

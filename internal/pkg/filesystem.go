@@ -41,6 +41,11 @@ func WriteFileAtomic(path string, data []byte) error {
 		return fmt.Errorf("create temp file in %s: %w", dir, err)
 	}
 	tmpName := tmp.Name()
+	// 配置/凭据文件只允许服务账号读取。
+	if err = tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
 	// rename 成功后该路径已不存在，Remove 失败可忽略。
 	defer func() { _ = os.Remove(tmpName) }()
 
@@ -110,7 +115,7 @@ func AppendLine(path string, line string) error {
 	if err := EnsureDir(filepath.Dir(path)); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("open append %s: %w", path, err)
 	}

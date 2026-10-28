@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/go-git/go-git/v5"
@@ -9,11 +10,17 @@ import (
 
 // CheckoutInfo 是一次签出后的 SCM 现场信息，供通知/日志使用。
 type CheckoutInfo struct {
-	Branch string // 分支名（去 refs/heads/ 前缀）
-	Commit string // 短 SHA（前 8 位）
-	Author string // 提交人姓名
-	Email  string // 提交人邮箱
+	Branch     string   // 分支名（去 refs/heads/ 前缀）
+	Commit     string   // 短 SHA（前 8 位）
+	CommitFull string   // 完整 SHA（构建页 Revision）
+	Message    string   // 提交说明（构建页 Changes Summary）
+	Files      []string // 本次提交修改的文件（按路径排序）
+	Author     string   // 提交人姓名
+	Email      string   // 提交人邮箱
 }
+
+// maxChangedFiles 限制构建元数据里保存的文件数，避免超大提交把 build.json 撑大。
+const maxChangedFiles = 200
 
 // ReadCheckoutInfo 从工作区读取当前 HEAD 的分支与提交人信息。
 // 不调用 git 命令（避免依赖 PATH），直接读 .git 元数据；
@@ -33,6 +40,7 @@ func ReadCheckoutInfo(workdir string) CheckoutInfo {
 			info.Branch = head.Name().Short()
 		}
 		sha := head.Hash().String()
+		info.CommitFull = sha
 		if len(sha) >= 8 {
 			info.Commit = sha[:8]
 		} else {
@@ -41,6 +49,19 @@ func ReadCheckoutInfo(workdir string) CheckoutInfo {
 		if commit, err := repo.CommitObject(head.Hash()); err == nil {
 			info.Author = strings.TrimSpace(commit.Author.Name)
 			info.Email = strings.TrimSpace(commit.Author.Email)
+			info.Message = strings.TrimSpace(commit.Message)
+			// Stats 会与第一父提交做 diff；merge/root 提交失败时只是没有 Changes 列表，不影响构建。
+			if stats, statErr := commit.Stats(); statErr == nil && len(stats) > 0 {
+				files := make([]string, 0, len(stats))
+				for _, stat := range stats {
+					files = append(files, stat.Name)
+				}
+				sort.Strings(files)
+				if len(files) > maxChangedFiles {
+					files = files[:maxChangedFiles]
+				}
+				info.Files = files
+			}
 		}
 	}
 	return info

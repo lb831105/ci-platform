@@ -44,6 +44,11 @@ func ErrConflict(format string, args ...interface{}) *AppError {
 	return NewError(CodeConflict, format, args...)
 }
 
+// ErrForbidden 权限不足或操作被安全策略拒绝。
+func ErrForbidden(format string, args ...interface{}) *AppError {
+	return NewError(CodeForbidden, format, args...)
+}
+
 // ErrInternal 内部错误（HTTP 500 语义）：用于把底层错误包装成可读提示。
 func ErrInternal(format string, args ...interface{}) *AppError {
 	return NewError(CodeInternal, format, args...)

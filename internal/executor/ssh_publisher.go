@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"ci-platform/internal/pkg/logger"
 	"context"
 	"errors"
 	"fmt"
@@ -187,13 +186,12 @@ func (p *SshPublisher) dial(ctx context.Context, cfg *model.SshPublishConfig) (*
 }
 
 // sshHostKeyCallback 构建主机密钥校验回调。
-// 未配置 known_hosts 时保持兼容行为并明确告警；配置后未知主机将直接拒绝连接，
-// 防止中间人攻击。
+// 默认必须配置 known_hosts：静默使用 InsecureIgnoreHostKey 会让 SSH 发布暴露在
+// 中间人攻击下（攻击者可代理命令并截获密码）。未配置时直接拒绝连接，而不是告警后放行。
 func sshHostKeyCallback(knownHostsPath string) (ssh.HostKeyCallback, error) {
 	knownHostsPath = strings.TrimSpace(knownHostsPath)
 	if knownHostsPath == "" {
-		logger.Warnf("ssh publish host key verification disabled; configure known_hosts_path to enable it")
-		return ssh.InsecureIgnoreHostKey(), nil
+		return nil, fmt.Errorf("ssh publish: known_hosts_path is required; configure host key verification before publishing")
 	}
 	path := expandHome(knownHostsPath)
 	callback, err := knownhosts.New(path)
@@ -369,15 +367,6 @@ func applyRemovePrefix(rel, prefix string) string {
 		}
 	}
 	return rel
-}
-
-// withinDir 判断 target 是否位于 base 目录内（含 base 本身）。
-func withinDir(base, target string) bool {
-	rel, err := filepath.Rel(base, target)
-	if err != nil {
-		return false
-	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // copyFile 本地文件 → 远程文件。

@@ -7,11 +7,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
+
+	"ci-platform/internal/pkg"
 )
 
 // GitAuth 是 HTTPS 拉取所需的认证信息。
@@ -53,10 +56,10 @@ func (g *GitClient) Clone(ctx context.Context, url, branch, dest string, auth *G
 		}
 	}
 
-	fmt.Fprintf(out, "[git] cloning %s (branch=%s, auth=%t) -> %s\n", url, branch, authed, dest)
+	fmt.Fprintf(out, "[git] cloning %s (branch=%s, auth=%t) -> %s\n", pkg.MaskURLUserInfo(url), branch, authed, dest)
 	opts := &git.CloneOptions{
 		URL:           url,
-		ReferenceName: plumbing.NewBranchReferenceName(branch),
+		ReferenceName: gitReference(branch),
 		SingleBranch:  true,
 		Depth:         1,
 		Progress:      out,
@@ -65,7 +68,7 @@ func (g *GitClient) Clone(ctx context.Context, url, branch, dest string, auth *G
 		opts.Auth = &githttp.BasicAuth{Username: auth.Username, Password: auth.Password}
 	}
 	if _, err := git.PlainCloneContext(ctx, dest, false, opts); err != nil {
-		return fmt.Errorf("git clone %s: %w", url, err)
+		return fmt.Errorf("git clone %s: %s", pkg.MaskURLUserInfo(url), pkg.MaskURLUserInfo(err.Error()))
 	}
 	fmt.Fprintln(out, "[git] clone finished")
 	return nil
@@ -85,13 +88,18 @@ func (g *GitClient) update(ctx context.Context, url, branch, dest string, auth *
 		return fmt.Errorf("git create remote origin: %w", err)
 	}
 
+	refName := gitReference(branch)
+	isTag := strings.HasPrefix(branch, "refs/tags/")
+	tagName := strings.TrimPrefix(branch, "refs/tags/")
+	refspec := fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", branch, branch)
+	if isTag {
+		refspec = fmt.Sprintf("+refs/tags/%s:refs/tags/%s", tagName, tagName)
+	}
 	fetchOpts := &git.FetchOptions{
 		RemoteName: "origin",
 		Depth:      1,
 		Force:      true,
-		RefSpecs: []config.RefSpec{
-			config.RefSpec(fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", branch, branch)),
-		},
+		RefSpecs:   []config.RefSpec{config.RefSpec(refspec)},
 	}
 	if auth != nil && (auth.Username != "" || auth.Password != "") {
 		fetchOpts.Auth = &githttp.BasicAuth{Username: auth.Username, Password: auth.Password}
@@ -99,18 +107,22 @@ func (g *GitClient) update(ctx context.Context, url, branch, dest string, auth *
 	fetchErr := repo.FetchContext(ctx, fetchOpts)
 	alreadyUpToDate := errors.Is(fetchErr, git.NoErrAlreadyUpToDate)
 	if fetchErr != nil && !alreadyUpToDate {
-		return fmt.Errorf("git fetch %s: %w", url, fetchErr)
+		return fmt.Errorf("git fetch %s: %s", pkg.MaskURLUserInfo(url), pkg.MaskURLUserInfo(fetchErr.Error()))
 	}
 
-	remoteRef, err := repo.Reference(plumbing.NewRemoteReferenceName("origin", branch), true)
+	remoteRefName := plumbing.NewRemoteReferenceName("origin", branch)
+	if isTag {
+		remoteRefName = plumbing.NewTagReferenceName(tagName)
+	}
+	remoteRef, err := repo.Reference(remoteRefName, true)
 	if err != nil {
-		return fmt.Errorf("git branch %q not found on origin: %w", branch, err)
+		return fmt.Errorf("git ref %q not found on origin: %w", branch, err)
 	}
 	// 远端未变化且本地受版本控制的文件干净时，直接跳过 checkout/reset：
 	// 不重写源码文件，保留未跟踪的构建产物，构建更快。
 	if alreadyUpToDate {
-		if head, headErr := repo.Head(); headErr == nil && head.Name() == plumbing.NewBranchReferenceName(branch) && head.Hash() == remoteRef.Hash() && trackedWorktreeClean(repo) {
-			fmt.Fprintf(out, "[git] already up to date at origin/%s (%s), skip reset\n", branch, shortHash(remoteRef.Hash()))
+		if head, headErr := repo.Head(); headErr == nil && head.Name() == refName && head.Hash() == remoteRef.Hash() && trackedWorktreeClean(repo) {
+			fmt.Fprintf(out, "[git] already up to date at %s (%s), skip reset\n", branch, shortHash(remoteRef.Hash()))
 			return nil
 		}
 	}
@@ -137,17 +149,24 @@ func (g *GitClient) update(ctx context.Context, url, branch, dest string, auth *
 		}()
 	}
 
-	localRef := plumbing.NewBranchReferenceName(branch)
-	// 已在目标分支时跳过 checkout：go-git 的 Force checkout 会清理未跟踪文件，
+	// 已在目标分支/提交时跳过 checkout：go-git 的 Force checkout 会清理未跟踪文件，
 	// 导致上次构建产物丢失。只做 hard reset 即可更新受版本控制的文件。
 	head, headErr := repo.Head()
-	onBranch := headErr == nil && head.Name() == localRef
-	if !onBranch {
-		if err = wt.Checkout(&git.CheckoutOptions{Branch: localRef, Force: true}); err != nil {
+	onRef := headErr == nil && head.Name() == refName
+	if isTag {
+		onRef = headErr == nil && head.Hash() == remoteRef.Hash()
+	}
+	if !onRef {
+		if isTag {
+			// tag 是只读引用，不能 checkout 到 branch；直接按提交哈希 detached checkout。
+			if err = wt.Checkout(&git.CheckoutOptions{Hash: remoteRef.Hash(), Force: true}); err != nil {
+				return fmt.Errorf("git checkout tag %s: %w", tagName, err)
+			}
+		} else if err = wt.Checkout(&git.CheckoutOptions{Branch: refName, Force: true}); err != nil {
 			if !errors.Is(err, plumbing.ErrReferenceNotFound) {
 				return fmt.Errorf("git checkout %s: %w", branch, err)
 			}
-			if err = wt.Checkout(&git.CheckoutOptions{Branch: localRef, Create: true, Hash: remoteRef.Hash(), Force: true}); err != nil {
+			if err = wt.Checkout(&git.CheckoutOptions{Branch: refName, Create: true, Hash: remoteRef.Hash(), Force: true}); err != nil {
 				return fmt.Errorf("git create branch %s: %w", branch, err)
 			}
 		}
@@ -158,6 +177,15 @@ func (g *GitClient) update(ctx context.Context, url, branch, dest string, auth *
 	}
 	fmt.Fprintf(out, "[git] workspace updated to origin/%s (%s)\n", branch, shortHash(remoteRef.Hash()))
 	return nil
+}
+
+// gitReference 把分支名或 refs/tags/xxx 转成 go-git 引用。
+// Webhook tag_push 使用 refs/tags/ 前缀，避免被当成同名分支。
+func gitReference(branch string) plumbing.ReferenceName {
+	if strings.HasPrefix(branch, "refs/tags/") {
+		return plumbing.NewTagReferenceName(strings.TrimPrefix(branch, "refs/tags/"))
+	}
+	return plumbing.NewBranchReferenceName(branch)
 }
 
 // trackedWorktreeClean 判断受版本控制的文件是否干净。

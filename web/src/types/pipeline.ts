@@ -231,6 +231,10 @@ export interface Pipeline {
   git_branch: string
   git_credential_id: string
   webhook_secret: string
+  // 服务端只读提示：是否已配置密钥（密钥本身永远不回传）
+  has_webhook_secret?: boolean
+  // 请求专用：显式清空 Webhook 密钥（空字符串默认表示保留旧密钥）
+  clear_webhook_secret?: boolean
   // Webhook 分支策略：'' / 'payload' 用推送事件的分支（默认）；'fixed' 始终构建 git_branch
   webhook_branch_mode?: string
   // 允许触发的分支白名单（精确 / release/* / hotfix/**），空表示任意分支
@@ -302,6 +306,7 @@ export function emptyPipeline(): PipelinePayload {
     git_branch: 'main',
     git_credential_id: '',
     webhook_secret: '',
+    clear_webhook_secret: false,
     webhook_branch_mode: 'payload',
     webhook_branches: [],
     webhook_events: ['push'],

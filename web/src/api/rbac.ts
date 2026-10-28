@@ -25,9 +25,14 @@ export const rbacApi = {
     return http.get<UserAccount[]>('/security/users')
   },
 
-  // 邮箱必填：构建通知按人员邮箱发信，没有邮箱的账号收不到告警邮件。
-  addUser(name: string, password: string, email: string): Promise<RbacData> {
-    return http.post<RbacData>('/security/users', { name, password, email })
+  // 邮箱必填：构建通知按人员邮箱发信；姓名必填且只允许汉字（用于界面展示）。
+  addUser(name: string, password: string, email: string, displayName: string): Promise<RbacData> {
+    return http.post<RbacData>('/security/users', {
+      name,
+      password,
+      email,
+      display_name: displayName,
+    })
   },
 
   deleteUser(name: string): Promise<RbacData> {
@@ -38,8 +43,14 @@ export const rbacApi = {
     return http.put<void>('/security/users/password', { name, password })
   },
 
-  // 设置用户联系方式（任务通知按用户名引用时解析邮箱与 @ 提醒）。
-  setUserContact(payload: { name: string; email: string; wecom_id: string; phone: string }): Promise<RbacData> {
+  // 设置用户姓名与联系方式（任务通知按用户名引用时解析邮箱与 @ 提醒）。
+  setUserContact(payload: {
+    name: string
+    display_name: string
+    email: string
+    wecom_id: string
+    phone: string
+  }): Promise<RbacData> {
     return http.put<RbacData>('/security/users/contact', payload)
   },
 }

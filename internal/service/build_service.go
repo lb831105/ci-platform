@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ci-platform/internal/executor"
@@ -106,7 +108,7 @@ func (s *BuildService) SetToolInstaller(installer *tools.Installer) {
 // “用户主动取消”与“关机/超时导致的取消”，前者落 aborted 状态。
 type cancelEntry struct {
 	cancel    context.CancelFunc
-	cancelled bool
+	cancelled atomic.Bool
 }
 
 // wasCancelled 并发安全地读取取消标记。
@@ -114,7 +116,7 @@ func (e *cancelEntry) wasCancelled() bool {
 	if e == nil {
 		return false
 	}
-	return e.cancelled
+	return e.cancelled.Load()
 }
 
 // NewBuildService 构造构建业务服务。
@@ -228,11 +230,13 @@ func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger m
 		p.GitBranch = branch
 	}
 
+	createdAt := time.Now().UTC()
 	b := &model.Build{
 		PipelineID:  pipelineID,
 		Status:      model.BuildPending,
 		TriggerType: trigger,
 		TriggeredBy: strings.TrimSpace(triggeredBy),
+		CreatedAt:   &createdAt,
 		Params:      resolved,
 		// 触发时先记下分支：签出后会由 git 现场信息覆盖，但排队/待审批阶段
 		// 也需要知道"这次是哪条分支"，否则列表里只看到任务配置的那条。
@@ -281,6 +285,29 @@ func (s *BuildService) ListByPipeline(ctx context.Context, pipelineID string) ([
 // Get 返回构建详情。
 func (s *BuildService) Get(ctx context.Context, pipelineID, buildID string) (*model.Build, error) {
 	return s.builds.Get(ctx, pipelineID, buildID)
+}
+
+// UpdateMetadata 更新构建页可编辑的元数据：备注与「永久保留」。
+// 只改 build.json，不触碰日志与产物；保留策略会在下一轮清理时读取 KeepForever。
+func (s *BuildService) UpdateMetadata(ctx context.Context, pipelineID, buildID string, description *string, keepForever *bool) (*model.Build, error) {
+	b, err := s.builds.Get(ctx, pipelineID, buildID)
+	if err != nil {
+		return nil, err
+	}
+	if description != nil {
+		trimmed := strings.TrimSpace(*description)
+		if len([]rune(trimmed)) > 2000 {
+			return nil, pkg.ErrBadRequest("构建描述最多 2000 个字符")
+		}
+		b.Description = trimmed
+	}
+	if keepForever != nil {
+		b.KeepForever = *keepForever
+	}
+	if err = s.builds.Update(ctx, b); err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 // Summaries 为任务列表计算聚合视图（上次成功 / 上次失败 / 上次持续时间）。
@@ -525,7 +552,7 @@ func (s *BuildService) Cancel(pipelineID, buildID string) error {
 	}
 	// 标记“用户主动取消”，再关闭 ctx 终止当前步骤。
 	s.cancelMu.Lock()
-	entry.cancelled = true
+	entry.cancelled.Store(true)
 	s.cancelMu.Unlock()
 	entry.cancel()
 	logger.Infof("build %s/%s cancelled by user", pipelineID, buildID)
@@ -597,6 +624,9 @@ func (s *BuildService) executeStages(ctx context.Context, p *model.Pipeline, b *
 		if info := executor.ReadCheckoutInfo(absWorkspace); info.Branch != "" || info.Commit != "" {
 			b.Branch = info.Branch
 			b.Commit = info.Commit
+			b.CommitFull = info.CommitFull
+			b.CommitMessage = info.Message
+			b.ChangedFiles = info.Files
 			b.CommitAuthor = info.Author
 			b.CommitEmail = info.Email
 			fmt.Fprintf(out, "[git] checkout %s\n", info.String())
@@ -1160,6 +1190,9 @@ func (s *BuildService) resolveGitAuth(ctx context.Context, p *model.Pipeline) (*
 	if err != nil {
 		return nil, fmt.Errorf("git: 凭据 %s 不存在或不可读: %w", p.GitCredential, err)
 	}
+	if err := ensureCredentialHost(c, p.GitURL); err != nil {
+		return nil, err
+	}
 	switch c.Type {
 	case model.CredentialUsernamePassword:
 		return &executor.GitAuth{Username: c.Username, Password: c.Secret}, nil
@@ -1172,6 +1205,32 @@ func (s *BuildService) resolveGitAuth(ctx context.Context, p *model.Pipeline) (*
 	default:
 		return nil, fmt.Errorf("git: 凭据 %q 类型 %s 不支持 HTTPS 拉取", c.Name, c.Type)
 	}
+}
+
+// ensureCredentialHost 校验凭据是否允许用于本次 Git URL。
+// 旧凭据的 AllowedHosts 为空时保持兼容（只告警），新凭据建议在凭据管理里配置。
+func ensureCredentialHost(c *model.Credential, rawURL string) error {
+	if c == nil || len(c.AllowedHosts) == 0 {
+		if c != nil {
+			logger.Warnf("git credential %q has no allowed_hosts; consider scoping it to a host", c.Name)
+		}
+		return nil
+	}
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Hostname() == "" {
+		return pkg.ErrBadRequest("Git URL 格式不正确，无法校验凭据主机")
+	}
+	host := strings.ToLower(u.Hostname())
+	for _, allowed := range c.AllowedHosts {
+		allowed = strings.ToLower(strings.TrimSpace(allowed))
+		if allowed == host {
+			return nil
+		}
+		if strings.HasPrefix(allowed, "*.") && strings.HasSuffix(host, strings.TrimPrefix(allowed, "*")) {
+			return nil
+		}
+	}
+	return pkg.ErrForbidden("凭据 %q 不允许用于 Git 主机 %q", c.Name, host)
 }
 
 // Republish 把某次成功构建已归档的产物直接重新发布到 SSH 服务器（不重新编译），
@@ -1223,6 +1282,18 @@ func (s *BuildService) Republish(ctx context.Context, pipelineID, buildID, serve
 	}
 	spec.Enabled = true
 	if serverID = strings.TrimSpace(serverID); serverID != "" {
+		// 只允许覆盖成任务已经配置过的服务器：job.replay 是较低权限，
+		// 不能让它在任意全局 SSH 服务器上部署产物。
+		allowed := false
+		for _, t := range targets {
+			if strings.EqualFold(strings.TrimSpace(t.ServerID), serverID) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return pkg.ErrForbidden("重新发布只能使用任务已配置的 SSH 服务器 %q", serverID)
+		}
 		spec.ServerID = serverID
 	}
 	if spec.ServerID == "" {
@@ -1269,6 +1340,15 @@ func (s *BuildService) pruneBuilds(ctx context.Context, p *model.Pipeline, setti
 	now := time.Now()
 	maxAge := time.Duration(maxAgeDays) * 24 * time.Hour
 	for i, b := range builds {
+		// 排队/运行/待审批的构建不能删：删目录会让状态永远停在活动状态，
+		// 审批人随后点开也只会拿到 404。
+		if b.Status == model.BuildRunning || b.Status == model.BuildPending || b.Status == model.BuildPendingApproval {
+			continue
+		}
+		// Jenkins 的 Keep this build forever：用户显式保留的记录不参与保留策略。
+		if b.KeepForever {
+			continue
+		}
 		remove := false
 		if maxPerJob > 0 && i >= maxPerJob {
 			remove = true
@@ -1291,10 +1371,8 @@ func (s *BuildService) PruneAll(ctx context.Context) {
 		return
 	}
 	settings := s.currentSettings()
-	// 全局策略未启用时无需扫描（任务级配置在各自构建后已生效）。
-	if settings.BuildRetentionMaxPerJob <= 0 && settings.BuildRetentionMaxAgeDays <= 0 {
-		return
-	}
+	// 即使全局策略关闭，也要扫描任务级策略：用户调低某个任务的保留数后，
+	// 不活跃任务不会再有新构建触发清理，只能靠这里补扫。
 	for _, p := range pipelines {
 		s.pruneBuilds(ctx, p, settings)
 	}

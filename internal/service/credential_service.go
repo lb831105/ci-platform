@@ -83,6 +83,10 @@ func (s *CredentialService) Update(ctx context.Context, id string, in *model.Cre
 	if err != nil {
 		return nil, err
 	}
+	// 未提交 allowed_hosts（nil）时沿用旧作用域；显式提交 [] 才清空。
+	if in.AllowedHosts == nil {
+		in.AllowedHosts = old.AllowedHosts
+	}
 	if err = normalizeCredential(in); err != nil {
 		return nil, err
 	}
@@ -116,12 +120,48 @@ func (s *CredentialService) allocateID() string {
 	return strconv.FormatInt(id, 10)
 }
 
+// normalizeCredentialHosts 归一化允许的 Git 主机：小写、去 scheme/path、去重。
+// 支持精确域名与 *.example.com；空列表表示兼容旧凭据（不限制）。
+func normalizeCredentialHosts(in []string) ([]string, error) {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		host := strings.ToLower(strings.TrimSpace(raw))
+		host = strings.TrimPrefix(host, "https://")
+		host = strings.TrimPrefix(host, "http://")
+		if i := strings.IndexAny(host, "/?#"); i >= 0 {
+			host = host[:i]
+		}
+		host = strings.TrimSpace(host)
+		if host == "" {
+			continue
+		}
+		if strings.ContainsAny(host, " \t\r\n") || strings.Contains(host, "..") {
+			return nil, pkg.ErrBadRequest("凭据允许主机格式不正确: %q", raw)
+		}
+		if seen[host] {
+			continue
+		}
+		seen[host] = true
+		out = append(out, host)
+	}
+	if len(out) > 20 {
+		return nil, pkg.ErrBadRequest("凭据允许主机最多 20 个")
+	}
+	return out, nil
+}
+
 // normalizeCredential 做字段归一化与按类型的必填校验。
 func normalizeCredential(in *model.Credential) error {
 	in.Name = strings.TrimSpace(in.Name)
 	in.Type = strings.TrimSpace(in.Type)
 	in.Username = strings.TrimSpace(in.Username)
 	in.Description = strings.TrimSpace(in.Description)
+	hosts, err := normalizeCredentialHosts(in.AllowedHosts)
+	if err != nil {
+		return err
+	}
+	in.AllowedHosts = hosts
 
 	if in.Name == "" {
 		return pkg.ErrBadRequest("凭据名称不能为空")

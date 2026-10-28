@@ -10,6 +10,15 @@ export const buildApi = {
     return http.get<Build>(`/pipelines/${pipelineId}/builds/${buildId}`)
   },
 
+  // 构建页备注 / 永久保留：指针语义由后端处理，未传字段保持不变。
+  updateMetadata(
+    pipelineId: string,
+    buildId: string,
+    payload: { description?: string; keep_forever?: boolean },
+  ): Promise<Build> {
+    return http.put<Build>(`/pipelines/${pipelineId}/builds/${buildId}`, payload)
+  },
+
   log(pipelineId: string, buildId: string): Promise<BuildLogPayload> {
     return http.get<BuildLogPayload>(`/pipelines/${pipelineId}/builds/${buildId}/log`)
   },
@@ -45,6 +54,15 @@ export const buildApi = {
   // 取消运行中/等待中的构建（对齐 Jenkins Stop Build）。
   cancel(pipelineId: string, buildId: string): Promise<null> {
     return http.post(`/pipelines/${pipelineId}/builds/${buildId}/cancel`)
+  },
+
+  // 发布审批：放行 / 拒绝 pending_approval 构建。
+  approve(pipelineId: string, buildId: string, comment = ''): Promise<Build> {
+    return http.post<Build>(`/pipelines/${pipelineId}/builds/${buildId}/approve`, { comment })
+  },
+
+  reject(pipelineId: string, buildId: string, comment: string): Promise<Build> {
+    return http.post<Build>(`/pipelines/${pipelineId}/builds/${buildId}/reject`, { comment })
   },
 
   // 删除构建：连同 data/jobs/{pid}/builds/{bid} 目录（日志 + 产物）一起删除。

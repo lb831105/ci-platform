@@ -179,6 +179,10 @@ async function confirmCode(): Promise<void> {
           <el-input :model-value="profile?.name ?? ''" disabled />
         </el-form-item>
 
+        <el-form-item label="姓名">
+          <el-input :model-value="profile?.display_name ?? ''" disabled placeholder="由管理员在用户管理中维护" />
+        </el-form-item>
+
         <el-form-item label="邮箱" required>
           <div class="profile-email">
             <el-input v-model="form.email" class="mono" placeholder="name@example.com（必填，用于构建通知）" style="flex: 1" />

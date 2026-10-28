@@ -148,16 +148,16 @@ func TestRBACRoleValidation(t *testing.T) {
 
 func TestRBACUsers(t *testing.T) {
 	svc := newRbacForTest(t)
-	if err := svc.AddUser("alice", "password1", "alice@example.com"); err != nil {
+	if err := svc.AddUser("alice", "password1", "alice@example.com", "李斌"); err != nil {
 		t.Fatalf("add user: %v", err)
 	}
-	if err := svc.AddUser("alice", "password2", "alice2@example.com"); err == nil {
+	if err := svc.AddUser("alice", "password2", "alice2@example.com", "李斌"); err == nil {
 		t.Fatal("duplicate user must be rejected")
 	}
-	if err := svc.AddUser("root", "password1", "root@example.com"); err == nil {
+	if err := svc.AddUser("root", "password1", "root@example.com", "李斌"); err == nil {
 		t.Fatal("user with admin name must be rejected")
 	}
-	if err := svc.AddUser("bob", "short", "bob@example.com"); err == nil {
+	if err := svc.AddUser("bob", "short", "bob@example.com", "李斌"); err == nil {
 		t.Fatal("weak password must be rejected")
 	}
 	if !svc.VerifyLogin("alice", "password1") {

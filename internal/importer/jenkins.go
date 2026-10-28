@@ -201,20 +201,6 @@ func (n *node) child(suffixes ...string) *node {
 	return nil
 }
 
-// children 返回所有名称匹配的子节点。
-func (n *node) children(suffixes ...string) []*node {
-	out := make([]*node, 0, len(n.Children))
-	for i := range n.Children {
-		for _, suffix := range suffixes {
-			if n.Children[i].matches(suffix) {
-				out = append(out, &n.Children[i])
-				break
-			}
-		}
-	}
-	return out
-}
-
 // value 返回第一个匹配子节点的文本（顺带 trim）。
 func (n *node) value(suffixes ...string) string {
 	if c := n.child(suffixes...); c != nil {

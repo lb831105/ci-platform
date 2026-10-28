@@ -124,7 +124,14 @@ type Pipeline struct {
 	GitURL        string `json:"git_url"`
 	GitBranch     string `json:"git_branch"`
 	GitCredential string `json:"git_credential_id"` // 引用的凭据 ID（账号密码 / 令牌）
+	// WebhookSecret 只用于校验 Webhook 来源，任何读取接口都不得回显。
 	WebhookSecret string `json:"webhook_secret"`
+	// HasWebhookSecret 是只读提示位：接口返回时告知前端「已配置密钥」，
+	// 密钥本身始终为空。持久化时会自然变成 false（omitempty），不会污染配置。
+	HasWebhookSecret bool `json:"has_webhook_secret,omitempty"`
+	// ClearWebhookSecret 是请求专用标记：编辑时显式清空密钥，避免“空值=保留”
+	// 让用户无法禁用远程触发。持久化前会被归一化为 false。
+	ClearWebhookSecret bool `json:"clear_webhook_secret,omitempty"`
 
 	// Webhook 分支策略：Webhook 触发时用哪个分支构建。
 	//   ""      / "payload" → 用推送事件里的分支（默认，对齐 GitLab CI：推哪个分支就构建哪个）

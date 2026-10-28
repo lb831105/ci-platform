@@ -20,6 +20,7 @@ const form = reactive<CredentialPayload>({
   username: '',
   description: '',
   secret: '',
+  allowed_hosts: [],
 })
 
 const TYPE_LABELS: Record<CredentialType, string> = {
@@ -43,7 +44,7 @@ onMounted(load)
 function openCreate(): void {
   isEdit.value = false
   editingId.value = ''
-  Object.assign(form, { name: '', type: 'username_password', username: '', description: '', secret: '' })
+  Object.assign(form, { name: '', type: 'username_password', username: '', description: '', secret: '', allowed_hosts: [] })
   dialogVisible.value = true
 }
 
@@ -56,6 +57,7 @@ function openEdit(row: Credential): void {
     username: row.username ?? '',
     description: row.description,
     secret: '',
+    allowed_hosts: [...(row.allowed_hosts ?? [])],
   })
   dialogVisible.value = true
 }
@@ -159,6 +161,20 @@ async function onRemove(row: Credential): Promise<void> {
         </el-form-item>
         <el-form-item v-if="form.type === 'username_password'" label="用户名">
           <el-input v-model="form.username" />
+        </el-form-item>
+        <el-form-item label="允许的 Git 主机">
+          <el-select
+            v-model="form.allowed_hosts"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            placeholder="如 git.example.com 或 *.example.com，留空表示不限制"
+            style="width: 100%"
+          />
+          <div class="form-tip">
+            配置后该凭据只会发送到匹配的 Git 主机，防止任务配置者把凭据带到任意 URL；旧凭据留空以保持兼容。
+          </div>
         </el-form-item>
         <el-form-item label="凭据内容">
           <el-input

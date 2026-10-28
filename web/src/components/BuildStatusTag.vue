@@ -8,6 +8,7 @@ type TagType = 'success' | 'danger' | 'warning' | 'info' | 'primary'
 
 const LABELS: Record<BuildStatus, string> = {
   pending: '等待中',
+  pending_approval: '待审批',
   running: '构建中',
   success: '成功',
   failed: '失败',
@@ -16,6 +17,7 @@ const LABELS: Record<BuildStatus, string> = {
 
 const TYPES: Record<BuildStatus, TagType> = {
   pending: 'info',
+  pending_approval: 'warning',
   running: 'warning',
   success: 'success',
   failed: 'danger',

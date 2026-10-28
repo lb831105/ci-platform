@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -95,7 +96,7 @@ func (s *RBACService) Data() model.RbacData {
 	out.Users = make([]model.RbacUser, len(s.data.Users))
 	for i, u := range s.data.Users {
 		out.Users[i] = model.RbacUser{
-			Name: u.Name, CreatedAt: u.CreatedAt,
+			Name: u.Name, DisplayName: u.DisplayName, CreatedAt: u.CreatedAt,
 			Email: u.Email, WecomID: u.WecomID, Phone: u.Phone,
 		}
 	}
@@ -388,7 +389,11 @@ func (s *RBACService) EffectivePermissions(user string) []string {
 	administer := false
 	for _, kind := range []string{model.RoleKindGlobal, model.RoleKindItem} {
 		for _, role := range s.rolesFor(user, kind) {
-			for _, p := range role.Perms {
+			// 通过 role.Has 展开模板继承；直接遍历 role.Perms 会漏掉模板权限。
+			for _, p := range all {
+				if !role.Has(p, s.resolveTemplate, 0) {
+					continue
+				}
 				if p == model.PermOverallAdminister {
 					administer = true
 				}
@@ -423,6 +428,7 @@ func (s *RBACService) Profile(name string) (model.Profile, error) {
 		}
 		return model.Profile{
 			Name:          u.Name,
+			DisplayName:   u.DisplayName,
 			Email:         u.Email,
 			WecomID:       u.WecomID,
 			Phone:         u.Phone,
@@ -477,6 +483,7 @@ func (s *RBACService) Users() []model.UserAccount {
 		created := u.CreatedAt
 		list = append(list, model.UserAccount{
 			Name:          u.Name,
+			DisplayName:   u.DisplayName,
 			Email:         u.Email,
 			WecomID:       u.WecomID,
 			Phone:         u.Phone,
@@ -665,7 +672,8 @@ func (s *RBACService) SetAssignments(assignments []model.RbacAssignment) error {
 //
 // email 必填：构建结果的邮件通知按人员解析邮箱，没有邮箱的账号在被选为
 // 通知对象时只会「静默收不到」，因此从创建入口就要求填对地址。
-func (s *RBACService) AddUser(name, password, email string) error {
+// displayName 也必填且只允许汉字：用户名是登录标识（libin），姓名用于界面展示。
+func (s *RBACService) AddUser(name, password, email, displayName string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return pkg.ErrBadRequest("用户名不能为空")
@@ -680,8 +688,26 @@ func (s *RBACService) AddUser(name, password, email string) error {
 	if err != nil {
 		return err
 	}
+	displayName, err = normalizeUserDisplayName(displayName)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 旧管理员改名后，rbac.json 里可能残留「旧用户名 → 全局 administer」的授权。
+	// 如果允许再创建同名平台用户，该用户会直接继承管理员权限，因此这里拒绝
+	// 任何已经拥有全局 Administer 授权的主体名。
+	for _, a := range s.data.Assignments {
+		if a.Kind != model.RoleKindGlobal || a.Subject != name {
+			continue
+		}
+		for _, role := range s.data.Roles {
+			if role.Kind == model.RoleKindGlobal && role.Name == a.Role &&
+				containsPerm(role.Perms, model.PermOverallAdminister) {
+				return pkg.ErrConflict("用户名 %s 已存在全局管理员授权，请先在「分配角色」中清理旧授权", name)
+			}
+		}
+	}
 	for _, u := range s.data.Users {
 		if u.Name == name {
 			return pkg.ErrConflict("用户 %s 已存在", name)
@@ -693,6 +719,7 @@ func (s *RBACService) AddUser(name, password, email string) error {
 	}
 	s.data.Users = append(s.data.Users, model.RbacUser{
 		Name:         name,
+		DisplayName:  displayName,
 		PasswordHash: string(hash),
 		Email:        email,
 		CreatedAt:    time.Now().UTC(),
@@ -733,6 +760,31 @@ func normalizeUserEmail(raw string) (string, error) {
 		return "", pkg.ErrBadRequest("邮箱 %q 不能包含空白字符", email)
 	}
 	return email, nil
+}
+
+// normalizeUserDisplayName 校验并规范化「姓名」。
+// 用户名承担登录与 URL/授权标识职责，姓名只用于展示；要求汉字是为了避免
+// 界面出现 libin/li bin 这类中英混杂的称呼。少数民族姓名允许用「·」分隔。
+func normalizeUserDisplayName(raw string) (string, error) {
+	displayName := strings.TrimSpace(raw)
+	if displayName == "" {
+		return "", pkg.ErrBadRequest("姓名不能为空（请填写汉字姓名）")
+	}
+	runes := []rune(displayName)
+	if len(runes) < 2 || len(runes) > 20 {
+		return "", pkg.ErrBadRequest("姓名长度需为 2-20 个汉字")
+	}
+	for i, r := range runes {
+		if unicode.Is(unicode.Han, r) {
+			continue
+		}
+		if r == '·' && i > 0 && i < len(runes)-1 &&
+			unicode.Is(unicode.Han, runes[i-1]) && unicode.Is(unicode.Han, runes[i+1]) {
+			continue
+		}
+		return "", pkg.ErrBadRequest("姓名只能使用汉字（少数民族姓名可用「·」分隔）")
+	}
+	return displayName, nil
 }
 
 // UsersWithoutEmail 返回缺少邮箱的历史用户（旧数据没有强制邮箱）。
@@ -804,9 +856,18 @@ func (s *RBACService) ResetUserPassword(name, password string) error {
 	return pkg.ErrNotFound("用户 %s 不存在", name)
 }
 
-// SetUserContact 设置用户的通知联系方式（管理员在「用户管理」中维护）。
-// 任务通知按用户名引用人员时，用这些信息解析收件邮箱与 @ 提醒对象。
+// SetUserContact 设置用户的通知联系方式（个人资料页自助维护）。
+// 姓名由管理员维护，这里保留原值，避免用户自助改联系方式时把姓名清空。
 func (s *RBACService) SetUserContact(name, email, wecomID, phone string) error {
+	return s.updateUserContact(name, "", email, wecomID, phone, false)
+}
+
+// SetUserContactAndDisplayName 同时更新姓名与联系方式（管理员在「用户管理」中维护）。
+func (s *RBACService) SetUserContactAndDisplayName(name, displayName, email, wecomID, phone string) error {
+	return s.updateUserContact(name, displayName, email, wecomID, phone, true)
+}
+
+func (s *RBACService) updateUserContact(name, displayName, email, wecomID, phone string, setDisplayName bool) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return pkg.ErrBadRequest("用户名不能为空")
@@ -814,6 +875,12 @@ func (s *RBACService) SetUserContact(name, email, wecomID, phone string) error {
 	email, err := normalizeUserEmail(email)
 	if err != nil {
 		return err
+	}
+	if setDisplayName {
+		displayName, err = normalizeUserDisplayName(displayName)
+		if err != nil {
+			return err
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -824,6 +891,9 @@ func (s *RBACService) SetUserContact(name, email, wecomID, phone string) error {
 		// 邮箱变更后原验证状态不再成立，必须重新验证。
 		if !strings.EqualFold(s.data.Users[i].Email, email) {
 			s.data.Users[i].EmailVerified = false
+		}
+		if setDisplayName {
+			s.data.Users[i].DisplayName = displayName
 		}
 		s.data.Users[i].Email = email
 		s.data.Users[i].WecomID = strings.TrimSpace(wecomID)

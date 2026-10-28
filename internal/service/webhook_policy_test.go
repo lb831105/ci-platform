@@ -55,7 +55,7 @@ func TestDecideWebhookSkipCI(t *testing.T) {
 func TestDecideWebhookTagEvent(t *testing.T) {
 	p := &model.Pipeline{WebhookEvents: []string{"push", "tag_push"}}
 	d := DecideWebhook(p, webhook.Event{Kind: webhook.KindTagPush, Branch: "v1.0.0"})
-	if !d.Trigger || d.Branch != "v1.0.0" {
+	if !d.Trigger || d.Branch != "refs/tags/v1.0.0" {
 		t.Fatalf("tag_push must be allowed when whitelisted: %+v", d)
 	}
 	// 未勾选 tag_push 时同样事件应被忽略。

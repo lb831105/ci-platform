@@ -207,7 +207,9 @@ type RbacAssignment struct {
 
 // RbacUser 是平台内管理的用户（对齐 Jenkins 安全域中的用户列表）。
 type RbacUser struct {
-	Name         string    `json:"name"`
+	Name string `json:"name"`
+	// DisplayName 是管理端维护的汉字姓名（用户名是登录标识，不用于展示）。
+	DisplayName  string    `json:"display_name,omitempty"`
 	PasswordHash string    `json:"password_hash"` // bcrypt；接口返回时清空
 	CreatedAt    time.Time `json:"created_at"`
 
@@ -225,6 +227,7 @@ type RbacUser struct {
 // Builtin 用户（系统配置里的管理员）不在 rbac.json 中，联系方式只读。
 type Profile struct {
 	Name          string `json:"name"`
+	DisplayName   string `json:"display_name,omitempty"`
 	Email         string `json:"email,omitempty"`
 	WecomID       string `json:"wecom_id,omitempty"`
 	Phone         string `json:"phone,omitempty"`
@@ -244,6 +247,7 @@ type UserRoleRef struct {
 // 它不在 rbac.json 里，也不可删除/改密码（否则可能把自己锁在门外）。
 type UserAccount struct {
 	Name          string        `json:"name"`
+	DisplayName   string        `json:"display_name,omitempty"`
 	Email         string        `json:"email,omitempty"`
 	WecomID       string        `json:"wecom_id,omitempty"`
 	Phone         string        `json:"phone,omitempty"`

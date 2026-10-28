@@ -44,6 +44,30 @@ func (h *BuildHandler) Get(w http.ResponseWriter, r *http.Request) {
 	pkg.OK(w, b)
 }
 
+// updateBuildRequest 是 PUT /api/pipelines/{pid}/builds/{bid} 的请求体。
+// 指针字段用于区分“没传”和“显式清空/关闭”：只改描述时不能把 KeepForever 重置。
+type updateBuildRequest struct {
+	Description *string `json:"description"`
+	KeepForever *bool   `json:"keep_forever"`
+}
+
+// Update PUT /api/pipelines/{pid}/builds/{bid}
+// 更新构建备注与「永久保留」标记（对齐 Jenkins Build 页的 Add description / Keep forever）。
+func (h *BuildHandler) Update(w http.ResponseWriter, r *http.Request) {
+	var in updateBuildRequest
+	if err := decodeJSON(w, r, &in); err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	b, err := h.builds.UpdateMetadata(r.Context(),
+		chi.URLParam(r, "pid"), chi.URLParam(r, "bid"), in.Description, in.KeepForever)
+	if err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	pkg.OK(w, b)
+}
+
 // Log GET /api/pipelines/{pid}/builds/{bid}/log 返回 log.txt 全文。
 func (h *BuildHandler) Log(w http.ResponseWriter, r *http.Request) {
 	text, err := h.builds.ReadLog(r.Context(), chi.URLParam(r, "pid"), chi.URLParam(r, "bid"))
@@ -143,6 +167,49 @@ func (h *BuildHandler) Republish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pkg.OK(w, nil)
+}
+
+// approvalRequest 是发布审批请求体；拒绝时必须提供理由。
+type approvalRequest struct {
+	Comment string `json:"comment"`
+}
+
+// Approve POST /api/pipelines/{pid}/builds/{bid}/approve
+// 放行 pending_approval 构建：状态回到 pending 并重新入队。
+func (h *BuildHandler) Approve(w http.ResponseWriter, r *http.Request) {
+	var in approvalRequest
+	if r.ContentLength != 0 {
+		if err := decodeJSON(w, r, &in); err != nil {
+			pkg.Fail(w, err)
+			return
+		}
+	}
+	b, err := h.builds.DecideApproval(r.Context(),
+		chi.URLParam(r, "pid"), chi.URLParam(r, "bid"), true, in.Comment,
+		pkg.UserFromContext(r.Context()))
+	if err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	pkg.OK(w, b)
+}
+
+// Reject POST /api/pipelines/{pid}/builds/{bid}/reject
+// 拒绝 pending_approval 构建：直接落 aborted，并记录审批理由。
+func (h *BuildHandler) Reject(w http.ResponseWriter, r *http.Request) {
+	var in approvalRequest
+	if err := decodeJSON(w, r, &in); err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	b, err := h.builds.DecideApproval(r.Context(),
+		chi.URLParam(r, "pid"), chi.URLParam(r, "bid"), false, in.Comment,
+		pkg.UserFromContext(r.Context()))
+	if err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	pkg.OK(w, b)
 }
 
 // Cancel POST /api/pipelines/{pid}/builds/{bid}/cancel

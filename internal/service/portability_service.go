@@ -61,6 +61,10 @@ type PipelineExport struct {
 
 	Artifacts model.ArtifactConfig `json:"artifacts"`
 
+	// 发布审批：安全门禁必须随任务一起迁移，否则导入后生产发布会被静默放开。
+	RequireApproval        bool `json:"require_approval"`
+	ApprovalTimeoutMinutes int  `json:"approval_timeout_minutes"`
+
 	BuildRetentionMaxPerJob    int   `json:"build_retention_max_per_job"`
 	BuildRetentionMaxAgeDays   int   `json:"build_retention_max_age_days"`
 	DeleteWorkspaceBeforeBuild *bool `json:"delete_workspace_before_build,omitempty"`
@@ -139,9 +143,12 @@ func (s *PortabilityService) Export(ctx context.Context, pipelineID string) (*Pi
 		CronSpec:      p.CronSpec,
 		Params:        append([]model.ParamDef(nil), p.Params...),
 		Artifacts: model.ArtifactConfig{
-			Enabled: p.Artifacts.Enabled,
-			Files:   append([]string(nil), p.Artifacts.Files...),
+			Enabled:    p.Artifacts.Enabled,
+			Files:      append([]string(nil), p.Artifacts.Files...),
+			AllowEmpty: p.Artifacts.AllowEmpty,
 		},
+		RequireApproval:          p.RequireApproval,
+		ApprovalTimeoutMinutes:   p.ApprovalTimeoutMinutes,
 		BuildRetentionMaxPerJob:  p.BuildRetentionMaxPerJob,
 		BuildRetentionMaxAgeDays: p.BuildRetentionMaxAgeDays,
 		WebhookBranchMode:        p.WebhookBranchMode,
@@ -314,6 +321,14 @@ func (s *PortabilityService) Import(ctx context.Context, doc []byte, opts Import
 	if err != nil {
 		return nil, err
 	}
+	// 导入更新时保留现有审批门禁：旧文档可能没有 require_approval 字段，
+	// 若直接按零值覆盖，生产发布会在迁移后被静默放开。需要关闭审批请走任务编辑接口。
+	if existing != nil && mode == "update" && !pipeline.RequireApproval {
+		pipeline.RequireApproval = existing.RequireApproval
+		if pipeline.ApprovalTimeoutMinutes == 0 {
+			pipeline.ApprovalTimeoutMinutes = existing.ApprovalTimeoutMinutes
+		}
+	}
 	switch {
 	case existing != nil && mode == "skip":
 		outcome.Pipeline = existing
@@ -419,20 +434,6 @@ var knownDocFields = map[string]bool{
 	"webhook_secret": true,
 }
 
-// toPipelineSkeleton 把导出文档转成 model.Pipeline 的骨架（用于回退解析与名称读取）。
-func toPipelineSkeleton(d exportDoc) model.Pipeline {
-	return model.Pipeline{
-		Name:        d.Name,
-		Description: d.Description,
-		Steps:       d.Steps,
-		GitURL:      d.GitURL,
-		GitBranch:   d.GitBranch,
-		CronSpec:    d.CronSpec,
-		Params:      d.Params,
-		Artifacts:   d.Artifacts,
-	}
-}
-
 // toPipeline 合并导出文档与原生文档，产出最终任务定义。
 func (s *PortabilityService) toPipeline(ctx context.Context, exported *PipelineExport, raw *rawDoc, add func(level, field, format string, args ...interface{})) (*model.Pipeline, error) {
 	p := &model.Pipeline{GitBranch: "main"}
@@ -450,11 +451,13 @@ func (s *PortabilityService) toPipeline(ctx context.Context, exported *PipelineE
 	if len(p.Params) == 0 {
 		p.Params = raw.Params
 	}
-	if exported.Artifacts.Enabled || len(exported.Artifacts.Files) > 0 {
+	if exported.Artifacts.Enabled || len(exported.Artifacts.Files) > 0 || exported.Artifacts.AllowEmpty {
 		p.Artifacts = exported.Artifacts
 	} else {
 		p.Artifacts = raw.Artifacts
 	}
+	// allow_empty 是独立开关：旧文档没有该字段时从原生配置补齐。
+	p.Artifacts.AllowEmpty = exported.Artifacts.AllowEmpty || raw.Artifacts.AllowEmpty
 	p.WebhookBranchMode = firstNonEmpty(exported.WebhookBranchMode, raw.WebhookBranchMode)
 	if len(exported.WebhookBranches) > 0 {
 		p.WebhookBranches = append([]string(nil), exported.WebhookBranches...)
@@ -466,6 +469,9 @@ func (s *PortabilityService) toPipeline(ctx context.Context, exported *PipelineE
 	} else {
 		p.WebhookEvents = append([]string(nil), raw.WebhookEvents...)
 	}
+	// 审批配置：导出文档与原生 config.json 都接受；任一侧开启即保留。
+	p.RequireApproval = exported.RequireApproval || raw.RequireApproval
+	p.ApprovalTimeoutMinutes = firstIntValue(exported.ApprovalTimeoutMinutes, raw.ApprovalTimeoutMinutes)
 	p.BuildRetentionMaxPerJob = firstIntValue(exported.BuildRetentionMaxPerJob, raw.BuildRetentionMaxPerJob)
 	p.BuildRetentionMaxAgeDays = firstIntValue(exported.BuildRetentionMaxAgeDays, raw.BuildRetentionMaxAgeDays)
 	if len(exported.ToolSelections) > 0 {

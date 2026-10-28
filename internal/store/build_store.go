@@ -162,7 +162,7 @@ func (s *BuildStore) writeNextBuildMark(pipelineID, next string) error {
 	if err := pkg.EnsureDir(filepath.Join(s.jobsRoot, pipelineID)); err != nil {
 		return err
 	}
-	return os.WriteFile(s.nextBuildFile(pipelineID), []byte(strconv.Itoa(n)+"\n"), 0o644)
+	return os.WriteFile(s.nextBuildFile(pipelineID), []byte(strconv.Itoa(n)+"\n"), 0o600)
 }
 
 // Create 创建构建目录并写入 build.json。
@@ -253,7 +253,7 @@ func (s *BuildStore) LogWriter(ctx context.Context, pipelineID, buildID string) 
 	if err := pkg.EnsureDir(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open log %s: %w", path, err)
 	}
@@ -272,7 +272,7 @@ func (s *BuildStore) AppendLog(ctx context.Context, pipelineID, buildID string, 
 	if err := pkg.EnsureDir(filepath.Dir(path)); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("open log %s: %w", path, err)
 	}

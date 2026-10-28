@@ -24,8 +24,20 @@ func NewViewHandler(views *service.ViewService, pipelines *service.PipelineServi
 }
 
 // List GET /api/views：全部视图。
+// 视图的 Jobs 字段可能包含用户无 job.read 权限的任务名，必须按当前用户过滤；
+// 否则拥有 view.read 但没有任务权限的人可借视图列表枚举任务。
 func (h *ViewHandler) List(w http.ResponseWriter, r *http.Request) {
-	pkg.OK(w, h.views.List())
+	user := pkg.UserFromContext(r.Context())
+	views := h.views.List()
+	for i := range views {
+		names, err := h.views.JobNames(r.Context(), &views[i], user)
+		if err != nil {
+			pkg.Fail(w, err)
+			return
+		}
+		views[i].Jobs = names
+	}
+	pkg.OK(w, views)
 }
 
 // Jobs GET /api/views/{name}/jobs：视图内任务列表（含构建聚合）。

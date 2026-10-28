@@ -139,13 +139,12 @@ func TestMatchFilesRejectsTraversal(t *testing.T) {
 }
 
 func TestSSHHostKeyCallback(t *testing.T) {
-	// 未配置：保持兼容（不校验），但回调可用。
-	callback, err := sshHostKeyCallback("")
-	if err != nil || callback == nil {
-		t.Fatalf("empty known_hosts should fall back to permissive callback: %v", err)
+	// 未配置：默认拒绝发布，避免静默关闭主机密钥校验。
+	if _, err := sshHostKeyCallback(""); err == nil {
+		t.Fatal("empty known_hosts must be rejected (host key verification is mandatory)")
 	}
 	// 配置了不存在的文件：构建应失败，而不是静默跳过校验。
-	if _, err = sshHostKeyCallback(filepath.Join(t.TempDir(), "missing_known_hosts")); err == nil {
+	if _, err := sshHostKeyCallback(filepath.Join(t.TempDir(), "missing_known_hosts")); err == nil {
 		t.Fatal("missing known_hosts file must fail")
 	}
 }

@@ -121,6 +121,8 @@ func (h *RbacHandler) PutAssignments(w http.ResponseWriter, r *http.Request) {
 type addUserRequest struct {
 	Name     string `json:"name"`
 	Password string `json:"password"`
+	// DisplayName 必填且只允许汉字：用户名用于登录，姓名用于界面展示。
+	DisplayName string `json:"display_name"`
 	// Email 必填：构建通知按人员邮箱发信，没有邮箱等于收不到告警。
 	Email string `json:"email"`
 }
@@ -132,7 +134,7 @@ func (h *RbacHandler) AddUser(w http.ResponseWriter, r *http.Request) {
 		pkg.Fail(w, err)
 		return
 	}
-	if err := h.rbac.AddUser(in.Name, in.Password, in.Email); err != nil {
+	if err := h.rbac.AddUser(in.Name, in.Password, in.Email, in.DisplayName); err != nil {
 		pkg.Fail(w, err)
 		return
 	}
@@ -183,10 +185,11 @@ func (h *RbacHandler) ResetUserPassword(w http.ResponseWriter, r *http.Request) 
 
 // contactRequest 是 PUT /api/security/users/contact 请求体。
 type contactRequest struct {
-	Name    string `json:"name"`
-	Email   string `json:"email"`
-	WecomID string `json:"wecom_id"`
-	Phone   string `json:"phone"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Email       string `json:"email"`
+	WecomID     string `json:"wecom_id"`
+	Phone       string `json:"phone"`
 }
 
 // SetUserContact PUT /api/security/users/contact
@@ -197,7 +200,7 @@ func (h *RbacHandler) SetUserContact(w http.ResponseWriter, r *http.Request) {
 		pkg.Fail(w, err)
 		return
 	}
-	if err := h.rbac.SetUserContact(in.Name, in.Email, in.WecomID, in.Phone); err != nil {
+	if err := h.rbac.SetUserContactAndDisplayName(in.Name, in.DisplayName, in.Email, in.WecomID, in.Phone); err != nil {
 		pkg.Fail(w, err)
 		return
 	}

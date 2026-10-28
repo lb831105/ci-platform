@@ -9,6 +9,7 @@ const LABELS: Record<string, string> = {
   failed: '失败',
   running: '构建中',
   pending: '等待中',
+  pending_approval: '待审批',
   aborted: '已取消',
   none: '暂无构建',
 }
@@ -18,6 +19,7 @@ const GLYPHS: Record<string, string> = {
   failed: '✕',
   running: '',
   pending: '',
+  pending_approval: '!',
   aborted: '■',
   none: '',
 }
@@ -63,6 +65,10 @@ const glyph = computed(() => GLYPHS[props.status] ?? '')
 }
 .ball--pending {
   background: #ffb300;
+  border-color: transparent;
+}
+.ball--pending_approval {
+  background: #e6a23c;
   border-color: transparent;
 }
 .ball--aborted {

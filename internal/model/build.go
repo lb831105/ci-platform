@@ -69,9 +69,17 @@ type Build struct {
 	Status      BuildStatus `json:"status"`
 	TriggerType TriggerType `json:"trigger_type"`
 	TriggeredBy string      `json:"triggered_by"` // 手动触发时的用户名；webhook 触发时为 webhook
-	StartedAt   *time.Time  `json:"started_at"`
-	FinishedAt  *time.Time  `json:"finished_at"`
-	ExitCode    int         `json:"exit_code"`
+	// CreatedAt 是触发/入队时间；StartedAt 是真正开始执行的时间。
+	// Jenkins 的 “waiting” 就是这两者之间的差值；旧构建没有该字段时前端回退到 StartedAt。
+	CreatedAt  *time.Time `json:"created_at,omitempty"`
+	StartedAt  *time.Time `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at"`
+	ExitCode   int        `json:"exit_code"`
+
+	// Description 是构建页的备注（对齐 Jenkins Build 的 Add description）。
+	Description string `json:"description,omitempty"`
+	// KeepForever 为 true 时构建保留策略跳过本条记录（对齐 Jenkins “Keep this build forever”）。
+	KeepForever bool `json:"keep_forever,omitempty"`
 
 	// Params 是本次构建实际使用的参数值（触发时快照，便于复盘「这次用的是什么版本号」）。
 	Params map[string]string `json:"params,omitempty"`
@@ -90,10 +98,13 @@ type Build struct {
 
 	// SCM 现场信息：从实际签出的工作区读取，供「按分支路由」与「通知提交者」使用。
 	// 非 Git 任务为空。
-	Branch       string `json:"branch,omitempty"`
-	Commit       string `json:"commit,omitempty"`        // 短 SHA
-	CommitAuthor string `json:"commit_author,omitempty"` // 提交人姓名
-	CommitEmail  string `json:"commit_email,omitempty"`  // 提交人邮箱（路由到提交者用）
+	Branch        string   `json:"branch,omitempty"`
+	Commit        string   `json:"commit,omitempty"`         // 短 SHA
+	CommitFull    string   `json:"commit_full,omitempty"`    // 完整 SHA（构建页展示）
+	CommitMessage string   `json:"commit_message,omitempty"` // 提交说明（构建页的 Changes Summary）
+	ChangedFiles  []string `json:"changed_files,omitempty"`  // 本次提交修改的文件（最多保留前 200 个）
+	CommitAuthor  string   `json:"commit_author,omitempty"`  // 提交人姓名
+	CommitEmail   string   `json:"commit_email,omitempty"`   // 提交人邮箱（路由到提交者用）
 }
 
 // BuildAdvice 是一次构建失败时给出的结构化修复建议。

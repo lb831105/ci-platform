@@ -41,6 +41,11 @@ const settingsStore = useSettingsStore()
 const auth = useAuthStore()
 
 const isEdit = ref(false)
+// Jenkins 2.x 的 Configure 页是 General / Triggers / 流水线 / Advanced 四个页签；
+// 这里保留同样的信息架构，避免长页面滚动时找不到配置项。
+type ConfigureTab = 'general' | 'triggers' | 'pipeline' | 'advanced'
+const activeTab = ref<ConfigureTab>('general')
+const globalQuietPeriod = computed(() => settingsStore.data?.quiet_period_seconds ?? 0)
 // 编辑既有任务时的配置权限（按任务名判断，普通用户可能只被授权部分任务）。
 const canEditExisting = ref(true)
 const saving = ref(false)
@@ -116,6 +121,23 @@ const retentionEnabled = computed({
     }
   },
 })
+
+// 服务端不会回传密钥，只告诉我们是否已配置；用于在编辑页提示当前状态。
+const webhookSecretSet = ref(false)
+
+function generateWebhookSecret(): void {
+  const bytes = new Uint8Array(24)
+  crypto.getRandomValues(bytes)
+  form.value.webhook_secret = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+  form.value.clear_webhook_secret = false
+  webhookSecretSet.value = false
+}
+
+function clearWebhookSecret(): void {
+  form.value.webhook_secret = ''
+  form.value.clear_webhook_secret = true
+  webhookSecretSet.value = false
+}
 
 const webhookUrl = computed(() => {
   const base = (settingsStore.data?.jenkins_url || window.location.origin).replace(/\/$/, '')
@@ -343,6 +365,7 @@ onMounted(async () => {
     canEditExisting.value = auth.canJob('job.configure', pipeline.name)
 
     form.value = toPayload(pipeline)
+    webhookSecretSet.value = pipeline.has_webhook_secret ?? false
     scm.value = form.value.git_url ? 'git' : 'none'
   }
 })
@@ -460,12 +483,19 @@ async function saveCredential(): Promise<void> {
 
   credSaving.value = true
   try {
+    let gitHost = ''
+    try {
+      gitHost = new URL(form.value.git_url).hostname.toLowerCase()
+    } catch {
+      // URL 尚未填完整时允许创建不带作用域的凭据，稍后可在凭据管理里补。
+    }
     const created = await credentialApi.create({
       name,
       type: 'username_password',
       username,
       description: 'Git 账号密码',
       secret: password,
+      allowed_hosts: gitHost ? [gitHost] : [],
     })
     saveCredDraft()
     // 先本地插入：即使随后列表刷新失败，新建的账号也能被选中并显示。
@@ -571,17 +601,18 @@ function copyWebhook(): void {
       style="margin-bottom: 12px"
     />
 
-    <nav class="configure__nav">
-      <a @click="scrollTo('general')">General</a>
-      <a @click="scrollTo('scm')">源码管理</a>
-      <a @click="scrollTo('triggers')">构建触发器</a>
-      <a @click="scrollTo('environment')">构建环境</a>
-      <a @click="scrollTo('steps')">构建步骤</a>
-      <a @click="scrollTo('postbuild')">构建后操作</a>
+    <nav class="configure__breadcrumb" aria-label="breadcrumb">
+      <RouterLink :to="{ name: 'pipeline-list' }">任务</RouterLink>
+      <span class="configure__breadcrumb-sep">/</span>
+      <span>{{ form.name || '新建任务' }}</span>
+      <span class="configure__breadcrumb-sep">/</span>
+      <span>Configure</span>
     </nav>
 
     <el-card v-loading="loading" shadow="never" class="configure__card">
-      <section id="general" class="config-section">
+      <el-tabs v-model="activeTab" class="configure__tabs">
+        <el-tab-pane label="General" name="general">
+        <section id="general" class="config-section">
         <h2 class="config-section__title">General</h2>
         <el-form label-width="160px" label-position="right">
           <el-form-item label="任务名称">
@@ -611,13 +642,12 @@ function copyWebhook(): void {
             </div>
             <div class="form-tip">定义参数后，触发构建会先弹出参数表单；参数以环境变量注入步骤并快照进构建记录。</div>
           </el-form-item>
-          <el-form-item label="在必要的时候并发构建">
-            <el-alert
-              type="info"
-              :closable="false"
-              show-icon
-              title="平台对同一任务固定串行执行（避免多个构建同时写同一工作区），不同任务按 worker 数量并行；与 Jenkins 的「并发构建」开关等价于关闭。"
-            />
+          <el-form-item label="不允许并发构建">
+            <el-checkbox :model-value="true" disabled>不允许并发构建</el-checkbox>
+            <div class="form-tip">
+              平台固定同一任务串行执行（避免多个构建同时写同一工作区），不同任务按 worker 数量并行；
+              因此这个 Jenkins 选项在平台中等价于始终勾选。
+            </div>
           </el-form-item>
           <el-form-item label="禁用任务">
             <el-alert
@@ -628,57 +658,29 @@ function copyWebhook(): void {
             />
           </el-form-item>
         </el-form>
-      </section>
-
-      <section id="scm" class="config-section">
-        <h2 class="config-section__title">源码管理</h2>
-        <p class="config-section__hint">连接并管理代码仓库，构建时自动拉取最新代码。</p>
+        </section>
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          style="margin: 0 0 18px"
+        title="GitHub 项目、GitLab Connection、Preserve stashes、Throttle builds 等 Jenkins 插件项未启用；代码仓库在「流水线」配置，GitLab 状态回写在「Triggers」配置。"
+      />
+        <section id="params" class="config-section">
+        <h2 class="config-section__title">参数化构建</h2>
+        <p class="config-section__hint">
+          定义参数后，点击「构建」会先弹出参数表单；参数以环境变量形式传给构建步骤。
+        </p>
         <el-form label-width="160px" label-position="right">
-          <el-form-item label="源码管理">
-            <el-radio-group v-model="scm">
-              <el-radio value="none">无</el-radio>
-              <el-radio value="git">Git</el-radio>
-            </el-radio-group>
-            <div class="form-tip">选择「无」表示直接在工作区执行步骤，不拉取代码。</div>
+          <el-form-item label="构建参数">
+            <ParamConfig v-model="form.params" />
           </el-form-item>
-          <template v-if="scm === 'git'">
-            <el-form-item label="Repository URL">
-              <el-input v-model="form.git_url" class="mono" placeholder="https://git.example.com/group/repo.git" />
-            </el-form-item>
-            <el-form-item label="Credentials">
-              <div class="cred-row">
-                <el-select
-                  v-model="form.git_credential_id"
-                  clearable
-                  filterable
-                  placeholder="选择账号密码 / 令牌凭据（私有仓库必填）"
-                  style="flex: 1; min-width: 260px"
-                >
-                  <el-option
-                    v-for="cred in credentials"
-                    :key="cred.id"
-                    :label="cred.username ? `${cred.name}（${cred.username}）` : cred.name"
-                    :value="cred.id"
-                  />
-                </el-select>
-                <el-button v-if="auth.hasPerm('credential.create')" @click="openCredDialog">新增账号密码</el-button>
-                <RouterLink v-if="auth.hasPerm('credential.view')" :to="{ name: 'system-credentials' }">
-                  <el-button>管理凭据</el-button>
-                </RouterLink>
-              </div>
-              <div class="form-tip">私有仓库需要账号密码或访问令牌；凭据保存到凭据库后，构建拉取时自动使用。</div>
-            </el-form-item>
-            <el-form-item label="指定分支">
-              <el-input v-model="form.git_branch" class="mono" placeholder="main（留空默认 main，暂不支持 any）" style="max-width: 320px" />
-            </el-form-item>
-            <el-form-item label="Additional Behaviours">
-              <el-alert type="info" :closable="false" show-icon title="基础版使用浅克隆（depth=1），不提供额外行为扩展。" />
-            </el-form-item>
-          </template>
         </el-form>
-      </section>
+        </section>
+        </el-tab-pane>
 
-      <section id="triggers" class="config-section">
+        <el-tab-pane label="Triggers" name="triggers" lazy>
+        <section id="triggers" class="config-section">
         <h2 class="config-section__title">构建触发器</h2>
         <p class="config-section__hint">根据事件自动触发构建，如代码提交或远程调用。</p>
         <el-form label-width="160px" label-position="right">
@@ -690,7 +692,21 @@ function copyWebhook(): void {
             <div class="form-tip">通过该地址触发构建。密钥校验兼容三种来源（任一匹配即通过）：请求头 <span class="mono">X-Webhook-Secret</span>（curl / CI 脚本）、<span class="mono">X-Gitlab-Token</span>（GitLab Webhook）、<span class="mono">X-Hub-Signature-256</span>（GitHub Webhook HMAC）。</div>
           </el-form-item>
           <el-form-item label="Webhook 密钥">
-            <el-input v-model="form.webhook_secret" placeholder="留空表示该 Webhook 不校验密钥（不建议）" style="max-width: 480px" />
+            <div class="webhook-row">
+              <el-input
+                v-model="form.webhook_secret"
+                type="password"
+                show-password
+                :placeholder="webhookSecretSet ? '已配置；留空保存会保留原密钥' : '留空表示禁用远程触发'"
+                style="max-width: 480px"
+                @input="form.clear_webhook_secret = false"
+              />
+              <el-button @click="generateWebhookSecret">生成密钥</el-button>
+              <el-button v-if="webhookSecretSet" @click="clearWebhookSecret">清除密钥</el-button>
+            </div>
+            <div class="form-tip">
+              远程触发必须配置密钥；留空保存不会清空已有密钥，填写新值即轮换。任务列表/详情接口永远不会回传密钥。
+            </div>
           </el-form-item>
           <el-form-item label="GitLab / GitHub">
             <div class="form-tip">
@@ -786,9 +802,65 @@ function copyWebhook(): void {
             />
           </el-form-item>
         </el-form>
-      </section>
+        </section>
+        </el-tab-pane>
 
-      <section id="environment" class="config-section">
+        <el-tab-pane label="流水线" name="pipeline" lazy>
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 14px"
+        title="平台不使用 Jenkinsfile / Groovy 沙盒：流水线由「源码管理 + 构建步骤」定义，构建后操作在下方配置。"
+      />
+        <section id="scm" class="config-section">
+        <h2 class="config-section__title">源码管理</h2>
+        <p class="config-section__hint">连接并管理代码仓库，构建时自动拉取最新代码。</p>
+        <el-form label-width="160px" label-position="right">
+          <el-form-item label="源码管理">
+            <el-radio-group v-model="scm">
+              <el-radio value="none">无</el-radio>
+              <el-radio value="git">Git</el-radio>
+            </el-radio-group>
+            <div class="form-tip">选择「无」表示直接在工作区执行步骤，不拉取代码。</div>
+          </el-form-item>
+          <template v-if="scm === 'git'">
+            <el-form-item label="Repository URL">
+              <el-input v-model="form.git_url" class="mono" placeholder="https://git.example.com/group/repo.git" />
+            </el-form-item>
+            <el-form-item label="Credentials">
+              <div class="cred-row">
+                <el-select
+                  v-model="form.git_credential_id"
+                  clearable
+                  filterable
+                  placeholder="选择账号密码 / 令牌凭据（私有仓库必填）"
+                  style="flex: 1; min-width: 260px"
+                >
+                  <el-option
+                    v-for="cred in credentials"
+                    :key="cred.id"
+                    :label="cred.username ? `${cred.name}（${cred.username}）` : cred.name"
+                    :value="cred.id"
+                  />
+                </el-select>
+                <el-button v-if="auth.hasPerm('credential.create')" @click="openCredDialog">新增账号密码</el-button>
+                <RouterLink v-if="auth.hasPerm('credential.view')" :to="{ name: 'system-credentials' }">
+                  <el-button>管理凭据</el-button>
+                </RouterLink>
+              </div>
+              <div class="form-tip">私有仓库需要账号密码或访问令牌；凭据保存到凭据库后，构建拉取时自动使用。</div>
+            </el-form-item>
+            <el-form-item label="指定分支">
+              <el-input v-model="form.git_branch" class="mono" placeholder="main（留空默认 main，暂不支持 any）" style="max-width: 320px" />
+            </el-form-item>
+            <el-form-item label="Additional Behaviours">
+              <el-alert type="info" :closable="false" show-icon title="基础版使用浅克隆（depth=1），不提供额外行为扩展。" />
+            </el-form-item>
+          </template>
+        </el-form>
+        </section>
+        <section id="environment" class="config-section">
         <h2 class="config-section__title">构建环境</h2>
         <p class="config-section__hint">定义构建运行时的上下文，如工作区清理策略。</p>
         <el-form label-width="220px" label-position="right">
@@ -846,21 +918,8 @@ function copyWebhook(): void {
             />
           </el-form-item>
         </el-form>
-      </section>
-
-      <section id="params" class="config-section">
-        <h2 class="config-section__title">参数化构建</h2>
-        <p class="config-section__hint">
-          定义参数后，点击「构建」会先弹出参数表单；参数以环境变量形式传给构建步骤。
-        </p>
-        <el-form label-width="160px" label-position="right">
-          <el-form-item label="构建参数">
-            <ParamConfig v-model="form.params" />
-          </el-form-item>
-        </el-form>
-      </section>
-
-      <section id="steps" class="config-section">
+        </section>
+        <section id="steps" class="config-section">
         <h2 class="config-section__title">构建步骤</h2>
         <p class="config-section__hint">按顺序编排构建任务，如编译、测试与打包；每步可单独设置超时、重试与失败处理。</p>
         <el-form label-width="160px" label-position="right">
@@ -879,9 +938,8 @@ function copyWebhook(): void {
             </div>
           </el-form-item>
         </el-form>
-      </section>
-
-      <section id="postbuild" class="config-section">
+        </section>
+        <section id="postbuild" class="config-section">
         <h2 class="config-section__title">构建后操作</h2>
         <p class="config-section__hint">构建完成后的动作：先归档产物，再执行 SSH 发布与通知。</p>
         <ArtifactConfig v-if="form.artifacts" v-model="form.artifacts" />
@@ -929,7 +987,40 @@ function copyWebhook(): void {
           :testing="testingNotify"
           @test="onTestNotify"
         />
-      </section>
+        </section>
+        </el-tab-pane>
+
+        <el-tab-pane label="Advanced" name="advanced" lazy>
+        <section id="advanced" class="config-section">
+        <h2 class="config-section__title">Advanced</h2>
+        <p class="config-section__hint">Jenkins 高级项在平台上的对应位置。</p>
+        <el-form label-width="160px" label-position="right">
+          <el-form-item label="静默期">
+            <el-input-number :model-value="globalQuietPeriod" :min="0" :max="3600" disabled />
+            <span class="muted" style="margin-left: 8px">秒</span>
+            <div class="form-tip">
+              平台在「系统管理 → 系统配置 → 静默期」统一配置，任务级暂不覆盖；
+              当前值 {{ globalQuietPeriod }} 秒。<RouterLink :to="{ name: 'system-configure' }">去修改</RouterLink>
+            </div>
+          </el-form-item>
+          <el-form-item label="显示的名称">
+            <el-input :model-value="form.name" disabled />
+            <div class="form-tip">
+              平台以任务名作为唯一标识和显示名；重命名会同步工作区目录与角色 Pattern，避免两个名称不一致。
+            </div>
+          </el-form-item>
+          <el-form-item label="其他 Jenkins 选项">
+            <el-alert
+              type="info"
+              :closable="false"
+              show-icon
+              title="平台不执行 Jenkinsfile / Groovy，也不依赖 Jenkins master：不允许并发构建、当 master 重启后不允许恢复、流水线效率/持久保存等选项不适用。并发策略固定为同一任务串行，不同任务按 worker 并行。"
+            />
+          </el-form-item>
+        </el-form>
+        </section>
+        </el-tab-pane>
+      </el-tabs>
 
       <div class="configure__footer">
         <el-button type="primary" :loading="saving" @click="onSave">保存</el-button>
@@ -1028,24 +1119,29 @@ function copyWebhook(): void {
   margin-left: 10px;
   vertical-align: middle;
 }
-.configure__nav {
+.configure__breadcrumb {
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
-  margin-bottom: 16px;
-}
-.configure__nav a {
-  padding: 5px 14px;
-  border: 1px solid #dcdfe6;
-  border-radius: 16px;
-  background: #fff;
-  color: var(--brand-600);
+  margin: 0 0 12px;
+  color: var(--text-2, #606266);
   font-size: 13px;
-  cursor: pointer;
 }
-.configure__nav a:hover {
-  border-color: var(--brand-600);
-  background: var(--brand-50);
+.configure__breadcrumb a {
+  color: var(--brand-600);
+  text-decoration: none;
+}
+.configure__breadcrumb a:hover {
+  text-decoration: underline;
+}
+.configure__breadcrumb-sep {
+  color: #c0c4cc;
+}
+.configure__tabs :deep(.el-tabs__header) {
+  margin-bottom: 18px;
+}
+.configure__tabs :deep(.el-tabs__item) {
+  font-size: 14px;
 }
 .configure__card {
   max-width: 980px;

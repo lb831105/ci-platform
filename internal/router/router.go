@@ -222,11 +222,16 @@ func New(d Deps) http.Handler {
 					r.With(jobPerm(model.PermJobDelete)).Delete("/", d.Pipeline.Delete)
 					r.With(jobPerm(model.PermJobBuild)).Post("/build", d.Pipeline.TriggerBuild)
 					r.With(jobPerm(model.PermJobBuild)).Post("/builds/{bid}/cancel", d.Build.Cancel)
+					// 发布审批：审批人必须拥有 job.approve，不能复用触发/配置权限。
+					r.With(jobPerm(model.PermJobApprove)).Post("/builds/{bid}/approve", d.Build.Approve)
+					r.With(jobPerm(model.PermJobApprove)).Post("/builds/{bid}/reject", d.Build.Reject)
 					r.With(jobPerm(model.PermJobConfigure)).Post("/rename", d.Pipeline.Rename)
 					r.With(jobPerm(model.PermJobConfigure)).Post("/notify/test", d.Notify.TestNotify)
 
 					r.With(jobPerm(model.PermJobRead)).Get("/builds", d.Build.List)
 					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}", d.Build.Get)
+					// 构建页备注与「永久保留」：写操作，按任务配置权限控制。
+					r.With(jobPerm(model.PermJobConfigure)).Put("/builds/{bid}", d.Build.Update)
 					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}/log", d.Build.Log)
 					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}/artifacts", d.Build.Artifacts)
 					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}/artifacts/download", d.Build.DownloadArtifact)

@@ -39,7 +39,7 @@ const liveBuildId = ref('')
 const history = computed(() => buildStore.getHistory(props.pipelineId))
 
 function hasActive(list: Build[]): boolean {
-  return list.some((item) => item.status === 'pending' || item.status === 'running')
+  return list.some((item) => item.status === 'pending' || item.status === 'pending_approval' || item.status === 'running')
 }
 
 // 存在未结束的构建时持续刷新历史，全部结束即停止。
@@ -575,7 +575,7 @@ function showChanges(): void {
                 <span class="build-row__cause">{{ causeText(build) }}</span>
                 <span class="build-row__time mono">{{ clockLabel(build.started_at) }}</span>
                 <span
-                  v-if="(build.status === 'running' || build.status === 'pending') && can('job.build')"
+                  v-if="(build.status === 'running' || build.status === 'pending' || build.status === 'pending_approval') && can('job.build')"
                   class="build-row__stop"
                   @click.stop="onCancel(build)"
                 >{{ cancellingId === build.id ? '停止中…' : '停止' }}</span>

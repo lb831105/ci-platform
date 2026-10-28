@@ -1,10 +1,11 @@
 package service
 
 import (
-	"ci-platform/internal/pkg/logger"
 	"sync/atomic"
+	"time"
 
 	"ci-platform/internal/model"
+	"ci-platform/internal/pkg/logger"
 )
 
 // AuditRecorder 由 AuditStore 实现：追加与读取审计记录。
@@ -39,6 +40,9 @@ func (s *AuditService) Post(e model.AuditEntry) {
 		return
 	}
 	e.ID = s.seq.Add(1)
+	if e.Time.IsZero() {
+		e.Time = time.Now().UTC()
+	}
 	e.User = sanitizeAuditUser(e.User)
 	if err := s.recorder.Append(&e); err != nil {
 		logger.Errorf("[audit] append failed: %v", err)

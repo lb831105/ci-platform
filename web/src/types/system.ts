@@ -242,6 +242,7 @@ export interface Credential {
   type: CredentialType
   username?: string
   description: string
+  allowed_hosts?: string[]
   created_at: string
   updated_at: string
 }
@@ -252,6 +253,7 @@ export interface CredentialPayload {
   username: string
   description: string
   secret: string
+  allowed_hosts?: string[]
 }
 
 // 操作审计日志条目（与 Go model.AuditEntry 对齐）。

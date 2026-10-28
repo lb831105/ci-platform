@@ -1,6 +1,7 @@
 // 个人资料（与 Go model.Profile 对齐）：当前登录用户的联系方式与邮箱验证状态。
 export interface Profile {
   name: string
+  display_name?: string
   email?: string
   wecom_id?: string
   phone?: string

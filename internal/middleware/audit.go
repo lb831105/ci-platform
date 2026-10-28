@@ -2,6 +2,8 @@ package middleware
 
 import (
 	"bytes"
+	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -32,13 +34,28 @@ func Audit(audit AuditPoster) func(http.Handler) http.Handler {
 			// 包装 ResponseWriter 以捕获业务码与登录用户名（平台恒返回 HTTP 200，
 			// 成败在 body 的 code 字段；登录成功后 username 在响应体中）。
 			rw := &auditResponseWriter{ResponseWriter: w}
+			// 登录失败时响应体里没有 username；从请求体提取（只取 username，
+			// 密码绝不落盘），否则审计日志会丢失「谁尝试登录失败」。
+			loginUser := ""
+			if r.URL.Path == "/api/auth/login" && r.Body != nil {
+				body, _ := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+				r.Body = io.NopCloser(bytes.NewReader(body))
+				var in struct {
+					Username string `json:"username"`
+				}
+				if json.Unmarshal(body, &in) == nil {
+					loginUser = strings.TrimSpace(in.Username)
+				}
+			}
 			// 用户名必须在 next 之前读：挂载点在 Auth 之后，请求进入本中间件时
 			// context 已含用户名（内层写入的 context 不会传回外层）。
 			user := pkg.UserFromContext(r.Context())
 			next.ServeHTTP(rw, r)
-			if r.URL.Path == "/api/auth/login" && rw.body.Len() > 0 {
+			if r.URL.Path == "/api/auth/login" {
 				if name := parseLoginUsername(rw.body.Bytes()); name != "" {
 					user = name
+				} else if loginUser != "" {
+					user = loginUser
 				}
 			}
 			// 登录/登出用专门的动作名，其余按 METHOD 归类。

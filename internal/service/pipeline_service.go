@@ -197,6 +197,13 @@ func (s *PipelineService) Update(ctx context.Context, id string, in *model.Pipel
 	in.ID = id
 	in.CreatedAt = old.CreatedAt
 	in.UpdatedAt = time.Now().UTC()
+	// Webhook 密钥从不回显：前端提交空值时沿用旧密钥，避免「打开配置直接保存」
+	// 把外部 Webhook 弄失效。需要更换时直接填入新密钥即可。
+	if in.ClearWebhookSecret {
+		in.WebhookSecret = ""
+	} else if strings.TrimSpace(in.WebhookSecret) == "" {
+		in.WebhookSecret = old.WebhookSecret
+	}
 	// 先合并敏感字段再校验：编辑时前端不回显密码，需用旧值补齐，
 	// 否则 auth_type=password 的任务保存会被“密码必填”误拦截。
 	mergeSensitive(old, in)
@@ -459,6 +466,8 @@ func normalizeAndValidate(p *model.Pipeline, nameRegex string, defaultBranch ...
 	p.GitBranch = strings.TrimSpace(p.GitBranch)
 	p.GitCredential = strings.TrimSpace(p.GitCredential)
 	p.WebhookSecret = strings.TrimSpace(p.WebhookSecret)
+	p.HasWebhookSecret = false // 只读提示位，不进入持久化配置
+	p.ClearWebhookSecret = false
 	// 平台已改为纯本地构建；executor/image 字段保留仅为兼容旧数据，不再参与调度。
 	p.Executor = model.ExecutorLocal
 	// Webhook 触发器策略（事件 / 分支 / 回写），业务规则只在这里校验。
@@ -787,6 +796,9 @@ func normalizeNotifyTargets(in []model.NotifyTarget, label string) ([]model.Noti
 		if !strings.HasPrefix(t.URL, "http://") && !strings.HasPrefix(t.URL, "https://") {
 			return nil, pkg.ErrBadRequest("%s URL 必须以 http:// 或 https:// 开头", label)
 		}
+		if err := ValidateNotifyTargetURL(t.URL); err != nil {
+			return nil, notifyURLValidationError(label, t.URL, err)
+		}
 		key := t.Channel + "|" + pkg.MaskWebhookURL(t.Channel, t.URL)
 		if seen[key] {
 			continue
@@ -952,15 +964,57 @@ func normalizeNotifyChannel(channel string) string {
 }
 
 func mergeSensitive(old, in *model.Pipeline) {
-	if old.SshPublish == nil || in.SshPublish == nil {
+	if old.SshPublish != nil && in.SshPublish != nil {
+		if in.SshPublish.PrivateKeyPath == "" {
+			in.SshPublish.PrivateKeyPath = old.SshPublish.PrivateKeyPath
+		}
+		if in.SshPublish.Password == "" {
+			in.SshPublish.Password = old.SshPublish.Password
+		}
+	}
+	// 多目标发布：接口返回时密码被清空，编辑保存时按 server_id 回填旧密码。
+	// 同一个 server_id 可能被多个目标复用（不同远程目录），这里只按顺序匹配，
+	// 密码相同不影响正确性；服务器级凭据优先，内联密码仅用于兼容旧任务。
+	if len(in.SshPublishes) == 0 || len(old.SshPublishes) == 0 {
 		return
 	}
-	if in.SshPublish.PrivateKeyPath == "" {
-		in.SshPublish.PrivateKeyPath = old.SshPublish.PrivateKeyPath
+	oldByKey := make(map[string]model.SshPublishConfig, len(old.SshPublishes))
+	for _, item := range old.SshPublishes {
+		key := sshPublishMergeKey(item)
+		if key != "" {
+			oldByKey[key] = item
+		}
 	}
-	if in.SshPublish.Password == "" {
-		in.SshPublish.Password = old.SshPublish.Password
+	for i := range in.SshPublishes {
+		key := sshPublishMergeKey(in.SshPublishes[i])
+		if key == "" {
+			continue
+		}
+		prev, ok := oldByKey[key]
+		if !ok {
+			continue
+		}
+		if in.SshPublishes[i].PrivateKeyPath == "" {
+			in.SshPublishes[i].PrivateKeyPath = prev.PrivateKeyPath
+		}
+		if in.SshPublishes[i].Password == "" {
+			in.SshPublishes[i].Password = prev.Password
+		}
 	}
+}
+
+// sshPublishMergeKey 返回多目标敏感字段回填的匹配键。
+// 优先用稳定的 server_id；旧版内联配置没有 server_id 时退回 host+username。
+func sshPublishMergeKey(item model.SshPublishConfig) string {
+	if id := strings.TrimSpace(item.ServerID); id != "" {
+		return "server:" + strings.ToLower(id)
+	}
+	host := strings.TrimSpace(item.Host)
+	user := strings.TrimSpace(item.Username)
+	if host == "" || user == "" {
+		return ""
+	}
+	return "inline:" + strings.ToLower(host) + "|" + user
 }
 
 // 从显式构建命令推断产物位置，用于旧任务的一次性自动归档迁移。
@@ -1048,6 +1102,21 @@ const (
 // 参数会被写成环境变量（NAME 与 CI_PARAM_NAME），非法字符会让 shell 无法读取。
 var paramNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// reservedEnvNames 是构建参数禁止覆盖的危险环境变量。
+// 任务参数最终会注入步骤进程；允许覆盖 PATH/LD_PRELOAD/NODE_OPTIONS 等
+// 等于绕过平台的工具链与进程隔离，可能加载任意动态库或执行非预期程序。
+var reservedEnvNames = map[string]bool{
+	"PATH": true, "HOME": true, "TMPDIR": true, "TEMP": true, "TMP": true,
+	"LD_PRELOAD": true, "LD_LIBRARY_PATH": true, "DYLD_INSERT_LIBRARIES": true,
+	"DYLD_LIBRARY_PATH": true, "BASH_ENV": true, "IFS": true,
+	"CDPATH": true, "GLOBIGNORE": true, "SHELL": true, "COMSPEC": true, "PATHEXT": true,
+	"NODE_OPTIONS": true, "PYTHONPATH": true, "PYTHONHOME": true,
+	"GEM_HOME": true, "GEM_PATH": true, "JAVA_TOOL_OPTIONS": true, "_JAVA_OPTIONS": true,
+	"MAVEN_OPTS": true, "GRADLE_OPTS": true, "GIT_SSH_COMMAND": true,
+	"GIT_CONFIG_GLOBAL": true, "GIT_CONFIG_SYSTEM": true, "SSH_AUTH_SOCK": true,
+	"HTTP_PROXY": true, "HTTPS_PROXY": true, "ALL_PROXY": true, "NO_PROXY": true,
+}
+
 // normalizeParams 归一化并校验参数定义（对齐 Jenkins Parameters 的常用能力）。
 func normalizeParams(p *model.Pipeline) error {
 	if len(p.Params) == 0 {
@@ -1066,6 +1135,9 @@ func normalizeParams(p *model.Pipeline) error {
 		}
 		if len(def.Name) > maxParamNameLen || !paramNamePattern.MatchString(def.Name) {
 			return pkg.ErrBadRequest("参数名 %q 非法：只能用字母、数字、下划线，且不能以数字开头", def.Name)
+		}
+		if reservedEnvNames[strings.ToUpper(def.Name)] {
+			return pkg.ErrBadRequest("参数名 %q 是平台保留的环境变量，不能覆盖", def.Name)
 		}
 		// CI_ 前缀是平台保留命名空间，避免任务覆盖 CI_BUILD_ID 等内置变量。
 		if strings.HasPrefix(strings.ToUpper(def.Name), "CI_") {

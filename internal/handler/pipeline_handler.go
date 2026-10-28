@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -28,6 +29,10 @@ func sanitizePipeline(p *model.Pipeline) *model.Pipeline {
 	if p == nil {
 		return p
 	}
+	// Webhook 密钥只用于校验来源，绝不能通过列表/详情/创建/更新响应回显。
+	// HasWebhookSecret 让前端仍能显示「已配置」，但值本身永远是空。
+	p.HasWebhookSecret = strings.TrimSpace(p.WebhookSecret) != ""
+	p.WebhookSecret = ""
 	if p.SshPublish != nil {
 		p.SshPublish.Password = ""
 	}

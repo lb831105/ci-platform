@@ -110,8 +110,12 @@ func (c *Config) ParseArgs(args []string) error {
 
 	// 记录 data-home 是否由命令行显式指定：显式指定时优先于引导配置文件。
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "data-home" {
+		switch f.Name {
+		case "data-home":
 			c.DataHomeSet = true
+		case "auth-password":
+			// 显式传了密码就不再是自动生成，main 不应把用户密码打印到日志。
+			c.AuthPasswordGenerated = false
 		}
 	})
 

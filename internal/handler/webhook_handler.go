@@ -27,17 +27,23 @@ type WebhookHandler struct {
 	limiter   *pkg.RateLimiter
 	// dedupe 抵消重复投递（GitLab 的 Resend、代理重试）：同一次投递只构建一次。
 	dedupe *pkg.Dedupe
+	// audit 记录未经过 Auth 中间件的 Webhook 触发（含来源 IP 与结果）。
+	audit *service.AuditService
 }
 
 // NewWebhookHandler 构造 Webhook 处理器。
-func NewWebhookHandler(pipelines *service.PipelineService, builds *service.BuildService, trigger *PipelineHandler) *WebhookHandler {
-	return &WebhookHandler{
+func NewWebhookHandler(pipelines *service.PipelineService, builds *service.BuildService, trigger *PipelineHandler, audit ...*service.AuditService) *WebhookHandler {
+	h := &WebhookHandler{
 		pipelines: pipelines,
 		builds:    builds,
 		trigger:   trigger,
 		limiter:   pkg.NewRateLimiter(120, time.Minute),
 		dedupe:    pkg.NewDedupe(10*time.Minute, 4096),
 	}
+	if len(audit) > 0 {
+		h.audit = audit[0]
+	}
+	return h
 }
 
 // webhookIgnored 是「策略忽略」的响应体：明确告诉调用方为什么没构建。
@@ -72,11 +78,18 @@ func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	// 读失败时保持旧行为（当作无 body），不能让一次畸形请求变成 500。
 	body, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 
-	if p.WebhookSecret != "" {
-		if !h.verifySecret(w, r, p.WebhookSecret, body) {
-			pkg.FailStatus(w, pkg.NewError(pkg.CodeUnauthorized, "invalid webhook secret"))
-			return
-		}
+	// 空密钥 = 禁止远程触发，而不是「跳过校验」。新建任务默认没有密钥，
+	// 绝不能因此变成任何人知道任务 ID 就能触发构建/发布。
+	if strings.TrimSpace(p.WebhookSecret) == "" {
+		h.recordAudit(r, pipelineID, pkg.CodeForbidden, "secret-not-configured")
+		pkg.FailStatus(w, pkg.NewError(pkg.CodeForbidden,
+			"该任务未配置 Webhook 密钥，远程触发已禁用；请在任务配置中设置密钥"))
+		return
+	}
+	if !h.verifySecret(w, r, p.WebhookSecret, body) {
+		h.recordAudit(r, pipelineID, pkg.CodeUnauthorized, "invalid-secret")
+		pkg.FailStatus(w, pkg.NewError(pkg.CodeUnauthorized, "invalid webhook secret"))
+		return
 	}
 
 	ev := webhook.Parse(r.Header, body)
@@ -84,6 +97,7 @@ func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		pipelineID, ev.Kind, ev.BranchRef(), ev.Commit, ev.Project, ev.SkipCI)
 	decision := service.DecideWebhook(p, ev)
 	if !decision.Trigger {
+		h.recordAudit(r, pipelineID, pkg.CodeOK, "ignored:"+decision.Reason)
 		// 正常忽略 → 2xx，避免代码平台把它记成投递失败。
 		logger.Debugf("[webhook] pipeline=%s ignored: %s (event=%s branch=%s provider=%s)",
 			pipelineID, decision.Reason, ev.Kind, ev.Branch, ev.Provider)
@@ -98,6 +112,7 @@ func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		deliveryKey = "sha:" + pipelineID + ":" + ev.Branch + ":" + ev.Commit
 	}
 	if !h.dedupe.First(deliveryKey) {
+		h.recordAudit(r, pipelineID, pkg.CodeOK, "duplicate:"+deliveryKey)
 		pkg.OK(w, webhookIgnored{Ignored: true, Reason: "重复投递（同一事件已处理）", Event: ev.Kind, Branch: ev.Branch})
 		return
 	}
@@ -115,7 +130,21 @@ func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	}
 	logger.Infof("[webhook] pipeline=%s build=%s branch=%s commit=%s event=%s provider=%s",
 		pipelineID, b.ID, orDash(b.Branch), orDash(ev.Commit), ev.Kind, ev.Provider)
+	h.recordAudit(r, pipelineID, pkg.CodeOK, "build:"+b.ID)
 	pkg.OK(w, b)
+}
+
+// recordAudit 记录一次 Webhook 请求；Webhook 不走 Auth/审计中间件，
+// 但生产发布来源必须可追溯（谁在什么 IP 触发了哪个任务）。
+func (h *WebhookHandler) recordAudit(r *http.Request, pipelineID string, status int, detail string) {
+	if h.audit == nil {
+		return
+	}
+	target := "POST /api/webhook/" + pipelineID
+	if detail != "" {
+		target += " (" + detail + ")"
+	}
+	h.audit.Record("webhook", "webhook", target, status, pkg.ClientIP(r))
 }
 
 // verifySecret 校验 webhook 密钥，兼容三类来源（任一匹配即通过）：

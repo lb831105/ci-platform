@@ -11,15 +11,15 @@ import (
 func TestRBACUserEmailRequired(t *testing.T) {
 	svc := newRbacForTest(t)
 
-	if err := svc.AddUser("noemail", "password1", ""); err == nil {
+	if err := svc.AddUser("noemail", "password1", "", "李斌"); err == nil {
 		t.Fatal("creating a user without email must be rejected")
 	}
 	for _, bad := range []string{"not-an-email", "a@b", "@b.com", "a@.com", "a b@c.com"} {
-		if err := svc.AddUser("u1", "password1", bad); err == nil {
+		if err := svc.AddUser("u1", "password1", bad, "李斌"); err == nil {
 			t.Fatalf("invalid email %q must be rejected", bad)
 		}
 	}
-	if err := svc.AddUser("u1", "password1", "  u1@example.com  "); err != nil {
+	if err := svc.AddUser("u1", "password1", "  u1@example.com  ", "李斌"); err != nil {
 		t.Fatalf("add user with valid email: %v", err)
 	}
 
@@ -45,7 +45,7 @@ func TestRBACUserEmailRequired(t *testing.T) {
 // 历史数据兜底：旧用户可能没有邮箱，需要能列举出来（启动告警 + UI 提示）。
 func TestRBACUsersWithoutEmail(t *testing.T) {
 	svc := newRbacForTest(t)
-	if err := svc.AddUser("ok", "password1", "ok@example.com"); err != nil {
+	if err := svc.AddUser("ok", "password1", "ok@example.com", "李斌"); err != nil {
 		t.Fatal(err)
 	}
 	// 模拟旧数据：直接塞一个没有邮箱的用户。

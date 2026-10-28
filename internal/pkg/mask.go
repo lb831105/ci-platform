@@ -71,6 +71,30 @@ func isSecretQueryKey(key string) bool {
 	return false
 }
 
+// MaskURLUserInfo 脱敏 URL 中的 userinfo（https://user:token@host/repo）。
+// 用于 Git 日志与错误信息：URL 本身可能是用户填写的带 Token 地址。
+func MaskURLUserInfo(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	scheme := strings.Index(raw, "://")
+	if scheme < 0 {
+		return raw
+	}
+	rest := raw[scheme+3:]
+	end := len(rest)
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		end = i
+	}
+	authority := rest[:end]
+	at := strings.LastIndex(authority, "@")
+	if at < 0 {
+		return raw
+	}
+	return raw[:scheme+3] + "***:***@" + rest[at+1:]
+}
+
 // MaskWebhookURL 按渠道脱敏群机器人 URL。
 // Slack 的密钥在 path 最后一段（https://hooks.slack.com/services/T/B/SECRET），
 // 仅脱敏查询参数不够，必须一并掩码路径尾段。

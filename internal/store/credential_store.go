@@ -4,7 +4,6 @@ import (
 	"context"
 	"path/filepath"
 	"sort"
-	"time"
 
 	"ci-platform/internal/model"
 	"ci-platform/internal/pkg"
@@ -111,9 +110,4 @@ func (s *CredentialStore) Delete(ctx context.Context, id string) error {
 		return pkg.ErrNotFound("credential %s not found", id)
 	}
 	return pkg.RemoveAll(s.path(id))
-}
-
-// allocateID 以纳秒时间戳生成凭据 ID。
-func (s *CredentialStore) allocateID() string {
-	return time.Now().UTC().Format("20060102150405.000000000")
 }

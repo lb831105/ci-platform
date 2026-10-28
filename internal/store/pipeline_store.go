@@ -48,7 +48,7 @@ func (s *PipelineStore) WriteAuxFile(id, name string, data []byte) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, name), data, 0o644)
+	return os.WriteFile(filepath.Join(dir, name), data, 0o600)
 }
 
 // Exists 判断 pipeline 目录是否存在。

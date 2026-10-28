@@ -229,7 +229,7 @@ func (l *Logger) openLocked(now time.Time) error {
 		return fmt.Errorf("创建日志目录 %s: %w", dir, err)
 	}
 	name := filepath.Join(dir, "app-"+day+".log")
-	f, err := os.OpenFile(name, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("打开日志文件 %s: %w", name, err)
 	}

@@ -37,3 +37,23 @@ func TestCreateCredentialRejectsSSHKey(t *testing.T) {
 		t.Fatalf("error should point to the SSH server config, got %v", err)
 	}
 }
+
+func TestCredentialAllowedHosts(t *testing.T) {
+	hosts, err := normalizeCredentialHosts([]string{" Git.Example.com ", "https://git.example.com/group/repo", "*.corp.example.com", "git.example.com"})
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if len(hosts) != 2 || hosts[0] != "git.example.com" || hosts[1] != "*.corp.example.com" {
+		t.Fatalf("hosts = %+v", hosts)
+	}
+	c := &model.Credential{Name: "git", AllowedHosts: []string{"git.example.com", "*.corp.example.com"}}
+	if err := ensureCredentialHost(c, "https://git.example.com/group/repo.git"); err != nil {
+		t.Fatalf("exact host should be allowed: %v", err)
+	}
+	if err := ensureCredentialHost(c, "https://ci.corp.example.com/repo.git"); err != nil {
+		t.Fatalf("wildcard host should be allowed: %v", err)
+	}
+	if err := ensureCredentialHost(c, "https://evil.example.net/repo.git"); err == nil {
+		t.Fatal("unlisted host must be rejected")
+	}
+}

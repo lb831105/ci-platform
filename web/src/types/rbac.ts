@@ -17,6 +17,7 @@ export interface RbacAssignment {
 
 export interface RbacUserInfo {
   name: string
+  display_name?: string
   created_at?: string
   // 通知联系方式（任务通知按用户名引用人员时解析）
   email?: string
@@ -33,6 +34,7 @@ export interface UserRoleRef {
 
 export interface UserAccount {
   name: string
+  display_name?: string
   email?: string
   wecom_id?: string
   phone?: string

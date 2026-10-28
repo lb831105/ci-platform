@@ -164,6 +164,11 @@ func main() {
 	authSvc.SetUserPasswordUpdater(rbacSvc)
 	if authSvc.Enabled() {
 		logger.Infof("auth enabled: user=%s (可在「系统管理 → 全局安全配置」中修改，-no-auth 关闭)", settings.AuthUser)
+		if cfg.AuthPasswordGenerated && authSvc.UsesPassword(cfg.AuthPassword) {
+			// 只在随机密码确实被采用（首次初始化）时输出一次；已有 settings.json
+			// 的实例不会重复打印。请立即登录并修改。
+			logger.Warnf("首次启动已生成管理员初始密码: %s（请立即登录并修改）", cfg.AuthPassword)
+		}
 		// 只提示"还没改过初始密码"，不写出具体口令：
 		// 启动日志常被收集/转发，写出默认口令等于把凭据公开。
 		if authSvc.UsesPassword("admin") {
@@ -201,7 +206,7 @@ func main() {
 	// 6. 接口层
 	pipelineHandler := handler.NewPipelineHandler(pipelineSvc, buildSvc)
 	buildHandler := handler.NewBuildHandler(buildSvc, artifactSvc)
-	webhookHandler := handler.NewWebhookHandler(pipelineSvc, buildSvc, pipelineHandler)
+	webhookHandler := handler.NewWebhookHandler(pipelineSvc, buildSvc, pipelineHandler, auditSvc)
 	wsHandler := handler.NewWSHandler(hub, buildSvc, cfg.LogBufferSize, cfg.CORSOrigins)
 	authHandler := handler.NewAuthHandler(authSvc, settingsSvc)
 	authHandler.SetRBAC(rbacSvc)
@@ -291,6 +296,22 @@ func main() {
 	scheduler.Start(workerCtx, cfg.Workers)
 	// 定时构建：随 worker 上下文启停（优雅停机时一并退出）。
 	cronTrigger.Start(workerCtx)
+	// 发布审批超时扫描：无人处理的 pending_approval 必须按任务配置的
+	// approval_timeout_minutes 自动取消，否则会永远挂在待审批。
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-ticker.C:
+				if n := buildSvc.SweepApprovals(workerCtx); n > 0 {
+					logger.Infof("approval sweep: %d build(s) timed out", n)
+				}
+			}
+		}
+	}()
 	// 构建保留策略定期扫描：每小时应用全局保留策略到全部任务
 	// （构建后清理只覆盖有新构建的任务，旧任务需要定期补扫）。
 	go func() {

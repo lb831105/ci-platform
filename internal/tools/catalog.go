@@ -26,6 +26,9 @@ type Version struct {
 	StripTop bool `json:"-"`
 	// FallbackURLs 是老版本的备用地址（Apache 老版本只在 archive 站上）。
 	FallbackURLs map[string]string `json:"-"`
+	// SHA256 按平台提供压缩包校验和（hex）。为空表示当前版本未内置校验和，
+	// 安装器会跳过校验；生产镜像可在自定义清单中补全，防止下载内容被篡改。
+	SHA256 map[string]string `json:"-"`
 	// Custom 表示这个版本是按 URL 模板现算出来的（用户手填的补丁版本）。
 	Custom bool `json:"custom,omitempty"`
 }

@@ -17,9 +17,12 @@ export interface BuildLogController {
   retrying: Ref<boolean>
   error: Ref<string>
   finished: Ref<boolean>
+  totalLines: Ref<number>
+  matchedLines: Ref<number>
+  truncated: Ref<boolean>
   start: () => Promise<void>
   stop: () => void
-  loadInitial: () => Promise<void>
+  loadInitial: (options?: { tail?: number; grep?: string }) => Promise<void>
   refreshStatus: () => Promise<Build | null>
 }
 
@@ -37,8 +40,12 @@ export function useBuildLog(pipelineId: string, buildId: string): BuildLogContro
   const retrying = ref(false)
   const error = ref('')
   const finished = ref(false)
+  const totalLines = ref(0)
+  const matchedLines = ref(0)
+  const truncated = ref(false)
 
   let socket: WebSocket | null = null
+  let lastQuery: { tail?: number; grep?: string } = {}
   let attempt = 0
   let stopped = false
   let partial = ''
@@ -61,15 +68,24 @@ export function useBuildLog(pipelineId: string, buildId: string): BuildLogContro
     const text = partial + chunk
     const parts = text.replace(/\r\n/g, '\n').split('\n')
     partial = parts.pop() ?? ''
-    pushLines(parts)
+    // 用户启用了 grep 时，WebSocket 增量也要按同样规则过滤，
+    // 否则“过滤后的历史 + 未过滤的新日志”会混在一起。
+    const needle = lastQuery.grep?.trim().toLowerCase()
+    pushLines(needle ? parts.filter((line) => line.toLowerCase().includes(needle)) : parts)
   }
 
-  async function loadInitial(): Promise<void> {
+  async function loadInitial(options?: { tail?: number; grep?: string }): Promise<void> {
+    if (options !== undefined) {
+      lastQuery = options
+    }
     try {
-      const payload = await buildApi.log(pipelineId, buildId)
+      const payload = await buildApi.log(pipelineId, buildId, lastQuery)
       lines.value = []
       partial = ''
       pushLines(splitLines(payload.log))
+      totalLines.value = payload.total_lines ?? 0
+      matchedLines.value = payload.matched_lines ?? 0
+      truncated.value = payload.truncated ?? false
     } catch (e) {
       error.value = describeError(e)
     }
@@ -165,5 +181,9 @@ export function useBuildLog(pipelineId: string, buildId: string): BuildLogContro
 
   onUnmounted(stop)
 
-  return { lines, status, connected, retrying, error, finished, start, stop, loadInitial, refreshStatus }
+  return {
+    lines, status, connected, retrying, error, finished,
+    totalLines, matchedLines, truncated,
+    start, stop, loadInitial, refreshStatus,
+  }
 }

@@ -45,3 +45,17 @@ func TestDedupeCapacity(t *testing.T) {
 		t.Fatal("evicted key must be treated as new")
 	}
 }
+
+func TestDedupeForgetAllowsRetry(t *testing.T) {
+	d := NewDedupe(time.Minute, 10)
+	if !d.First("delivery-1") {
+		t.Fatal("first delivery must pass")
+	}
+	if d.First("delivery-1") {
+		t.Fatal("duplicate delivery must be ignored")
+	}
+	d.Forget("delivery-1")
+	if !d.First("delivery-1") {
+		t.Fatal("delivery must pass again after Forget")
+	}
+}

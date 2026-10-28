@@ -12,3 +12,15 @@ export function downloadText(filename: string, text: string, mime = 'application
   // 立即释放会让部分浏览器来不及下载，交给下一轮事件循环。
   setTimeout(() => URL.revokeObjectURL(url), 0)
 }
+
+// downloadBlob 下载接口返回的二进制：用于构建日志/产物等已由后端生成的文件。
+export function downloadBlob(filename: string, blob: Blob): void {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+}

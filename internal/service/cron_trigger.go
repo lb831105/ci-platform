@@ -73,6 +73,10 @@ func (c *CronTrigger) scan(ctx context.Context) {
 	seen := map[string]bool{}
 	for _, p := range pipelines {
 		seen[p.ID] = true
+		if p.Disabled {
+			c.forget(p.ID)
+			continue
+		}
 		spec := strings.TrimSpace(p.CronSpec)
 		if spec == "" {
 			c.forget(p.ID)

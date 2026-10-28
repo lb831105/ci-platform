@@ -313,22 +313,26 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | GET | `/api/auth/me` | 当前用户 |
 | POST | `/api/auth/password` | 修改**当前登录账号**的密码（校验旧密码；内置管理员与平台内用户都走这里，改密后其他会话失效） |
 | GET | `/api/overview` | 带构建聚合的任务列表（Jenkins 作业列表） |
-| GET | `/api/builds` | 跨任务构建历史 |
+| GET | `/api/builds` | 跨任务构建历史；支持 `q` / `status` / `pipeline` / `limit` / `offset`，总数在 `X-Total-Count` 响应头 |
 | GET | `/api/pipelines` | 任务列表 |
 | POST | `/api/pipelines` | 创建任务 |
 | GET | `/api/pipelines/{pid}` | 任务详情 |
 | PUT | `/api/pipelines/{pid}` | 更新任务 |
 | DELETE | `/api/pipelines/{pid}` | 删除任务（递归删目录） |
-| POST | `/api/pipelines/{pid}/build` | 手动触发；body 可带 `{"params":{"VERSION":"1.2.3"}}`（参数化构建），body 可省略 |
+| POST | `/api/pipelines/{pid}/build` | 手动触发；body 可带 `{"params":{"VERSION":"1.2.3"}}`（参数化构建），body 可省略；可带 `Idempotency-Key` 请求头或 body `idempotency_key`，同一用户/任务的重试复用第一次构建 |
 | POST | `/api/pipelines/{pid}/rename` | 重命名任务（受工程命名限制约束） |
 | POST | `/api/webhook/{pipeline_id}` | Webhook 触发：密钥兼容 `X-Webhook-Secret` / GitLab `X-Gitlab-Token` / GitHub `X-Hub-Signature-256`；按**事件与分支白名单**过滤、`[ci skip]` 跳过、按投递 UUID **幂等去重**、按推送分支构建；查询串可覆盖已定义参数。**该接口返回真实 HTTP 状态码**（401/404/409/429），被策略忽略时返回 200 + `{ignored:true,reason}` |
 | GET | `/api/pipelines/{pid}/builds` | 构建历史（遍历目录，编号倒序） |
-| GET | `/api/pipelines/{pid}/builds/{bid}` | 构建详情 |
-| GET | `/api/pipelines/{pid}/builds/{bid}/log` | 拉取日志全文 |
+| GET | `/api/pipelines/{pid}/builds/{bid}` | 构建详情（含 Revision、Changes、备注、保留标记） |
+| PUT | `/api/pipelines/{pid}/builds/{bid}` | 更新构建备注 / `keep_forever`（权限 `job.configure`） |
+| GET | `/api/pipelines/{pid}/builds/{bid}/log` | 拉取日志；可选 `tail=N`（最近 N 行，上限 5000）与 `grep=关键字` |
+| GET | `/api/pipelines/{pid}/builds/{bid}/log/download` | 下载日志纯文本附件 |
 | GET | `/api/pipelines/{pid}/builds/{bid}/artifacts` | 构建产物清单 |
 | GET | `/api/pipelines/{pid}/builds/{bid}/artifacts/download?file=...` | 下载单个产物（二进制） |
 | GET | `/api/pipelines/{pid}/builds/{bid}/artifacts.zip` | 下载全部产物 ZIP |
 | POST | `/api/pipelines/{pid}/builds/{bid}/republish` | 把该次构建的产物直接重新发布到 SSH（不重新编译）；body `{"server_id":"...","publish":"目标名"}`，`publish` 为空取第一个启用目标 |
+| POST | `/api/pipelines/{pid}/builds/{bid}/rerun` | 用该次构建的参数快照重新触发；密码参数由服务端从加密快照还原，不经过前端 |
+| POST | `/api/pipelines/{pid}/builds/{bid}/artifacts/promote` | 跨任务产物晋级：把源构建产物复制到目标构建（`bid=latest` 取最近成功构建），复制时校验源清单 SHA-256；body `{"source_pipeline_id":"...","source_build_id":"...","prefix":"","files":[],"overwrite":false}` |
 | POST | `/api/pipelines/{pid}/builds/{bid}/cancel` | 取消运行中/等待中的构建（状态落 `aborted`） |
 | GET | `/api/views` | 视图列表（列表视图 / 我的视图） |
 | GET | `/api/views/{name}/jobs` | 视图内任务（按当前用户权限过滤） |
@@ -347,6 +351,7 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | GET | `/api/system/audit?limit=300` | 操作审计日志（最近 N 条，时间倒序，管理员） |
 | GET | `/api/system/notify?limit=&pipeline=&recipient=&status=` | 通知投递记录（按收件人粒度，排查漏收） |
 | GET/PUT | `/api/profile` `/api/profile/contact` | 个人资料：查看 / 自助维护联系方式（任何登录用户）；**修改密码**在「个人资料」页自助完成 |
+| GET/POST/DELETE | `/api/profile/tokens` `/api/profile/tokens/{id}` | API 访问令牌：列表（脱敏）/ 创建（secret 只返回一次）/ 吊销；令牌继承用户权限，可替代登录会话用于脚本 |
 | POST | `/api/profile/email/verify` `/api/profile/email/confirm` | 发送邮箱验证码 / 提交验证码确认 |
 | GET | `/api/security/users` | 用户管理页数据：内置管理员 + 平台用户 + 联系方式 + 角色摘要 |
 | POST | `/api/security/users` | 创建平台内用户（bcrypt；用户名 + 汉字姓名 + 邮箱，管理员） |
@@ -395,11 +400,14 @@ data/                                  # DATA_HOME，运行时创建，已 gitig
 ├── audit.log                          # 操作审计（JSONL；16MB 轮转为 audit.log.1）
 ├── notify.log                         # 通知投递记录（JSONL；16MB 轮转为 notify.log.1）
 ├── credentials/
-│   └── {credential_id}.json           # 凭据（用户名密码 / 密钥 / SSH 私钥）
+│   └── {credential_id}.json           # 凭据（Secret 用 AES-GCM 加密，读取时解密）
+├── credentials.key                    # 凭据/密码参数加密密钥（0600，必须随 data 一起备份）
+├── tokens.json                        # API Token（只存 SHA-256 哈希，不存原始 secret）
 ├── jobs/
 │   └── {pipeline_id}/                 # 目录名即 ID（时间戳字符串），无额外索引
-│       ├── config.json                # Pipeline 定义（含 notify：人员/群/轮值/升级/抑制/路由/模板）
+│       ├── config.json                # Pipeline 定义（含 notify/cache/environment 等）
 │       ├── next_build                 # 下一个构建编号（单调递增，删除构建后不回退）
+│       ├── cache/                     # 显式缓存（按 cache key 哈希分目录，成功后写入）
 │       └── builds/
 │           └── {build_id}/            # 自增编号，对应 Jenkins #N
 │               ├── build.json         # 构建元数据（含分支/提交人，供分支路由与通知）
@@ -473,11 +481,28 @@ data/                                  # DATA_HOME，运行时创建，已 gitig
 - 升级后首次启动会自动为「步骤里明确写了输出文件」的旧任务启用归档：
   `go build -o <file>` 与 `jar cf <file>`；其他任务在任务配置中手动开启即可（一次性标记 `.artifact-config-v1`）。
 - 至少匹配一个文件，否则构建失败并在日志中提示，避免“构建成功但没有可回滚产物”。
+
+### JUnit 测试报告
+
+任务配置 → 构建后操作 → **发布 JUnit 测试报告**：按一行一个的 glob 匹配工作区 XML
+（如 `**/TEST-*.xml`、`target/surefire-reports/*.xml`）。构建结束后解析汇总并复制原始报告到
+`data/jobs/{pid}/builds/{bid}/test-reports/`；出现 failure/error 时构建标记为失败。
+「允许无测试报告」关闭时，匹配不到 XML 也会失败，避免测试根本没跑却显示成功。
 - 产物清单写入 `artifacts.json`（含 SHA-256），下载接口只允许清单中的相对路径。
 - 产物随「丢弃旧的构建」策略一起删除；需要保留全部构建时，把任务/全局保留数量与天数都设为 `0`。
 - 构建页「构建产物」卡片支持单文件下载与 ZIP 全量下载；接口见下表。
 
 ---
+
+### 缓存、产物晋级与环境记录
+
+- **显式缓存**（任务 → Advanced）：配置 `cache.key` 与工作区内路径（目录或 glob），构建前恢复到工作区、步骤成功后保存到
+  `data/jobs/{pid}/cache/`。key 支持 `${参数名}` 占位符，key 变化使用独立缓存目录；缓存超过 8GB 或 10 万文件会跳过并告警，
+  不影响构建结果。未启用时仍沿用工作区复用。
+- **跨任务产物晋级**：构建页「晋级产物」把源构建的 `artifacts/` 复制到目标任务（目标 `latest` 取最近成功构建），
+  每条文件按源清单 SHA-256 校验，失败不会留下半个文件；目标已存在同路径时默认拒绝，可显式覆盖。
+- **环境与部署记录**：任务可设置 `environment`（dev/staging/prod 等），随构建快照；每次 SSH 发布/重新发布在
+  `build.json` 的 `deployments` 中记录目标、服务器、环境、结果、时间与操作人，构建页展示「部署记录」卡片。
 
 ## 八、参数化构建
 
@@ -490,6 +515,7 @@ data/                                  # DATA_HOME，运行时创建，已 gitig
 | `bool` | `true` / `false`；触发时也接受 `1/0`、`yes/no`，统一归一为 `true`/`false` |
 | `choice` | 固定可选值集合，默认值必须在集合内（留空取第一个） |
 | `text` | 多行文本，保留换行（适合 changelog 之类的片段） |
+| `password` | 密码类参数：触发时填写，不设默认值；`build.json` 只保存加密值，API/构建页显示 `***`，重跑时由服务端解密还原 |
 
 约束（`internal/service/pipeline_service.go` 的 `normalizeParams` / `ResolveBuildParams`）：
 
@@ -599,6 +625,12 @@ bash ./build.sh         # ✅ 双平台产物 + UPX 压缩
 | 步骤级控制 | ✅ `allow_failure` 失败继续；`timeout_sec=1` 杀掉 sleep 并记 124；`when=failure/always` 在失败后执行；致命失败跳过 `when=success`；`retry=2` 共 3 次尝试 |
 | 通知记录 | ✅ 按收件人粒度落盘，可过滤 `sent` / `failed` / `suppressed`，失败带错误原因 |
 | 平台日志分级记录 + 30 天保留 | ✅ e2e + 7 例单测：默认 info 下无 DEBUG、`-log-level debug` 后出现 DEBUG、一天一个文件 `YYYY-MM/app-YYYY-MM-DD.log`、同一天复用同一文件 / 跨天换文件 / 跨月换目录、级别列落盘、API 返回结构化条目与「保留 30 天」信息、超 30 天的天文件被删除（空月目录一并清理，用户自建目录不碰，旧版根目录月文件也会清） |
+| JUnit 测试报告 | ✅ 解析 `<testsuites>` / 单 `<testsuite>`、汇总 passed/failed/error/skipped/耗时、失败用例与原始报告落盘；failure/error 让构建失败；`allow_empty` 可放行无报告 |
+| 禁用任务 | ✅ 手动/Webhook/定时触发统一拒绝（`Trigger` 入口拦截），配置与历史保留；重新启用即可继续 |
+| API Token / 幂等触发 | ✅ 令牌只存哈希、可吊销/过期、继承用户权限；`Idempotency-Key` 按任务+用户复用首次构建 |
+| 密码参数 | ✅ 触发时填写、`build.json` 只落 AES-GCM 密文、日志遮罩、API 显示 `***`；Re-run 服务端解密还原 |
+| 缓存 / 产物晋级 | ✅ 显式 cache key/paths 恢复与保存；跨任务复制产物并校验 SHA-256 |
+| 环境与部署记录 | ✅ 任务 environment 快照；SSH 发布/重新发布记录目标、状态、时间、操作人 |
 | 产物归档模式诊断 | ✅ e2e 11 + 11 + 7 项：`target/*.jar` 在多模块工程下（jar 只在 `ruoyi-admin/target/`）**直接归档成功**且日志注明自动递归、根目录有 jar 时优先根目录、真无产物仍失败并说明原因；构建记录带结构化 `advice`（当前模式/建议模式/找到的文件），按建议 PUT 后重建成功且产物归档；构建记录带结构化 `advice`（当前模式/建议模式/找到的文件）、按建议改模式后重建成功、`allow_empty` 无产物仍成功且配置持久化；单测覆盖 glob 语义、建议逻辑、allow_empty |
 | 任务级工具版本 | ✅ e2e 15 项：新装实例预置「自动安装」、任务选 JDK 8 / JDK 17 各自生效（构建日志可验证）、两个 Java 任务不会下载 NodeJS、选不存在的安装项保存被拒、未选择时用默认自动安装 |
 | 自动安装后台任务 | ✅ e2e 11 项：接口立刻返回、任务进度可查、重复点击单飞、客户端断开安装继续、完成后构建直接使用 |
@@ -650,7 +682,7 @@ ci-platform/
 
 | 分类 | 页面 | 能力 |
 |---|---|---|
-| 系统配置 | 系统配置 | 数据目录、系统消息、系统地址（Jenkins Location）、默认分支、工程命名限制、静默期/SCM 重试/Shell/全局超时、全局构建保留策略（含日志上限）、全局环境变量、Git 全局身份、SSH 服务器（Publish Over SSH）、邮件通知、Webhook 通知（钉钉/企微/Slack）、静默模式（安全关机窗口）、读取设置 |
+| 系统配置 | 系统配置 | 数据目录、系统消息、系统地址（Jenkins Location）、默认分支、工程命名限制、静默期/SCM 重试/Shell/全局超时、全局构建保留策略（新装默认 200 条/90 天，0=不限制；含日志上限）、全局环境变量、Git 全局身份、SSH 服务器（Publish Over SSH）、邮件通知、Webhook 通知（钉钉/企微/Slack）、静默模式（安全关机窗口）、读取设置 |
 | 系统配置 | 全局工具配置 | 按 JDK / Git / Gradle / Ant / Maven / NodeJS 分类维护安装项（工具主目录），Maven 的 `MAVEN_OPTS` / 本地仓库；**每类只有第一个填了主目录的安装项生效**（表格逐行标注「生效 / 仅记录」） |
 | 系统配置 | 内置能力 | 编译进二进制的组件清单（只读；平台没有插件机制，不能动态安装/停用） |
 | 系统配置 | 执行器 | 本机执行器数量、构建队列、工作区（单机执行，无节点/云编排） |
@@ -670,6 +702,7 @@ ci-platform/
 - `workers`、`queue_size`、`workspace-ttl`、`clean-interval` 属启动期参数，界面只读并显示**实际生效值**（来自命令行参数，而非 `settings.json` 里的副本），修改需重启。
 - 界面上的每一项都真的影响构建：默认分支会补齐任务空分支、系统管理员邮件地址作为发件人兜底；反过来说，**不会被使用的东西不放界面**（例如 Maven `settings.xml` 内容不再收纳，单元测试般的「仅记录」项会明确标注）。
 - 认证默认只有系统配置里的单管理员账号（密码 bcrypt 落盘，改后重启仍生效，至少 8 个字符）；
+  「个人资料 → API 访问令牌」可创建脚本用长期令牌（`Authorization: Bearer <token>`），令牌只保存哈希、可吊销/设置有效期，权限随账号 RBAC 实时生效；
   需要多人协作时在「系统管理 → 用户管理」创建平台用户，并在「Assign Roles」分配角色（姓名仅汉字、邮箱必填）。
 - 系统配置中的「单次产物大小上限（MB）」「单次产物文件数上限」会在归档时强制执行，防止异常产物写满磁盘。
 - 「准备关机（静默模式）」只拒绝**新的**构建入队，不影响正在运行的构建。
@@ -723,6 +756,8 @@ ci-platform/
   运行中的构建可「停止」（落 `aborted`），已结束的构建可「删除」（连带 `builds/{bid}` 目录，需 `job.delete` 权限）
 - 全局构建历史（Builds）：S 状态球、`任务名#编号` + 「命令行输出」、相对日期（可按日期排序）、Jenkins 风格状态
   （稳定 / 返回到正常 / 自从构建 #N 后断开 / 断开很长时间 / 中断）
+- 构建详情（Build 页）：状态摘要、Started/Took、启动用户、waiting/build/total 时间、Revision / Repository / refs、
+  Changes（提交说明、作者、修改文件）、构建步骤、构建参数、控制台输出；支持 Add description 与「永久保留这次编译」
 - 相关链接：最近一次 / 稳定 / 成功 / 失败 / 未成功 / 完成的构建
 
 数据层：`Pipeline` 新增 `description`，`Build` 新增 `triggered_by`（手动触发记录登录用户名，Webhook 记为 `webhook`）；新增 `POST /api/pipelines/{pid}/rename`。
@@ -733,7 +768,7 @@ ci-platform/
 
 | 分区 | 内容 |
 |---|---|
-| General | 任务名称、描述、丢弃旧的构建（任务级保留策略）、参数化构建（参数个数 + 快捷跳转）、并发构建（说明：平台同任务固定串行）、禁用任务（说明：用清空 cron + 撤销 Webhook 代替） |
+| General | 任务名称、描述、丢弃旧的构建（任务级保留策略）、参数化构建（参数个数 + 快捷跳转）、并发构建（说明：平台同任务固定串行）、禁用任务（暂停手动/Webhook/定时触发，配置与历史保留） |
 | 源码管理 | 无 / Git、Repository URL、Credentials（选择已保存的账号密码 / 令牌，支持现场新增）、指定分支、额外行为（说明） |
 | 构建触发器 | 远程触发 Webhook 地址（可复制）+ 密钥；**允许的事件**（默认只接受 push，tag_push 需勾选；MR/评论/Test 事件返回 200 但不构建）；**构建分支**（按推送分支构建 / 始终构建指定分支）；**允许的分支**（精确或 `release/*`、`hotfix/**` 通配）；`[ci skip]` 跳过；**回写构建状态**（GitLab commit status，需凭据 + GitLab 地址）；**定时构建**（5 字段 cron，支持 `H` 散列）；SCM 轮询/上下游任务链说明 |
 | 构建环境 | Delete workspace before build starts；**构建工具版本**：显示全局工具配置里生效的 JDK/NodeJS/Maven/Go 主目录（对应 Jenkins 的 per-job JDK/NodeJS 选择） |

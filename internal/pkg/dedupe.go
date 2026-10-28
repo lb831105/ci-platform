@@ -74,6 +74,17 @@ func (d *Dedupe) pruneLocked(now time.Time) {
 	d.order = kept
 }
 
+// Forget 移除一个键；用于「首次处理失败」时允许代码平台重试。
+// order 中残留的键会在 prune 时跳过，不影响容量。
+func (d *Dedupe) Forget(key string) {
+	if key == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.seen, key)
+}
+
 // Len 返回当前保留的键数量（测试用）。
 func (d *Dedupe) Len() int {
 	d.mu.Lock()

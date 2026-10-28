@@ -22,6 +22,12 @@ type CheckoutInfo struct {
 // maxChangedFiles 限制构建元数据里保存的文件数，避免超大提交把 build.json 撑大。
 const maxChangedFiles = 200
 
+// maxCommitMessageRunes 限制提交说明长度：git 元数据可被构造为超长文本，
+// 原样写入 build.json 会让构建详情接口和前端渲染都被拖慢。
+const maxCommitMessageRunes = 4000
+const maxCommitAuthorRunes = 200
+const maxCommitEmailRunes = 320
+
 // ReadCheckoutInfo 从工作区读取当前 HEAD 的分支与提交人信息。
 // 不调用 git 命令（避免依赖 PATH），直接读 .git 元数据；
 // 非 Git 工作区或读取失败时返回空结构（通知功能继续工作，只是不带分支信息）。
@@ -47,9 +53,9 @@ func ReadCheckoutInfo(workdir string) CheckoutInfo {
 			info.Commit = sha
 		}
 		if commit, err := repo.CommitObject(head.Hash()); err == nil {
-			info.Author = strings.TrimSpace(commit.Author.Name)
-			info.Email = strings.TrimSpace(commit.Author.Email)
-			info.Message = strings.TrimSpace(commit.Message)
+			info.Author = truncateRunes(strings.TrimSpace(commit.Author.Name), maxCommitAuthorRunes)
+			info.Email = truncateRunes(strings.TrimSpace(commit.Author.Email), maxCommitEmailRunes)
+			info.Message = truncateRunes(strings.TrimSpace(commit.Message), maxCommitMessageRunes)
 			// Stats 会与第一父提交做 diff；merge/root 提交失败时只是没有 Changes 列表，不影响构建。
 			if stats, statErr := commit.Stats(); statErr == nil && len(stats) > 0 {
 				files := make([]string, 0, len(stats))
@@ -65,6 +71,18 @@ func ReadCheckoutInfo(workdir string) CheckoutInfo {
 		}
 	}
 	return info
+}
+
+// truncateRunes 按字符截断，避免把 UTF-8 字节截断成乱码。
+func truncateRunes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "…"
 }
 
 // String 便于日志输出（不涉及密钥）。

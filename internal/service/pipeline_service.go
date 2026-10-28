@@ -461,6 +461,10 @@ func (s *PipelineService) defaultGitBranch() string {
 func normalizeAndValidate(p *model.Pipeline, nameRegex string, defaultBranch ...string) error {
 	p.Name = strings.TrimSpace(p.Name)
 	p.Description = strings.TrimSpace(p.Description)
+	p.Environment = strings.TrimSpace(p.Environment)
+	if len([]rune(p.Environment)) > 64 {
+		return pkg.ErrBadRequest("环境名称最多 64 个字符")
+	}
 	p.Image = strings.TrimSpace(p.Image)
 	p.GitURL = strings.TrimSpace(p.GitURL)
 	p.GitBranch = strings.TrimSpace(p.GitBranch)
@@ -548,10 +552,62 @@ func normalizeAndValidate(p *model.Pipeline, nameRegex string, defaultBranch ...
 	if err := normalizeArtifacts(&p.Artifacts); err != nil {
 		return err
 	}
+	if err := normalizeTestReport(&p.TestReport); err != nil {
+		return err
+	}
+	if err := normalizeCache(&p.Cache); err != nil {
+		return err
+	}
 	if err := normalizeParams(p); err != nil {
 		return err
 	}
 	return normalizeSshPublishes(p)
+}
+
+// normalizeCache 校验显式缓存配置。缓存 key 允许 ${PARAM} 占位符，
+// 保存阶段只校验字符集，真正展开在构建时按本次参数进行。
+func normalizeCache(c **model.CacheConfig) error {
+	if c == nil || *c == nil || !(*c).Enabled {
+		*c = nil
+		return nil
+	}
+	cfg := *c
+	cfg.Key = strings.TrimSpace(cfg.Key)
+	if cfg.Key == "" {
+		cfg.Key = "default"
+	}
+	if len([]rune(cfg.Key)) > 128 {
+		return pkg.ErrBadRequest("缓存 key 最多 128 个字符")
+	}
+	for _, r := range cfg.Key {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			r == '.' || r == '_' || r == '-' || r == '$' || r == '{' || r == '}' {
+			continue
+		}
+		return pkg.ErrBadRequest("缓存 key 只能包含字母、数字、._- 与 ${参数} 占位符")
+	}
+	seen := make(map[string]bool, len(cfg.Paths))
+	paths := make([]string, 0, len(cfg.Paths))
+	for _, raw := range cfg.Paths {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || seen[raw] {
+			continue
+		}
+		seen[raw] = true
+		paths = append(paths, raw)
+	}
+	if len(paths) == 0 {
+		return pkg.ErrBadRequest("启用缓存后至少要配置一个缓存路径")
+	}
+	if len(paths) > 50 {
+		return pkg.ErrBadRequest("缓存路径最多 50 个")
+	}
+	if err := executor.ValidateWorkspacePatterns(paths); err != nil {
+		return pkg.ErrBadRequest("缓存路径非法: %v", err)
+	}
+	cfg.Paths = paths
+	*c = cfg
+	return nil
 }
 
 // normalizeSshPublishes 归一化并校验多目标 SSH 发布配置。
@@ -599,6 +655,31 @@ func normalizeSshPublishes(p *model.Pipeline) error {
 
 // maxSshPublishes 限制单次构建的发布目标数量，避免误配导致构建卡在大量 SSH 连接上。
 const maxSshPublishes = 10
+
+// normalizeTestReport 去重/归一化 JUnit 报告匹配模式，并在启用时提前校验路径安全。
+func normalizeTestReport(t *model.TestReportConfig) error {
+	files := make([]string, 0, len(t.Files))
+	seen := make(map[string]bool)
+	for _, raw := range t.Files {
+		f := strings.TrimSpace(filepath.ToSlash(raw))
+		if f == "" || seen[f] {
+			continue
+		}
+		seen[f] = true
+		files = append(files, f)
+	}
+	t.Files = files
+	if !t.Enabled {
+		return nil
+	}
+	if len(files) == 0 {
+		return pkg.ErrBadRequest("test_report.files is required when test_report.enabled=true")
+	}
+	if err := executor.ValidateWorkspacePatterns(files); err != nil {
+		return pkg.ErrBadRequest("test_report.files: %v", err)
+	}
+	return nil
+}
 
 // normalizeArtifacts 去重/归一化产物匹配模式，并在启用时提前做安全校验。
 // 禁用时保留模式，方便用户下次重新启用而不用重填。
@@ -1155,9 +1236,13 @@ func normalizeParams(p *model.Pipeline) error {
 			def.Type = model.ParamString
 		}
 		switch def.Type {
-		case model.ParamString, model.ParamBool, model.ParamText, model.ParamChoice:
+		case model.ParamString, model.ParamBool, model.ParamText, model.ParamChoice, model.ParamPassword:
 		default:
-			return pkg.ErrBadRequest("参数 %q 的类型 %q 不支持（string/bool/choice/text）", def.Name, def.Type)
+			return pkg.ErrBadRequest("参数 %q 的类型 %q 不支持（string/bool/choice/text/password）", def.Name, def.Type)
+		}
+		if def.Type == model.ParamPassword && strings.TrimSpace(def.Default) != "" {
+			// 密码参数的默认值会写进 pipeline 配置，等于把密钥长期明文保存在任务里。
+			return pkg.ErrBadRequest("密码参数 %q 不能设置默认值，请在触发构建时填写", def.Name)
 		}
 		def.Description = strings.TrimSpace(def.Description)
 		options := make([]string, 0, len(def.Options))
@@ -1230,7 +1315,12 @@ func ResolveBuildParams(defs []model.ParamDef, in map[string]string) (map[string
 		}
 		value := def.Default
 		if ok {
-			value = strings.TrimSpace(raw)
+			if def.Type == model.ParamPassword {
+				// 密码可能以空格开头/结尾，不能 TrimSpace，否则会出现“同一密码登录失败”。
+				value = raw
+			} else {
+				value = strings.TrimSpace(raw)
+			}
 		}
 		switch def.Type {
 		case model.ParamBool:

@@ -76,13 +76,26 @@ type Build struct {
 	FinishedAt *time.Time `json:"finished_at"`
 	ExitCode   int        `json:"exit_code"`
 
+	// StepResults 是本次构建每一步的状态与耗时（由 LocalExecutor 采集）。
+	StepResults []StepResult `json:"step_results,omitempty"`
+	// TestReport 是 JUnit 测试报告汇总；未启用/未收集时为空。
+	TestReport *TestReport `json:"test_report,omitempty"`
+	// Environment 是触发时任务环境的快照。
+	Environment string `json:"environment,omitempty"`
+	// Deployments 记录本次构建触发的 SSH 发布/重新发布结果。
+	Deployments []DeploymentRecord `json:"deployments,omitempty"`
+
 	// Description 是构建页的备注（对齐 Jenkins Build 的 Add description）。
 	Description string `json:"description,omitempty"`
 	// KeepForever 为 true 时构建保留策略跳过本条记录（对齐 Jenkins “Keep this build forever”）。
 	KeepForever bool `json:"keep_forever,omitempty"`
 
 	// Params 是本次构建实际使用的参数值（触发时快照，便于复盘「这次用的是什么版本号」）。
+	// 密码参数在这里固定为 ***；真实值在 SecretParams 中加密保存。
 	Params map[string]string `json:"params,omitempty"`
+	// SecretParams 保存密码参数的真实值（enc:v1: 密文），只供执行器解密使用。
+	// API 响应必须清空该字段；build.json 落盘只能是密文。
+	SecretParams map[string]string `json:"secret_params,omitempty"`
 
 	// Approval 仅在任务开启发布审批时有值。
 	Approval *BuildApproval `json:"approval,omitempty"`
@@ -105,6 +118,51 @@ type Build struct {
 	ChangedFiles  []string `json:"changed_files,omitempty"`  // 本次提交修改的文件（最多保留前 200 个）
 	CommitAuthor  string   `json:"commit_author,omitempty"`  // 提交人姓名
 	CommitEmail   string   `json:"commit_email,omitempty"`   // 提交人邮箱（路由到提交者用）
+}
+
+// TestCaseResult 是测试报告中的一个失败/错误用例（只保留需要展示的失败项）。
+type TestCaseResult struct {
+	Name      string `json:"name"`
+	ClassName string `json:"class_name,omitempty"`
+	Status    string `json:"status"` // failure | error | skipped
+	TimeMS    int64  `json:"time_ms"`
+	Message   string `json:"message,omitempty"`
+}
+
+// TestReport 是本次构建收集到的 JUnit 测试汇总。
+type TestReport struct {
+	Total       int              `json:"total"`
+	Passed      int              `json:"passed"`
+	Failed      int              `json:"failed"`
+	Errors      int              `json:"errors"`
+	Skipped     int              `json:"skipped"`
+	Suites      int              `json:"suites"`
+	DurationMS  int64            `json:"duration_ms"`
+	Files       []string         `json:"files,omitempty"`
+	FailedCases []TestCaseResult `json:"failed_cases,omitempty"`
+	CreatedAt   time.Time        `json:"created_at"`
+}
+
+// DeploymentRecord 是一次 SSH 发布/重新发布的结果，用于构建页审计「发到了哪里、成功没有」。
+type DeploymentRecord struct {
+	Target        string    `json:"target,omitempty"`
+	ServerID      string    `json:"server_id,omitempty"`
+	Environment   string    `json:"environment,omitempty"`
+	Status        string    `json:"status"` // success | failed
+	DeployedAt    time.Time `json:"deployed_at"`
+	DeployedBy    string    `json:"deployed_by,omitempty"`
+	ArtifactCount int       `json:"artifact_count,omitempty"`
+	Message       string    `json:"message,omitempty"`
+}
+
+// StepResult 是单个构建步骤的执行结果（Build 页的 Module Builds / 步骤耗时）。
+// 步骤结果落进 build.json，构建结束后无需解析日志就能展示每步状态与耗时。
+type StepResult struct {
+	Name         string `json:"name"`
+	Status       string `json:"status"` // success | failed | skipped | cancelled
+	ExitCode     int    `json:"exit_code"`
+	DurationMS   int64  `json:"duration_ms"`
+	AllowFailure bool   `json:"allow_failure,omitempty"`
 }
 
 // BuildAdvice 是一次构建失败时给出的结构化修复建议。

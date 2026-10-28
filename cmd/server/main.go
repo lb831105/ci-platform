@@ -126,6 +126,7 @@ func main() {
 	artifactSvc := service.NewArtifactService(buildStore)
 	buildSvc := service.NewBuildService(pipelineStore, buildStore, gitClient, localExec, sshPublisher, hub, workspace, settingsSvc, artifactCollector, artifactSvc)
 	scheduler := service.NewScheduler(buildSvc, cfg.QueueSize, workspace, cfg.WorkspaceTTL, cfg.CleanInterval)
+	buildSvc.SetQueueStats(scheduler)
 	scheduler.SetWorkspaceKeeper(func() (map[string]bool, error) {
 		pipelines, err := pipelineStore.List(context.Background())
 		if err != nil {
@@ -162,6 +163,12 @@ func main() {
 	authSvc.SetUserVerifier(rbacSvc)
 	// 平台内用户（rbac.json 里的账号）自助改密：内置管理员走系统配置，其余走 RBAC。
 	authSvc.SetUserPasswordUpdater(rbacSvc)
+	// API Token：独立持久化文件，只存哈希；校验时确认账号仍存在。
+	apiTokenSvc := service.NewAPITokenService(store.NewTokenStore(cfg.DataHome))
+	apiTokenSvc.SetUserChecker(func(name string) bool {
+		return authSvc.IsAdmin(name) || rbacSvc.UserExists(name)
+	})
+	authSvc.SetAPITokenVerifier(apiTokenSvc)
 	if authSvc.Enabled() {
 		logger.Infof("auth enabled: user=%s (可在「系统管理 → 全局安全配置」中修改，-no-auth 关闭)", settings.AuthUser)
 		if cfg.AuthPasswordGenerated && authSvc.UsesPassword(cfg.AuthPassword) {
@@ -181,6 +188,8 @@ func main() {
 	// 4.2 凭据管理与系统管理服务
 	credentialSvc := service.NewCredentialService(store.NewCredentialStore(cfg.DataHome))
 	buildSvc.SetCredentialResolver(credentialSvc)
+	// 密码参数与凭据共用 credentials.key 做 AES-GCM 加密，避免 build.json 出现明文。
+	buildSvc.SetSecretCodec(credentialSvc)
 	// 操作审计：JSONL 追加写 data/audit.log；启动时恢复最大 ID 保证单调。
 	auditStore := store.NewAuditStore(cfg.DataHome)
 	var auditSvc *service.AuditService
@@ -206,6 +215,7 @@ func main() {
 	// 6. 接口层
 	pipelineHandler := handler.NewPipelineHandler(pipelineSvc, buildSvc)
 	buildHandler := handler.NewBuildHandler(buildSvc, artifactSvc)
+	buildHandler.SetRBAC(rbacSvc)
 	webhookHandler := handler.NewWebhookHandler(pipelineSvc, buildSvc, pipelineHandler, auditSvc)
 	wsHandler := handler.NewWSHandler(hub, buildSvc, cfg.LogBufferSize, cfg.CORSOrigins)
 	authHandler := handler.NewAuthHandler(authSvc, settingsSvc)
@@ -222,6 +232,7 @@ func main() {
 	toolsHandler := handler.NewToolsHandler(toolInstaller)
 
 	rbacHandler := handler.NewRbacHandler(rbacSvc, authSvc)
+	rbacHandler.SetTokens(apiTokenSvc)
 	rbacHandler.SetPipelines(pipelineSvc)
 	// 历史用户可能没有邮箱（旧版本允许留空）：启动时显式告警，
 	// 否则「任务里选了人却收不到邮件」会变成静默故障。
@@ -241,6 +252,7 @@ func main() {
 	// 个人资料：用户自助维护联系方式与邮箱验证。
 	profileSvc := service.NewProfileService(rbacSvc, settingsSvc)
 	profileHandler := handler.NewProfileHandler(profileSvc)
+	tokenHandler := handler.NewTokenHandler(apiTokenSvc)
 	// 视图：给任务归类（列表视图 + 我的视图），data/views.json。
 	viewSvc := service.NewViewService(store.NewViewStore(cfg.DataHome), pipelineSvc, rbacSvc)
 	viewHandler := handler.NewViewHandler(viewSvc, pipelineSvc, buildSvc)
@@ -263,6 +275,7 @@ func main() {
 		View:            viewHandler,
 		Notify:          notifyHandler,
 		Profile:         profileHandler,
+		Token:           tokenHandler,
 		Import:          importHandler,
 		Portability:     portabilityHandler,
 		AuthService:     authSvc,
@@ -456,6 +469,10 @@ func defaultSettings(cfg *config.Config) model.Settings {
 		QueueSize:            cfg.QueueSize,
 		WorkspaceTTLMinutes:  int(cfg.WorkspaceTTL.Minutes()),
 		CleanIntervalMinutes: int(cfg.CleanInterval.Minutes()),
+		// 构建保留默认值：每个任务保留 200 条、90 天，避免新实例无限增长。
+		// 0 仍表示「不限制」，旧 settings.json 里显式配置的 0 不会被覆盖。
+		BuildRetentionMaxPerJob:  200,
+		BuildRetentionMaxAgeDays: 90,
 		// 构建日志单次上限：默认 100MB（0/缺失时归一化为该值），超长日志截断。
 		LogMaxMB: 100,
 	}

@@ -12,7 +12,7 @@ import (
 func TestCopyDataEntriesCopiesMigrationMarkers(t *testing.T) {
 	src := t.TempDir()
 	dst := t.TempDir()
-	for _, name := range []string{".workspace-reuse-v1", ".artifact-config-v1"} {
+	for _, name := range []string{".workspace-reuse-v1", ".artifact-config-v1", "credentials.key", "tokens.json"} {
 		if err := os.WriteFile(filepath.Join(src, name), []byte("done"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -20,7 +20,7 @@ func TestCopyDataEntriesCopiesMigrationMarkers(t *testing.T) {
 	if err := copyDataEntries(context.Background(), src, dst); err != nil {
 		t.Fatalf("copy: %v", err)
 	}
-	for _, name := range []string{".workspace-reuse-v1", ".artifact-config-v1"} {
+	for _, name := range []string{".workspace-reuse-v1", ".artifact-config-v1", "credentials.key", "tokens.json"} {
 		if _, err := os.Stat(filepath.Join(dst, name)); err != nil {
 			t.Fatalf("marker %s not copied: %v", name, err)
 		}

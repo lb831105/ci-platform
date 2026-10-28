@@ -112,3 +112,30 @@ func TestLocalExecutorCmdChaining(t *testing.T) {
 		t.Fatalf("fallback not executed:\n%s", out.String())
 	}
 }
+
+// RunStepsWithResults 应采集每一步的状态与耗时；跳过步骤也要记录，供构建页展示。
+func TestLocalExecutorCollectsStepResults(t *testing.T) {
+	var out bytes.Buffer
+	results, code, err := NewLocalExecutor().RunStepsWithResults(context.Background(), RunSpec{
+		Workspace: t.TempDir(),
+		Steps: []model.Step{
+			{Name: "ok", Run: "echo ok"},
+			{Name: "skip-on-failure", Run: "echo never", When: model.StepWhenFailure},
+		},
+	}, &out)
+	if err != nil {
+		t.Fatalf("RunStepsWithResults error: %v\n%s", err, out.String())
+	}
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %+v, want 2 entries", results)
+	}
+	if results[0].Name != "ok" || results[0].Status != "success" || results[0].DurationMS < 0 {
+		t.Fatalf("unexpected first result: %+v", results[0])
+	}
+	if results[1].Name != "skip-on-failure" || results[1].Status != "skipped" {
+		t.Fatalf("unexpected skipped result: %+v", results[1])
+	}
+}

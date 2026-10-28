@@ -18,6 +18,24 @@ export const pipelineApi = {
     return http.get<BuildListItem[]>('/builds')
   },
 
+  // 分页/筛选版构建历史：返回当前页与总条数（总数来自 X-Total-Count）。
+  async allBuildsPage(params: {
+    page?: number
+    pageSize?: number
+    q?: string
+    status?: string
+    pipeline?: string
+  }): Promise<{ items: BuildListItem[]; total: number }> {
+    const query = new URLSearchParams()
+    query.set('limit', String(params.pageSize ?? 20))
+    query.set('offset', String(((params.page ?? 1) - 1) * (params.pageSize ?? 20)))
+    if (params.q) query.set('q', params.q)
+    if (params.status) query.set('status', params.status)
+    if (params.pipeline) query.set('pipeline', params.pipeline)
+    const result = await http.getPage<BuildListItem[]>(`/builds?${query.toString()}`)
+    return { items: result.data, total: result.total }
+  },
+
   get(id: string): Promise<Pipeline> {
     return http.get<Pipeline>(`/pipelines/${id}`)
   },
@@ -42,6 +60,11 @@ export const pipelineApi = {
   // 触发构建：params 仅对「参数化构建」任务有效，未传的参数由后端取默认值。
   build(id: string, params?: Record<string, string>): Promise<Build> {
     return http.post<Build>(`/pipelines/${id}/build`, params ? { params } : {})
+  },
+
+  // 用历史构建的参数重新触发；密码参数由后端解密源构建的快照，前端不接触明文。
+  rerun(id: string, buildId: string): Promise<Build> {
+    return http.post<Build>(`/pipelines/${id}/builds/${buildId}/rerun`)
   },
 
   rename(id: string, name: string): Promise<Pipeline> {

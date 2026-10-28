@@ -15,6 +15,7 @@ import { useSettingsStore } from '@/stores/settingsStore'
 import { useAuthStore } from '@/stores/authStore'
 import {
   emptyPipeline,
+  emptyCache,
   emptyEscalation,
   emptyOnCall,
   emptyRoute,
@@ -46,6 +47,34 @@ const isEdit = ref(false)
 type ConfigureTab = 'general' | 'triggers' | 'pipeline' | 'advanced'
 const activeTab = ref<ConfigureTab>('general')
 const globalQuietPeriod = computed(() => settingsStore.data?.quiet_period_seconds ?? 0)
+
+// JUnit 报告模式在界面上按「一行一个」编辑，提交时拆成数组。
+const testReportFilesText = computed({
+  get: () => (form.value.test_report?.files ?? []).join('\n'),
+  set: (value: string) => {
+    if (!form.value.test_report) {
+      form.value.test_report = { enabled: false, files: [], allow_empty: false }
+    }
+    form.value.test_report.files = value
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+  },
+})
+// 缓存路径按「一行一个」编辑，提交时拆成数组。
+const cachePathsText = computed({
+  get: () => (form.value.cache?.paths ?? []).join('\n'),
+  set: (value: string) => {
+    if (!form.value.cache) {
+      form.value.cache = emptyCache()
+    }
+    form.value.cache.paths = value
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+  },
+})
+
 // 编辑既有任务时的配置权限（按任务名判断，普通用户可能只被授权部分任务）。
 const canEditExisting = ref(true)
 const saving = ref(false)
@@ -153,6 +182,7 @@ function toPayload(pipeline: Pipeline): PipelinePayload {
   return {
     name: pipeline.name,
     description: pipeline.description,
+    environment: pipeline.environment ?? '',
     image: '',
     steps: pipeline.steps.map((step) => ({ ...step })),
     git_url: pipeline.git_url,
@@ -173,12 +203,26 @@ function toPayload(pipeline: Pipeline): PipelinePayload {
     build_retention_max_per_job: pipeline.build_retention_max_per_job ?? 0,
     build_retention_max_age_days: pipeline.build_retention_max_age_days ?? 0,
     cron_spec: pipeline.cron_spec ?? '',
+    disabled: pipeline.disabled ?? false,
     delete_workspace_before_build: pipeline.delete_workspace_before_build ?? false,
     executor: pipeline.executor ?? 'local',
     artifacts: {
       enabled: pipeline.artifacts?.enabled ?? false,
       files: [...(pipeline.artifacts?.files ?? [])],
+      allow_empty: pipeline.artifacts?.allow_empty ?? false,
     },
+    test_report: {
+      enabled: pipeline.test_report?.enabled ?? false,
+      files: [...(pipeline.test_report?.files ?? [])],
+      allow_empty: pipeline.test_report?.allow_empty ?? false,
+    },
+    cache: pipeline.cache
+      ? {
+          enabled: pipeline.cache.enabled ?? false,
+          key: pipeline.cache.key ?? 'default',
+          paths: [...(pipeline.cache.paths ?? [])],
+        }
+      : emptyCache(),
     // 参数定义：深拷贝 options，避免编辑表单时改到 store 里的任务对象。
     params: (pipeline.params ?? []).map((def) => ({
       ...def,
@@ -621,6 +665,10 @@ function copyWebhook(): void {
           <el-form-item label="描述">
             <el-input v-model="form.description" type="textarea" :rows="3" placeholder="显示在任务页顶部" />
           </el-form-item>
+          <el-form-item label="部署环境">
+            <el-input v-model="form.environment" placeholder="如 dev / staging / production（留空表示未设置）" style="max-width: 320px" />
+            <div class="form-tip">随构建快照，构建页与部署记录会显示该环境；仅作标识，不改变执行行为。</div>
+          </el-form-item>
           <el-form-item label="丢弃旧的构建">
             <el-checkbox v-model="retentionEnabled">丢弃旧的构建</el-checkbox>
           </el-form-item>
@@ -650,11 +698,18 @@ function copyWebhook(): void {
             </div>
           </el-form-item>
           <el-form-item label="禁用任务">
+            <el-switch v-model="form.disabled" />
+            <div class="form-tip">
+              暂停手动构建、Webhook 与定时触发；任务配置和构建历史保留，重新启用后即可继续。
+              全站暂停请用「系统管理 → 准备关机」。
+            </div>
             <el-alert
-              type="info"
+              v-if="form.disabled"
+              type="warning"
               :closable="false"
               show-icon
-              title="平台没有「禁用任务」开关：需要暂停自动触发时，清空「定时构建」并删除代码平台的 Webhook 即可；全站暂停请用「系统管理 → 准备关机」。"
+              style="margin-top: 8px; width: 100%"
+              title="任务已禁用：保存后不会接受新的构建触发。"
             />
           </el-form-item>
         </el-form>
@@ -941,7 +996,30 @@ function copyWebhook(): void {
         </section>
         <section id="postbuild" class="config-section">
         <h2 class="config-section__title">构建后操作</h2>
-        <p class="config-section__hint">构建完成后的动作：先归档产物，再执行 SSH 发布与通知。</p>
+        <p class="config-section__hint">构建完成后的动作：先解析测试报告、归档产物，再执行 SSH 发布与通知。</p>
+        <div class="config-section config-section--sub">
+          <h3 class="config-section__title">发布 JUnit 测试报告</h3>
+          <el-form label-width="200px" label-position="right">
+            <el-form-item label="Publish JUnit test result report">
+              <el-switch v-model="form.test_report.enabled" />
+              <div class="form-tip">解析工作区里的 JUnit XML；出现 failure/error 时构建标记为失败。</div>
+            </el-form-item>
+            <template v-if="form.test_report.enabled">
+              <el-form-item label="Test report XMLs">
+                <el-input
+                  v-model="testReportFilesText"
+                  type="textarea"
+                  :rows="3"
+                  placeholder="一行一个，例如：&#10;**/TEST-*.xml&#10;target/surefire-reports/*.xml"
+                />
+              </el-form-item>
+              <el-form-item label="允许无测试报告">
+                <el-switch v-model="form.test_report.allow_empty" />
+                <div class="form-tip">开启后没匹配到 XML 只告警；关闭则构建失败，避免测试根本没跑却显示成功。</div>
+              </el-form-item>
+            </template>
+          </el-form>
+        </div>
         <ArtifactConfig v-if="form.artifacts" v-model="form.artifacts" />
         <div class="ssh-targets">
           <div class="ssh-targets__head">
@@ -993,8 +1071,32 @@ function copyWebhook(): void {
         <el-tab-pane label="Advanced" name="advanced" lazy>
         <section id="advanced" class="config-section">
         <h2 class="config-section__title">Advanced</h2>
-        <p class="config-section__hint">Jenkins 高级项在平台上的对应位置。</p>
+        <p class="config-section__hint">Jenkins 高级项与平台扩展项。</p>
         <el-form label-width="160px" label-position="right">
+          <el-form-item label="显式缓存">
+            <el-switch v-model="form.cache!.enabled" />
+            <div class="form-tip">
+              构建前恢复、成功后保存工作区内的依赖目录，适合 npm / Maven / Gradle 等场景；
+              不启用时仍按任务配置复用工作区。
+            </div>
+          </el-form-item>
+          <template v-if="form.cache?.enabled">
+            <el-form-item label="缓存 key">
+              <el-input v-model="form.cache.key" placeholder="例如 node-${NODE_VERSION}" />
+              <div class="form-tip">
+                支持 ${参数名} 占位符；key 变化会使用不同的缓存目录，避免不同版本互相污染。
+              </div>
+            </el-form-item>
+            <el-form-item label="缓存路径">
+              <el-input
+                v-model="cachePathsText"
+                type="textarea"
+                :rows="3"
+                placeholder="一行一个，例如：&#10;node_modules&#10;.m2/repository"
+              />
+              <div class="form-tip">路径必须是工作区内的相对目录或 glob；最多 50 个。</div>
+            </el-form-item>
+          </template>
           <el-form-item label="静默期">
             <el-input-number :model-value="globalQuietPeriod" :min="0" :max="3600" disabled />
             <span class="muted" style="margin-left: 8px">秒</span>

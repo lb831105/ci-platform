@@ -40,6 +40,7 @@ type PipelineExport struct {
 
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
+	Environment string `json:"environment,omitempty"`
 
 	Steps []model.Step `json:"steps"`
 
@@ -59,12 +60,15 @@ type PipelineExport struct {
 
 	SshPublishes []SshPublishExport `json:"ssh_publishes,omitempty"`
 
-	Artifacts model.ArtifactConfig `json:"artifacts"`
+	Artifacts  model.ArtifactConfig   `json:"artifacts"`
+	TestReport model.TestReportConfig `json:"test_report,omitempty"`
+	Cache      *model.CacheConfig     `json:"cache,omitempty"`
 
 	// 发布审批：安全门禁必须随任务一起迁移，否则导入后生产发布会被静默放开。
 	RequireApproval        bool `json:"require_approval"`
 	ApprovalTimeoutMinutes int  `json:"approval_timeout_minutes"`
 
+	Disabled                   bool  `json:"disabled,omitempty"`
 	BuildRetentionMaxPerJob    int   `json:"build_retention_max_per_job"`
 	BuildRetentionMaxAgeDays   int   `json:"build_retention_max_age_days"`
 	DeleteWorkspaceBeforeBuild *bool `json:"delete_workspace_before_build,omitempty"`
@@ -137,6 +141,7 @@ func (s *PortabilityService) Export(ctx context.Context, pipelineID string) (*Pi
 		ExportedFrom:  s.version,
 		Name:          p.Name,
 		Description:   p.Description,
+		Environment:   p.Environment,
 		Steps:         append([]model.Step(nil), p.Steps...),
 		GitURL:        p.GitURL,
 		GitBranch:     p.EffectiveBranch(),
@@ -147,13 +152,26 @@ func (s *PortabilityService) Export(ctx context.Context, pipelineID string) (*Pi
 			Files:      append([]string(nil), p.Artifacts.Files...),
 			AllowEmpty: p.Artifacts.AllowEmpty,
 		},
+		TestReport: model.TestReportConfig{
+			Enabled:    p.TestReport.Enabled,
+			Files:      append([]string(nil), p.TestReport.Files...),
+			AllowEmpty: p.TestReport.AllowEmpty,
+		},
 		RequireApproval:          p.RequireApproval,
 		ApprovalTimeoutMinutes:   p.ApprovalTimeoutMinutes,
+		Disabled:                 p.Disabled,
 		BuildRetentionMaxPerJob:  p.BuildRetentionMaxPerJob,
 		BuildRetentionMaxAgeDays: p.BuildRetentionMaxAgeDays,
 		WebhookBranchMode:        p.WebhookBranchMode,
 		WebhookBranches:          append([]string(nil), p.WebhookBranches...),
 		WebhookEvents:            append([]string(nil), p.WebhookEvents...),
+	}
+	if p.Cache != nil {
+		doc.Cache = &model.CacheConfig{
+			Enabled: p.Cache.Enabled,
+			Key:     p.Cache.Key,
+			Paths:   append([]string(nil), p.Cache.Paths...),
+		}
 	}
 	if p.CommitStatus.Enabled || strings.TrimSpace(p.CommitStatus.Project) != "" {
 		status := &CommitStatusExport{Enabled: p.CommitStatus.Enabled, Project: p.CommitStatus.Project}
@@ -418,16 +436,17 @@ func (s *PortabilityService) decode(doc []byte) (*PipelineExport, *rawDoc, []pkg
 var knownDocFields = map[string]bool{
 	// 导出文档
 	"export_version": true, "exported_at": true, "exported_from": true,
-	"name": true, "description": true, "steps": true,
+	"name": true, "description": true, "environment": true, "steps": true,
 	"git_url": true, "git_branch": true, "git_credential_name": true,
 	"cron_spec": true, "params": true, "ssh_publishes": true, "artifacts": true,
+	"test_report": true, "cache": true,
 	"build_retention_max_per_job": true, "build_retention_max_age_days": true,
 	"delete_workspace_before_build": true, "notify": true, "warnings": true,
 	"tool_selections":     true,
 	"webhook_branch_mode": true, "webhook_branches": true, "webhook_events": true,
 	"commit_status": true,
 	// 原生 config.json 里的触发器/审批字段（导入时按需读取）
-	"require_approval": true, "approval_timeout_minutes": true,
+	"require_approval": true, "approval_timeout_minutes": true, "disabled": true,
 	// 原生 config.json 的实例字段（导入时忽略）
 	"id": true, "created_at": true, "updated_at": true, "workspace_dir": true,
 	"executor": true, "image": true, "git_credential_id": true, "ssh_publish": true,
@@ -440,6 +459,7 @@ func (s *PortabilityService) toPipeline(ctx context.Context, exported *PipelineE
 	// 原生 config.json 优先：它没有「导出时清空」的语义，字段就是配置本身。
 	p.Name = firstNonEmpty(exported.Name, raw.Name)
 	p.Description = firstNonEmpty(exported.Description, raw.Description)
+	p.Environment = firstNonEmpty(exported.Environment, raw.Environment)
 	p.Steps = exported.Steps
 	if len(p.Steps) == 0 {
 		p.Steps = raw.Steps
@@ -458,6 +478,17 @@ func (s *PortabilityService) toPipeline(ctx context.Context, exported *PipelineE
 	}
 	// allow_empty 是独立开关：旧文档没有该字段时从原生配置补齐。
 	p.Artifacts.AllowEmpty = exported.Artifacts.AllowEmpty || raw.Artifacts.AllowEmpty
+	if exported.TestReport.Enabled || len(exported.TestReport.Files) > 0 || exported.TestReport.AllowEmpty {
+		p.TestReport = exported.TestReport
+	} else {
+		p.TestReport = raw.TestReport
+	}
+	p.TestReport.AllowEmpty = exported.TestReport.AllowEmpty || raw.TestReport.AllowEmpty
+	if exported.Cache != nil {
+		p.Cache = &model.CacheConfig{Enabled: exported.Cache.Enabled, Key: exported.Cache.Key, Paths: append([]string(nil), exported.Cache.Paths...)}
+	} else if raw.Cache != nil {
+		p.Cache = &model.CacheConfig{Enabled: raw.Cache.Enabled, Key: raw.Cache.Key, Paths: append([]string(nil), raw.Cache.Paths...)}
+	}
 	p.WebhookBranchMode = firstNonEmpty(exported.WebhookBranchMode, raw.WebhookBranchMode)
 	if len(exported.WebhookBranches) > 0 {
 		p.WebhookBranches = append([]string(nil), exported.WebhookBranches...)
@@ -472,6 +503,7 @@ func (s *PortabilityService) toPipeline(ctx context.Context, exported *PipelineE
 	// 审批配置：导出文档与原生 config.json 都接受；任一侧开启即保留。
 	p.RequireApproval = exported.RequireApproval || raw.RequireApproval
 	p.ApprovalTimeoutMinutes = firstIntValue(exported.ApprovalTimeoutMinutes, raw.ApprovalTimeoutMinutes)
+	p.Disabled = exported.Disabled || raw.Disabled
 	p.BuildRetentionMaxPerJob = firstIntValue(exported.BuildRetentionMaxPerJob, raw.BuildRetentionMaxPerJob)
 	p.BuildRetentionMaxAgeDays = firstIntValue(exported.BuildRetentionMaxAgeDays, raw.BuildRetentionMaxAgeDays)
 	if len(exported.ToolSelections) > 0 {

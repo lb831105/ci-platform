@@ -3,7 +3,7 @@
 export type SshAuthType = 'key' | 'password'
 
 // 构建参数（对齐 Jenkins Parameters）：值会注入同名环境变量与 CI_PARAM_<大写名>。
-export type ParamType = 'string' | 'bool' | 'choice' | 'text'
+export type ParamType = 'string' | 'bool' | 'choice' | 'text' | 'password'
 
 export interface ParamDef {
   name: string
@@ -45,11 +45,24 @@ export interface SshPublishConfig {
 export type PipelineExecutor = 'docker' | 'local'
 
 // 构建产物归档规则：构建成功后按 glob 复制到 jobs/{pid}/builds/{bid}/artifacts/。
+export interface TestReportConfig {
+  enabled: boolean
+  files: string[]
+  allow_empty?: boolean
+}
+
 export interface ArtifactConfig {
   enabled: boolean
   files: string[]
   // 允许无产物：没匹配到文件只告警不失败（多模块项目常见）
   allow_empty?: boolean
+}
+
+// 显式缓存：构建前恢复、成功后保存；key 支持 ${PARAM} 占位符。
+export interface CacheConfig {
+  enabled: boolean
+  key: string
+  paths: string[]
 }
 
 // 步骤级执行控制（与 Go model.Step 对齐）：
@@ -225,6 +238,8 @@ export interface Pipeline {
   id: string
   name: string
   description: string
+  // 部署环境（dev/staging/prod 等），随构建快照
+  environment?: string
   image: string // 已废弃：仅兼容旧数据，本地构建不再使用
   steps: BuildStep[]
   git_url: string
@@ -245,6 +260,8 @@ export interface Pipeline {
   commit_status: CommitStatusConfig
   // 定时构建（对齐 Jenkins Build periodically）：5 字段 cron 规格，空表示不启用
   cron_spec: string
+  // 禁用任务：暂停手动/Webhook/定时触发，配置与历史保留
+  disabled?: boolean
   // 构建参数定义；为空则是普通「立即构建」，不弹参数表单
   params: ParamDef[]
   // 旧版单目标配置（仅旧数据会返回，读取时归一进 ssh_publishes）
@@ -252,6 +269,10 @@ export interface Pipeline {
   // 多目标发布：一次构建可依次发布到多台服务器/多个目录
   ssh_publishes: SshPublishConfig[]
   artifacts: ArtifactConfig
+  // JUnit 测试报告（构建后操作）
+  test_report: TestReportConfig
+  // 显式缓存；null/未启用时只复用工作区
+  cache?: CacheConfig | null
   // 任务级通知配置；null 表示沿用全局默认（系统配置 → 邮件 / Webhook 通知）
   notify: JobNotify | null
   build_retention_max_per_job: number
@@ -296,10 +317,19 @@ export function emptyArtifacts(): ArtifactConfig {
   return { enabled: false, files: [], allow_empty: false }
 }
 
+export function emptyTestReport(): TestReportConfig {
+  return { enabled: false, files: [], allow_empty: false }
+}
+
+export function emptyCache(): CacheConfig {
+  return { enabled: false, key: 'default', paths: [] }
+}
+
 export function emptyPipeline(): PipelinePayload {
   return {
     name: '',
     description: '',
+    environment: '',
     image: '',
     steps: [emptyStep('build')],
     git_url: '',
@@ -312,10 +342,13 @@ export function emptyPipeline(): PipelinePayload {
     webhook_events: ['push'],
     commit_status: { enabled: false, credential_id: '', project: '' },
     cron_spec: '',
+    disabled: false,
     params: [],
     ssh_publish: null,
     ssh_publishes: [emptySshPublish()],
     artifacts: emptyArtifacts(),
+    test_report: emptyTestReport(),
+    cache: emptyCache(),
     notify: emptyJobNotify(),
     build_retention_max_per_job: 0,
     build_retention_max_age_days: 0,

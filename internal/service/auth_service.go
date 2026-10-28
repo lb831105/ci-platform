@@ -34,6 +34,12 @@ type UserPasswordUpdater interface {
 	ChangeUserPassword(name, oldPassword, newPassword string) error
 }
 
+// APITokenVerifier 校验长期访问令牌（由 APITokenService 实现）。
+// 单列接口是为了让 AuthService 不直接依赖令牌存储，测试时也能注入空实现。
+type APITokenVerifier interface {
+	VerifyAPIToken(raw string) (string, bool)
+}
+
 // AuthService 负责管理员凭据校验与会话签发/校验。
 // 凭据与开关可在运行时通过「全局安全配置」修改。
 type AuthService struct {
@@ -46,7 +52,9 @@ type AuthService struct {
 	userVerifier UserVerifier
 	// passwordUpdater 处理平台内用户的自助改密；为 nil 时只支持内置管理员改密。
 	passwordUpdater UserPasswordUpdater
-	sessions        map[string]session
+	// tokenVerifier 处理 API Token；为 nil 时只接受登录会话。
+	tokenVerifier APITokenVerifier
+	sessions      map[string]session
 }
 
 // NewAuthService 构造认证服务。ttl <= 0 时回退为 12 小时。
@@ -114,6 +122,13 @@ func (a *AuthService) SetUserPasswordUpdater(u UserPasswordUpdater) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.passwordUpdater = u
+}
+
+// SetAPITokenVerifier 注入 API Token 校验实现。
+func (a *AuthService) SetAPITokenVerifier(v APITokenVerifier) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.tokenVerifier = v
 }
 
 // IsAdmin 判断用户名是否是内置管理员（密码保存在系统配置里的那个账号）。
@@ -290,23 +305,34 @@ func (a *AuthService) UsesPassword(plain string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(a.passwordHash), []byte(plain)) == nil
 }
 
-// Verify 校验 token，返回用户名与是否有效。认证关闭时恒为有效。
+// Verify 校验登录会话或 API Token，返回用户名与是否有效。
+// 认证关闭时恒为有效；校验 API Token 时不能在持锁状态下调用外部服务。
 func (a *AuthService) Verify(token string) (string, bool) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if !a.enabled {
+		a.mu.Unlock()
 		return "anonymous", true
 	}
 	if token == "" {
+		a.mu.Unlock()
 		return "", false
 	}
 	now := time.Now()
-	s, ok := a.sessions[token]
-	if !ok || now.After(s.expiresAt) {
-		delete(a.sessions, token)
-		return "", false
+	if s, ok := a.sessions[token]; ok {
+		if now.After(s.expiresAt) {
+			delete(a.sessions, token)
+			a.mu.Unlock()
+			return "", false
+		}
+		a.mu.Unlock()
+		return s.username, true
 	}
-	return s.username, true
+	verifier := a.tokenVerifier
+	a.mu.Unlock()
+	if verifier != nil {
+		return verifier.VerifyAPIToken(token)
+	}
+	return "", false
 }
 
 // Logout 主动销毁会话。

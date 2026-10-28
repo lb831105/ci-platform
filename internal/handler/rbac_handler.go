@@ -16,6 +16,8 @@ type RbacHandler struct {
 	auth *service.AuthService
 	// pipelines 仅用于生效预览：需要全部任务名（不按浏览者权限过滤）。
 	pipelines *service.PipelineService
+	// tokens 用于删除用户/重置密码后清理长期令牌。
+	tokens *service.APITokenService
 }
 
 // NewRbacHandler 构造 RBAC 接口处理器。auth 用于删除用户/重置密码后撤销会话。
@@ -26,6 +28,11 @@ func NewRbacHandler(rbac *service.RBACService, auth *service.AuthService) *RbacH
 // SetPipelines 注入任务服务（生效预览需要任务名列表）。
 func (h *RbacHandler) SetPipelines(pipelines *service.PipelineService) {
 	h.pipelines = pipelines
+}
+
+// SetTokens 注入 API Token 服务。
+func (h *RbacHandler) SetTokens(tokens *service.APITokenService) {
+	h.tokens = tokens
 }
 
 // rbacView 是 GET /api/security/rbac 的响应：数据 + 权限矩阵元信息。
@@ -157,8 +164,11 @@ func (h *RbacHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		pkg.Fail(w, err)
 		return
 	}
-	// 用户已删除，撤销其全部登录会话。
+	// 用户已删除，撤销其全部登录会话与长期令牌。
 	h.auth.RevokeUserSessions(strings.TrimSpace(in.Name))
+	if h.tokens != nil {
+		_ = h.tokens.RevokeUserTokens(strings.TrimSpace(in.Name))
+	}
 	pkg.OK(w, h.rbac.Data())
 }
 
@@ -180,6 +190,9 @@ func (h *RbacHandler) ResetUserPassword(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	h.auth.RevokeUserSessions(strings.TrimSpace(in.Name))
+	if h.tokens != nil {
+		_ = h.tokens.RevokeUserTokens(strings.TrimSpace(in.Name))
+	}
 	pkg.OK(w, nil)
 }
 

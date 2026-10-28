@@ -163,6 +163,12 @@ func normalizeWorkspacePattern(raw string) (string, error) {
 	return pattern, nil
 }
 
+// MatchWorkspaceFiles 是 matchWorkspaceFilesDetailed 的导出包装，
+// 供缓存等需要在工作区内按 glob 收集文件的服务复用同一套路径安全规则。
+func MatchWorkspaceFiles(workspace string, patterns []string, label string) ([]string, []string, error) {
+	return matchWorkspaceFilesDetailed(workspace, patterns, label)
+}
+
 // ValidateWorkspacePatterns 供 service 在保存任务时提前校验产物/上传模式。
 func ValidateWorkspacePatterns(patterns []string) error {
 	for _, raw := range patterns {

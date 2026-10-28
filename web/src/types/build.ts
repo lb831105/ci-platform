@@ -4,6 +4,46 @@ export type BuildStatus = 'pending' | 'pending_approval' | 'running' | 'success'
 
 export type TriggerType = 'manual' | 'webhook' | 'timer'
 
+export interface BuildStepResult {
+  name: string
+  status: 'success' | 'failed' | 'skipped' | 'cancelled' | string
+  exit_code: number
+  duration_ms: number
+  allow_failure?: boolean
+}
+
+export interface TestCaseResult {
+  name: string
+  class_name?: string
+  status: 'failure' | 'error' | 'skipped' | string
+  time_ms: number
+  message?: string
+}
+
+export interface TestReport {
+  total: number
+  passed: number
+  failed: number
+  errors: number
+  skipped: number
+  suites: number
+  duration_ms: number
+  files?: string[]
+  failed_cases?: TestCaseResult[]
+  created_at?: string
+}
+
+export interface DeploymentRecord {
+  target?: string
+  server_id?: string
+  environment?: string
+  status: 'success' | 'failed' | string
+  deployed_at: string
+  deployed_by?: string
+  artifact_count?: number
+  message?: string
+}
+
 export interface Build {
   id: string
   pipeline_id: string
@@ -18,6 +58,13 @@ export interface Build {
   // 构建页备注 / 永久保留（Jenkins Add description / Keep forever）。
   description?: string
   keep_forever?: boolean
+  // 构建步骤结果（由 LocalExecutor 采集；旧构建没有该字段）
+  step_results?: BuildStepResult[]
+  // JUnit 测试报告（启用「发布 JUnit 测试报告」后才有）
+  test_report?: TestReport
+  // 部署环境与 SSH 发布记录
+  environment?: string
+  deployments?: DeploymentRecord[]
   // SCM 现场：构建页展示 Revision / Repository / refs / Changes。
   branch?: string
   commit?: string
@@ -54,6 +101,9 @@ export interface BuildAdvice {
 
 export interface BuildLogPayload {
   log: string
+  total_lines?: number
+  matched_lines?: number
+  truncated?: boolean
 }
 
 // 与 Go internal/model/build.go 的 ArtifactFile / ArtifactManifest 对齐。

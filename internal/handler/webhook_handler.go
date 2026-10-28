@@ -107,10 +107,7 @@ func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 
 	// 幂等：同一次投递（UUID）在窗口内只构建一次。
 	// 没有投递标识时用「任务+分支+提交」组合兜底，仍能挡住明显的重复投递。
-	deliveryKey := ev.Delivery
-	if deliveryKey == "" && ev.Commit != "" {
-		deliveryKey = "sha:" + pipelineID + ":" + ev.Branch + ":" + ev.Commit
-	}
+	deliveryKey := webhookDeliveryKey(pipelineID, ev)
 	if !h.dedupe.First(deliveryKey) {
 		h.recordAudit(r, pipelineID, pkg.CodeOK, "duplicate:"+deliveryKey)
 		pkg.OK(w, webhookIgnored{Ignored: true, Reason: "重复投递（同一事件已处理）", Event: ev.Kind, Branch: ev.Branch})
@@ -124,6 +121,9 @@ func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 			CommitProject: ev.Project,
 		})
 	if err != nil {
+		// 去重键必须在失败时释放：否则队列满/任务禁用等可重试错误发生后，
+		// 代码平台按 5xx/429 重试会被当成「重复投递」永久忽略。
+		h.dedupe.Forget(deliveryKey)
 		logger.Errorf("[webhook] pipeline=%s trigger failed: %v", pipelineID, err)
 		pkg.FailStatus(w, err)
 		return
@@ -132,6 +132,19 @@ func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		pipelineID, b.ID, orDash(b.Branch), orDash(ev.Commit), ev.Kind, ev.Provider)
 	h.recordAudit(r, pipelineID, pkg.CodeOK, "build:"+b.ID)
 	pkg.OK(w, b)
+}
+
+// webhookDeliveryKey 生成去重键。
+// GitLab/GitHub 的投递 UUID 是项目级的：同一事件会分别投递到多个任务 URL，
+// 因此必须带 pipelineID，否则第二个任务会被误判为重复投递。
+func webhookDeliveryKey(pipelineID string, ev webhook.Event) string {
+	if ev.Delivery != "" {
+		return "uuid:" + pipelineID + ":" + ev.Delivery
+	}
+	if ev.Commit != "" {
+		return "sha:" + pipelineID + ":" + ev.Kind + ":" + ev.Branch + ":" + ev.Commit
+	}
+	return ""
 }
 
 // recordAudit 记录一次 Webhook 请求；Webhook 不走 Auth/审计中间件，

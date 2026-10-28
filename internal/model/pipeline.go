@@ -49,6 +49,22 @@ type CommitStatusConfig struct {
 	Project string `json:"project,omitempty"`
 }
 
+// TestReportConfig 描述 JUnit 测试报告收集规则（对齐 Jenkins "Publish JUnit test result report"）。
+// Files 是工作区内相对于工作区根目录的 glob；AllowEmpty 为 true 时没匹配到报告只告警。
+type TestReportConfig struct {
+	Enabled    bool     `json:"enabled"`
+	Files      []string `json:"files,omitempty"`
+	AllowEmpty bool     `json:"allow_empty,omitempty"`
+}
+
+// CacheConfig 描述显式缓存：构建前恢复、成功后保存，对齐 GitLab cache / GitHub Actions cache。
+// 路径是工作区内的目录或 glob；Key 变化会使用不同的缓存目录（例如按语言版本隔离）。
+type CacheConfig struct {
+	Enabled bool     `json:"enabled"`
+	Key     string   `json:"key"`
+	Paths   []string `json:"paths"`
+}
+
 // ArtifactConfig 描述构建产物的归档规则，语义对齐 Jenkins "Archive the artifacts"。
 // 构建步骤成功后，按 Files 中的 glob（相对工作区）复制到
 // data/jobs/{pid}/builds/{bid}/artifacts/，每次构建独立保留。
@@ -67,13 +83,15 @@ const (
 	ParamBool   = "bool"
 	ParamChoice = "choice"
 	ParamText   = "text"
+	// ParamPassword 是密码类参数：构建记录只保存加密值，API/界面只显示 ***。
+	ParamPassword = "password"
 )
 
 // ParamDef 定义一个构建参数：触发构建时由用户填值（或取默认值），
 // 值会以「参数名」和「CI_PARAM_<大写名>」两种环境变量注入构建步骤。
 type ParamDef struct {
 	Name        string   `json:"name"`
-	Type        string   `json:"type"` // string | bool | choice | text
+	Type        string   `json:"type"` // string | bool | choice | text | password
 	Default     string   `json:"default"`
 	Options     []string `json:"options,omitempty"` // choice 专用
 	Required    bool     `json:"required"`
@@ -116,8 +134,10 @@ const (
 
 // Pipeline 对应 Jenkins Job，持久化为 data/jobs/{id}/config.json。
 type Pipeline struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Environment 是任务所属部署环境（dev/staging/prod 等自由文本）。
+	Environment   string `json:"environment,omitempty"`
 	Description   string `json:"description"`
 	Image         string `json:"image"`
 	Steps         []Step `json:"steps"`
@@ -145,6 +165,10 @@ type Pipeline struct {
 	// CommitStatus 把构建状态回写到代码平台（GitLab commit status），便于 MR 里看到结果。
 	CommitStatus CommitStatusConfig `json:"commit_status"`
 
+	// Disabled 为 true 时暂停手动/Webhook/定时触发（对齐 Jenkins "Disable Project"）。
+	// 任务配置与构建历史保留；重新启用后即可继续构建。
+	Disabled bool `json:"disabled,omitempty"`
+
 	// 定时构建（对齐 Jenkins Build periodically）：5 字段 cron 规格，
 	// 支持 H 散列均衡；为空表示不定时触发。
 	CronSpec string `json:"cron_spec,omitempty"`
@@ -163,6 +187,9 @@ type Pipeline struct {
 	// SshPublishes 是多目标发布列表：一次构建可依次发布到多台服务器/多个目录。
 	SshPublishes []SshPublishConfig `json:"ssh_publishes,omitempty"`
 	Artifacts    ArtifactConfig     `json:"artifacts"`
+	TestReport   TestReportConfig   `json:"test_report,omitempty"`
+	// Cache 是显式缓存配置；nil/未启用时只复用工作区（平台默认行为）。
+	Cache *CacheConfig `json:"cache,omitempty"`
 
 	// 丢弃旧的构建（per-job 覆盖全局 Build Discarders）。
 	BuildRetentionMaxPerJob  int `json:"build_retention_max_per_job"`

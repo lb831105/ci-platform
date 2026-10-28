@@ -16,6 +16,7 @@ const typeOptions: Array<{ value: ParamType; label: string }> = [
   { value: 'bool', label: '布尔值' },
   { value: 'choice', label: '单选（Choice）' },
   { value: 'text', label: '多行文本' },
+  { value: 'password', label: '密码（不保存默认值）' },
 ]
 
 const items = computed(() => props.modelValue ?? [])
@@ -49,6 +50,11 @@ function patch(index: number, partial: Partial<ParamDef>): void {
   }
   if (partial.type === 'bool' && !list[index].default) {
     list[index].default = 'false'
+  }
+  if (partial.type === 'password') {
+    // 密码默认值会明文写进任务配置，切换类型时立刻清空。
+    list[index].default = ''
+    list[index].options = []
   }
   commit(list)
 }
@@ -122,6 +128,7 @@ function onAdd(): void {
           >
             <el-option v-for="opt in row.options ?? []" :key="opt" :label="opt" :value="opt" />
           </el-select>
+          <span v-else-if="row.type === 'password'" class="param-config__hint">触发构建时填写，任务配置不保存密码</span>
           <el-input
             v-else
             :model-value="row.default"

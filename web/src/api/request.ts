@@ -84,10 +84,38 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return body.data
 }
 
+// 列表分页接口：除统一响应体外，还读取 X-Total-Count 头返回总数。
+// 不把响应改成 {items,total} 信封，避免破坏已有「返回数组」的旧接口。
+async function requestPage<T>(path: string): Promise<{ data: T; total: number }> {
+  const headers = new Headers()
+  const token = getToken()
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`)
+  }
+  const response = await fetch(`${BASE_URL}${path}`, { headers })
+  if (!response.ok) {
+    throw new ApiError(response.status, `HTTP ${response.status}`)
+  }
+  const totalHeader = response.headers.get('X-Total-Count')
+  const total = totalHeader === null ? 0 : Number(totalHeader)
+  const body = (await response.json()) as ApiResponse<T>
+  if (body.code === CODE_UNAUTHORIZED) {
+    redirectToLogin()
+    throw new ApiError(body.code, body.msg)
+  }
+  if (body.code !== 0) {
+    throw new ApiError(body.code, body.msg)
+  }
+  return { data: body.data, total: Number.isFinite(total) ? total : 0 }
+}
+
 // 只做请求封装与类型标注，不含任何业务判断。
 export const http = {
   get<T>(path: string): Promise<T> {
     return request<T>(path)
+  },
+  getPage<T>(path: string): Promise<{ data: T; total: number }> {
+    return requestPage<T>(path)
   },
   post<T>(path: string, body?: unknown): Promise<T> {
     return request<T>(path, {

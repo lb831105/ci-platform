@@ -28,17 +28,25 @@ type BuildStore interface {
 	CreateNext(ctx context.Context, b *model.Build) error
 	Get(ctx context.Context, pipelineID, buildID string) (*model.Build, error)
 	Update(ctx context.Context, b *model.Build) error
+	UpdateMetadata(ctx context.Context, pipelineID, buildID string, description *string, keepForever *bool) (*model.Build, error)
 	ListByPipeline(ctx context.Context, pipelineID string) ([]*model.Build, error)
 	AppendLog(ctx context.Context, pipelineID, buildID string, data []byte) error
 	ReadLog(ctx context.Context, pipelineID, buildID string) (string, error)
 	LogWriter(ctx context.Context, pipelineID, buildID string) (io.WriteCloser, error)
 	DeleteBuild(ctx context.Context, pipelineID, buildID string) error
 	BuildDir(pipelineID, buildID string) string
+	// CacheDir 返回 task 级缓存目录（cacheKey 已由 service 做过文件名安全化）。
+	CacheDir(pipelineID, cacheKey string) string
 }
 
 // StepRunner 由 LocalExecutor 实现（在服务器上直接执行步骤）。
 type StepRunner interface {
 	RunSteps(ctx context.Context, spec executor.RunSpec, out io.Writer) (int, error)
+}
+
+// StepResultRunner 是可选能力：LocalExecutor 实现它，测试/自定义 runner 可以只实现 RunSteps。
+type StepResultRunner interface {
+	RunStepsWithResults(ctx context.Context, spec executor.RunSpec, out io.Writer) ([]model.StepResult, int, error)
 }
 
 // GitRunner 由 GitClient 实现。
@@ -73,6 +81,12 @@ type CredentialResolver interface {
 	Resolve(ctx context.Context, id string) (*model.Credential, error)
 }
 
+// SecretCodec 加密构建密码参数（由 CredentialService 实现，与凭据共用密钥）。
+type SecretCodec interface {
+	SealSecret(plain string) (string, error)
+	UnsealSecret(value string) (string, error)
+}
+
 // BuildService 编排一次构建的完整生命周期：状态流转 → 拉代码 → 本地执行 → SSH 发布。
 // 只调用 store 与 executor 的抽象接口，自身不读写文件、不拼命令。
 type BuildService struct {
@@ -85,11 +99,15 @@ type BuildService struct {
 	workspace      *WorkspaceManager
 	settings       SettingsProvider
 	credentials    CredentialResolver
+	secrets        SecretCodec
 	artifacts      ArtifactCollector
 	artifactReader ArtifactReader
+	tests          *executor.JUnitCollector
 	enqueuer       Enqueuer
 	// notifier 负责构建结果通知（项目 × 人员/群 × 事件）；为 nil 时跳过。
 	notifier *NotifyService
+	// queueStats 供首页仪表盘展示队列/worker 状态；为 nil 时相关指标为 0。
+	queueStats QueueStats
 	// toolInstaller 负责「自动安装」的工具（JDK/Maven/Node…）下载；为 nil 时只用已有主目录。
 	toolInstaller *tools.Installer
 
@@ -97,11 +115,24 @@ type BuildService struct {
 	// 构建开始时注册，结束（含取消/panic）时注销。
 	cancelMu sync.Mutex
 	cancels  map[string]*cancelEntry
+
+	// Idempotency-Key 的短期内存储：只保存「键 → build ID」。
+	// 不落盘是有意取舍：客户端重试通常发生在分钟级；进程重启后重新触发
+	// 仍可能产生重复构建，但不会把过期键永久写进数据目录。
+	idemMu      sync.Mutex
+	idemLocks   map[string]*sync.Mutex
+	idemEntries map[string]idemEntry
 }
 
 // SetToolInstaller 注入工具安装器（自动安装模式的下载/解压）。
 func (s *BuildService) SetToolInstaller(installer *tools.Installer) {
 	s.toolInstaller = installer
+}
+
+// SetSecretCodec 注入密码参数加密实现。未注入时，带密码参数的任务拒绝触发，
+// 避免在无法安全落盘的情况下把明文写进 build.json。
+func (s *BuildService) SetSecretCodec(codec SecretCodec) {
+	s.secrets = codec
 }
 
 // cancelEntry 记录一次运行中构建的取消句柄；cancelled 标记用于区分
@@ -143,6 +174,7 @@ func NewBuildService(
 		settings:       settings,
 		artifacts:      artifacts,
 		artifactReader: artifactReader,
+		tests:          executor.NewJUnitCollector(),
 		cancels:        make(map[string]*cancelEntry),
 	}
 }
@@ -201,6 +233,9 @@ func (s *BuildService) Recover(ctx context.Context) {
 type TriggerOptions struct {
 	// Params 是参数化构建的用户填值（未传的参数取默认值）。
 	Params map[string]string
+	// IdempotencyKey 让客户端重试同一个请求时复用第一次创建的构建。
+	// 键按「任务 + 触发人」隔离，避免不同用户/任务互相踩键。
+	IdempotencyKey string
 	// Branch 覆盖任务配置的分支：Webhook 按推送事件的分支构建时使用，
 	// 这是「一个任务服务所有分支」的关键（否则推 dev 却构建 main）。
 	Branch string
@@ -209,9 +244,23 @@ type TriggerOptions struct {
 }
 
 func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger model.TriggerType, triggeredBy string, opts TriggerOptions) (*model.Build, error) {
+	// 先处理幂等键：重复请求应返回第一次创建的构建，即使任务随后被禁用，
+	// 也不应该让客户端拿到 409 而误以为第一次触发失败。
+	idemBuild, releaseIdem, err := s.beginIdempotency(ctx, pipelineID, triggeredBy, opts.IdempotencyKey)
+	if err != nil {
+		return nil, err
+	}
+	if idemBuild != nil {
+		return idemBuild, nil
+	}
+	defer releaseIdem()
+
 	p, err := s.pipelines.Get(ctx, pipelineID)
 	if err != nil {
 		return nil, err
+	}
+	if p.Disabled {
+		return nil, pkg.ErrConflict("任务 %q 已禁用；请先在任务配置中重新启用", p.Name)
 	}
 	if s.enqueuer == nil {
 		return nil, pkg.NewError(pkg.CodeInternal, "scheduler is not initialized")
@@ -219,6 +268,10 @@ func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger m
 	// 参数在触发时就解析成最终值并快照进构建记录：
 	// 后续有人改了参数默认值，历史构建仍能还原「当时用的什么」。
 	resolved, err := ResolveBuildParams(p.Params, opts.Params)
+	if err != nil {
+		return nil, err
+	}
+	resolved, secretParams, err := s.protectPasswordParams(p.Params, resolved)
 	if err != nil {
 		return nil, err
 	}
@@ -232,15 +285,17 @@ func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger m
 
 	createdAt := time.Now().UTC()
 	b := &model.Build{
-		PipelineID:  pipelineID,
-		Status:      model.BuildPending,
-		TriggerType: trigger,
-		TriggeredBy: strings.TrimSpace(triggeredBy),
-		CreatedAt:   &createdAt,
-		Params:      resolved,
+		PipelineID:   pipelineID,
+		Status:       model.BuildPending,
+		TriggerType:  trigger,
+		TriggeredBy:  strings.TrimSpace(triggeredBy),
+		CreatedAt:    &createdAt,
+		Params:       resolved,
+		SecretParams: secretParams,
 		// 触发时先记下分支：签出后会由 git 现场信息覆盖，但排队/待审批阶段
 		// 也需要知道"这次是哪条分支"，否则列表里只看到任务配置的那条。
 		Branch:        strings.TrimSpace(p.GitBranch),
+		Environment:   strings.TrimSpace(p.Environment),
 		CommitProject: strings.TrimSpace(opts.CommitProject),
 	}
 	// 发布审批：先落 pending_approval 再等放行，绝不能先跑起来再问——生产发布
@@ -255,6 +310,7 @@ func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger m
 		_ = s.builds.AppendLog(ctx, pipelineID, b.ID, []byte(
 			"[ci] 等待发布审批：本任务开启了发布审批，需要拥有 job.approve 权限的人放行后才开始执行\n"))
 		logger.Infof("build %s/%s pending approval (requested by %s)", pipelineID, b.ID, b.TriggeredBy)
+		s.rememberIdempotency(pipelineID, triggeredBy, opts.IdempotencyKey, b.ID)
 		return b, nil
 	}
 	if err := s.builds.CreateNext(ctx, b); err != nil {
@@ -266,12 +322,178 @@ func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger m
 		dir = p.ID
 	}
 	if err := s.enqueuer.Enqueue(Job{PipelineID: pipelineID, BuildID: b.ID, WorkspaceDir: dir}); err != nil {
+		// 入队失败也要留下可读的终态，否则构建历史里只有一条没有 StartedAt/FinishedAt
+		// 的 failed 记录，用户无法判断是队列满还是服务异常。
+		now := time.Now().UTC()
 		b.Status = model.BuildFailed
 		b.ExitCode = -1
+		b.FinishedAt = &now
 		_ = s.builds.Update(ctx, b)
+		_ = s.builds.AppendLog(ctx, pipelineID, b.ID, []byte("[ci] 入队失败: "+err.Error()+"\n"))
 		return nil, err
 	}
+	s.rememberIdempotency(pipelineID, triggeredBy, opts.IdempotencyKey, b.ID)
 	return b, nil
+}
+
+const (
+	idemTTL       = 24 * time.Hour
+	idemMaxKeys   = 10000
+	maxIdemKeyLen = 128
+)
+
+// idemEntry 记录一次成功触发，用于重试时返回同一个构建。
+type idemEntry struct {
+	buildID string
+	at      time.Time
+}
+
+// beginIdempotency 锁定给定键并返回已存在的构建（若有）。
+// 返回的 release 必须在 Trigger 结束时调用，避免并发同键请求同时创建构建。
+func (s *BuildService) beginIdempotency(ctx context.Context, pipelineID, triggeredBy, key string) (*model.Build, func(), error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, func() {}, nil
+	}
+	if len([]rune(key)) > maxIdemKeyLen {
+		return nil, func() {}, pkg.ErrBadRequest("Idempotency-Key 最多 %d 个字符", maxIdemKeyLen)
+	}
+	full := idemKey(pipelineID, triggeredBy, key)
+
+	s.idemMu.Lock()
+	if s.idemLocks == nil {
+		s.idemLocks = make(map[string]*sync.Mutex)
+	}
+	lock := s.idemLocks[full]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		s.idemLocks[full] = lock
+	}
+	s.idemMu.Unlock()
+	lock.Lock()
+
+	s.idemMu.Lock()
+	entry, ok := s.idemEntries[full]
+	s.idemMu.Unlock()
+	if ok && time.Since(entry.at) < idemTTL {
+		b, err := s.builds.Get(ctx, pipelineID, entry.buildID)
+		if err == nil {
+			lock.Unlock()
+			return b, func() {}, nil
+		}
+		// 构建已被清理：删掉旧映射，允许同一个键重新触发。
+		s.idemMu.Lock()
+		delete(s.idemEntries, full)
+		s.idemMu.Unlock()
+	}
+	return nil, lock.Unlock, nil
+}
+
+func idemKey(pipelineID, triggeredBy, key string) string {
+	return pipelineID + "\x00" + triggeredBy + "\x00" + strings.TrimSpace(key)
+}
+
+func (s *BuildService) rememberIdempotency(pipelineID, triggeredBy, key, buildID string) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	full := idemKey(pipelineID, triggeredBy, key)
+	now := time.Now()
+	s.idemMu.Lock()
+	defer s.idemMu.Unlock()
+	if s.idemEntries == nil {
+		s.idemEntries = make(map[string]idemEntry)
+	}
+	if len(s.idemEntries) >= idemMaxKeys {
+		for k, v := range s.idemEntries {
+			if now.Sub(v.at) >= idemTTL {
+				delete(s.idemEntries, k)
+			}
+		}
+		// 仍然过多时只清最旧的一批；不做 LRU 以避免额外复杂度。
+		if len(s.idemEntries) >= idemMaxKeys {
+			for k := range s.idemEntries {
+				delete(s.idemEntries, k)
+				if len(s.idemEntries) < idemMaxKeys/2 {
+					break
+				}
+			}
+		}
+	}
+	s.idemEntries[full] = idemEntry{buildID: buildID, at: now}
+}
+
+// protectPasswordParams 把密码参数移入加密字段，并在公开 Params 中打码。
+// 返回的 map 是重新分配的新 map，不修改调用方传入的 resolved。
+func (s *BuildService) protectPasswordParams(defs []model.ParamDef, values map[string]string) (map[string]string, map[string]string, error) {
+	var secrets map[string]string
+	for _, def := range defs {
+		if def.Type != model.ParamPassword {
+			continue
+		}
+		value := values[def.Name]
+		if s.secrets == nil {
+			return nil, nil, pkg.NewError(pkg.CodeInternal, "密码参数需要先配置服务器密钥（缺 credentials.key）")
+		}
+		sealed, err := s.secrets.SealSecret(value)
+		if err != nil {
+			return nil, nil, fmt.Errorf("加密密码参数 %s: %w", def.Name, err)
+		}
+		if secrets == nil {
+			secrets = make(map[string]string)
+		}
+		secrets[def.Name] = sealed
+	}
+	if len(secrets) == 0 {
+		return values, nil, nil
+	}
+	masked := make(map[string]string, len(values))
+	for k, v := range values {
+		masked[k] = v
+	}
+	for name := range secrets {
+		masked[name] = "***"
+	}
+	return masked, secrets, nil
+}
+
+// PipelineName 返回任务名，供跨任务操作做任务级权限校验。
+func (s *BuildService) PipelineName(ctx context.Context, pipelineID string) (string, error) {
+	p, err := s.pipelines.Get(ctx, pipelineID)
+	if err != nil {
+		return "", err
+	}
+	return p.Name, nil
+}
+
+// Rerun 用历史构建的参数快照重新触发（对齐 Jenkins Re-run）。
+// 密码参数不能在 API 响应里回传，因此重跑必须由服务端从源构建的加密字段还原。
+func (s *BuildService) Rerun(ctx context.Context, pipelineID, buildID, triggeredBy string) (*model.Build, error) {
+	src, err := s.builds.Get(ctx, pipelineID, buildID)
+	if err != nil {
+		return nil, err
+	}
+	params := make(map[string]string, len(src.Params)+len(src.SecretParams))
+	for k, v := range src.Params {
+		if _, isSecret := src.SecretParams[k]; !isSecret {
+			params[k] = v
+		}
+	}
+	for name, sealed := range src.SecretParams {
+		if s.secrets == nil {
+			return nil, pkg.NewError(pkg.CodeInternal, "密码参数无法还原：服务未配置密钥")
+		}
+		plain, err := s.secrets.UnsealSecret(sealed)
+		if err != nil {
+			return nil, fmt.Errorf("解密参数 %s: %w", name, err)
+		}
+		params[name] = plain
+	}
+	return s.Trigger(ctx, pipelineID, model.TriggerManual, triggeredBy, TriggerOptions{
+		Params: params,
+		Branch: src.Branch,
+	})
 }
 
 // ListByPipeline 返回某个 pipeline 的构建历史。
@@ -290,24 +512,13 @@ func (s *BuildService) Get(ctx context.Context, pipelineID, buildID string) (*mo
 // UpdateMetadata 更新构建页可编辑的元数据：备注与「永久保留」。
 // 只改 build.json，不触碰日志与产物；保留策略会在下一轮清理时读取 KeepForever。
 func (s *BuildService) UpdateMetadata(ctx context.Context, pipelineID, buildID string, description *string, keepForever *bool) (*model.Build, error) {
-	b, err := s.builds.Get(ctx, pipelineID, buildID)
-	if err != nil {
-		return nil, err
-	}
 	if description != nil {
 		trimmed := strings.TrimSpace(*description)
 		if len([]rune(trimmed)) > 2000 {
 			return nil, pkg.ErrBadRequest("构建描述最多 2000 个字符")
 		}
-		b.Description = trimmed
 	}
-	if keepForever != nil {
-		b.KeepForever = *keepForever
-	}
-	if err = s.builds.Update(ctx, b); err != nil {
-		return nil, err
-	}
-	return b, nil
+	return s.builds.UpdateMetadata(ctx, pipelineID, buildID, description, keepForever)
 }
 
 // Summaries 为任务列表计算聚合视图（上次成功 / 上次失败 / 上次持续时间）。
@@ -332,9 +543,39 @@ func (s *BuildService) AllBuilds(ctx context.Context, pipelines []*model.Pipelin
 		if err != nil {
 			return nil, err
 		}
-		for _, b := range builds {
-			out = append(out, model.BuildListItem{Build: *b, PipelineName: p.Name})
+		// ListByPipeline 按编号倒序；这里从旧到新算失败 streak 和「上一次完成状态」，
+		// 分页后前端仍能拿到每行需要的上下文，不必依赖同页的其他行。
+		streak := 0
+		var failingSince *time.Time
+		var failingSinceBuild string
+		var previousFinished model.BuildStatus
+		annotated := make([]model.BuildListItem, len(builds))
+		for i := len(builds) - 1; i >= 0; i-- {
+			b := builds[i]
+			item := model.BuildListItem{Build: *b, PipelineName: p.Name, PreviousStatus: previousFinished}
+			switch b.Status {
+			case model.BuildFailed:
+				if streak == 0 {
+					failingSince = b.StartedAt
+					failingSinceBuild = b.ID
+				}
+				streak++
+			case model.BuildSuccess, model.BuildAborted:
+				streak = 0
+				failingSince = nil
+			}
+			if b.Status == model.BuildFailed {
+				item.FailureStreak = streak
+				item.FailingSinceBuild = failingSinceBuild
+				item.FailingSinceAt = failingSince
+			}
+			annotated[i] = item
+			// pending/running 不算「上一次完成」，继续沿用更早的完成状态。
+			if b.Status == model.BuildSuccess || b.Status == model.BuildFailed || b.Status == model.BuildAborted {
+				previousFinished = b.Status
+			}
 		}
+		out = append(out, annotated...)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		return startTimeKey(out[i].StartedAt) > startTimeKey(out[j].StartedAt)
@@ -351,11 +592,56 @@ func startTimeKey(t *time.Time) int64 {
 }
 
 // ReadLog 返回完整控制台日志文本。
+// 读取时再遮罩一次：旧版本构建的日志可能已经落盘了明文密钥，
+// 只靠写入侧遮罩无法保护这些历史文件（界面/下载接口仍会返回原文）。
 func (s *BuildService) ReadLog(ctx context.Context, pipelineID, buildID string) (string, error) {
-	if _, err := s.builds.Get(ctx, pipelineID, buildID); err != nil {
+	b, err := s.builds.Get(ctx, pipelineID, buildID)
+	if err != nil {
 		return "", err
 	}
-	return s.builds.ReadLog(ctx, pipelineID, buildID)
+	text, err := s.builds.ReadLog(ctx, pipelineID, buildID)
+	if err != nil {
+		return "", err
+	}
+	if s.pipelines == nil || s.settings == nil {
+		return text, nil
+	}
+	p, err := s.pipelines.Get(ctx, pipelineID)
+	if err != nil {
+		return text, nil
+	}
+	return pkg.MaskSecrets(text, s.collectMaskSecrets(ctx, p, b, s.currentSettings())), nil
+}
+
+// QueryLog 读取日志并按 tail / grep 过滤，供构建页「只看最近 N 行 / 搜索关键字」使用。
+// 返回过滤后的文本、原始总行数、命中行数与是否因 tail 截断。
+func (s *BuildService) QueryLog(ctx context.Context, pipelineID, buildID string, tail int, grep string) (string, int, int, bool, error) {
+	text, err := s.ReadLog(ctx, pipelineID, buildID)
+	if err != nil {
+		return "", 0, 0, false, err
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	total := len(lines)
+	if grep != "" {
+		needle := strings.ToLower(grep)
+		matched := make([]string, 0, len(lines))
+		for _, line := range lines {
+			if strings.Contains(strings.ToLower(line), needle) {
+				matched = append(matched, line)
+			}
+		}
+		lines = matched
+	}
+	matchedCount := len(lines)
+	truncated := false
+	if tail > 0 && len(lines) > tail {
+		lines = lines[len(lines)-tail:]
+		truncated = true
+	}
+	return strings.Join(lines, "\n"), total, matchedCount, truncated, nil
 }
 
 // Run 由 Scheduler 的 worker 调用，执行一次完整构建。
@@ -379,6 +665,12 @@ func (s *BuildService) Run(ctx context.Context, job Job) {
 	b, err := s.builds.Get(ctx, job.PipelineID, job.BuildID)
 	if err != nil {
 		return
+	}
+	// Trigger 时把本次构建的分支快照写进 b.Branch（Webhook 可能是 push 的分支，
+	// 而不是任务配置的固定分支）。执行阶段必须用快照覆盖配置，否则“按推送分支构建”
+	// 只体现在构建记录里，实际仍会 clone 任务配置的分支。
+	if branch := strings.TrimSpace(b.Branch); branch != "" {
+		p.GitBranch = branch
 	}
 
 	settings := s.currentSettings()
@@ -438,7 +730,12 @@ func (s *BuildService) Run(ctx context.Context, job Job) {
 		int64(s.currentSettings().LogMaxMB)*1024*1024,
 		[]byte(fmt.Sprintf("\n[ci] 日志超过 %d MB 上限，后续输出已截断（可在系统配置调整 log_max_mb）\n", s.currentSettings().LogMaxMB)))
 
-	out := io.MultiWriter(limited, executor.NewHubWriter(s.hub, model.LogKey(job.PipelineID, job.BuildID)))
+	// 构建日志必须先过遮罩再写文件/广播：凭据、Token、密码一旦 echo 出来，
+	// 落盘后再擦除已经来不及（历史日志/WebSocket 订阅者都拿到了）。
+	masked := pkg.NewMaskingWriter(io.MultiWriter(limited, executor.NewHubWriter(s.hub, model.LogKey(job.PipelineID, job.BuildID))),
+		s.collectMaskSecrets(ctx, p, b, s.currentSettings()))
+	defer func() { _ = masked.Flush() }()
+	out := io.Writer(masked)
 	fmt.Fprintf(out, "[ci] build #%s of pipeline %q started (trigger=%s, executor=local)\n",
 		job.BuildID, p.Name, b.TriggerType)
 
@@ -633,6 +930,12 @@ func (s *BuildService) executeStages(ctx context.Context, p *model.Pipeline, b *
 		}
 	}
 
+	// 显式缓存：在步骤前恢复，在成功步骤后保存。缓存失败只告警，
+	// 不影响构建本身（缓存是优化，不是正确性依赖）。
+	if err = s.restoreCache(ctx, p, b, absWorkspace, out); err != nil {
+		fmt.Fprintf(out, "[cache] restore skipped: %v\n", err)
+	}
+
 	env := map[string]string{
 		"CI":               "true",
 		"CI_BUILD_ID":      job.BuildID,
@@ -644,6 +947,19 @@ func (s *BuildService) executeStages(ctx context.Context, p *model.Pipeline, b *
 	for name, value := range b.Params {
 		env[name] = value
 		env[model.ParamDef{Name: name}.EnvName()] = value
+	}
+	// 密码参数在 Params 里是 ***，真实值来自加密的 SecretParams。
+	// 解密失败必须中止构建：继续执行只会拿到 "***" 或空密码，产生误导性的失败。
+	for name, sealed := range b.SecretParams {
+		if s.secrets == nil {
+			return -1, fmt.Errorf("密码参数 %s 无法解密：服务未配置密钥", name)
+		}
+		plain, decryptErr := s.secrets.UnsealSecret(sealed)
+		if decryptErr != nil {
+			return -1, fmt.Errorf("密码参数 %s 解密失败: %w", name, decryptErr)
+		}
+		env[name] = plain
+		env[model.ParamDef{Name: name}.EnvName()] = plain
 	}
 	// 全局属性 → 环境变量；Maven / Git 全局配置同样以环境变量注入。
 	for _, kv := range settings.GlobalEnv {
@@ -678,17 +994,48 @@ func (s *BuildService) executeStages(ctx context.Context, p *model.Pipeline, b *
 	settings = s.materializeTools(ctx, p, settings, out)
 	injectLocalToolHomes(settings, env)
 
-	code, err := s.runner.RunSteps(ctx, executor.RunSpec{
+	spec := executor.RunSpec{
 		Steps:     p.Steps,
 		Workspace: absWorkspace,
 		Env:       env,
 		Shell:     settings.Shell,
-	}, out)
+	}
+	var code int
+	if runner, ok := s.runner.(StepResultRunner); ok {
+		b.StepResults, code, err = runner.RunStepsWithResults(ctx, spec, out)
+	} else {
+		code, err = s.runner.RunSteps(ctx, spec, out)
+	}
 	if err != nil {
 		return code, err
 	}
+	// 测试报告在产物归档前解析：即使测试命令成功返回，JUnit 里的 failure/error
+	// 也应把构建标记为失败（对齐 Jenkins Publish JUnit test result report）。
+	if p.TestReport.Enabled {
+		if s.tests == nil {
+			return 1, fmt.Errorf("junit collector is not initialized")
+		}
+		report, testErr := s.tests.Collect(ctx, absWorkspace, s.builds.BuildDir(job.PipelineID, job.BuildID), p.TestReport, out)
+		if testErr != nil {
+			fmt.Fprintf(out, "[junit] FAILED: %v\n", testErr)
+			if code == 0 {
+				code = 1
+			}
+		} else {
+			b.TestReport = report
+			if report != nil && (report.Failed > 0 || report.Errors > 0) {
+				fmt.Fprintf(out, "[junit] %d failed / %d error test(s)，构建标记为失败\n", report.Failed, report.Errors)
+				if code == 0 {
+					code = 1
+				}
+			}
+		}
+	}
 	if code != 0 {
 		return code, fmt.Errorf("build steps failed with exit code %d", code)
+	}
+	if err = s.saveCache(ctx, p, b, absWorkspace, out); err != nil {
+		fmt.Fprintf(out, "[cache] save skipped: %v\n", err)
 	}
 
 	// 先归档本次编译产物，再发布。这样即使 SSH 发布失败，
@@ -740,8 +1087,16 @@ func (s *BuildService) executeStages(ctx context.Context, p *model.Pipeline, b *
 			if err = s.publisher.Publish(ctx, sshCfg, absWorkspace, out); err != nil {
 				failures = append(failures, fmt.Sprintf("%s: %v", sshCfg.Name, err))
 				fmt.Fprintf(out, "[ssh] target %q FAILED: %v\n", sshCfg.Name, err)
+				b.Deployments = append(b.Deployments, model.DeploymentRecord{
+					Target: sshCfg.Name, ServerID: sshCfg.ServerID, Environment: b.Environment,
+					Status: "failed", DeployedAt: time.Now().UTC(), DeployedBy: b.TriggeredBy, Message: err.Error(),
+				})
 				continue
 			}
+			b.Deployments = append(b.Deployments, model.DeploymentRecord{
+				Target: sshCfg.Name, ServerID: sshCfg.ServerID, Environment: b.Environment,
+				Status: "success", DeployedAt: time.Now().UTC(), DeployedBy: b.TriggeredBy,
+			})
 			fmt.Fprintf(out, "[ssh] target %q done\n", sshCfg.Name)
 		}
 		if len(failures) > 0 {
@@ -1309,15 +1664,127 @@ func (s *BuildService) Republish(ctx context.Context, pipelineID, buildID, serve
 		return fmt.Errorf("open build log: %w", err)
 	}
 	defer func() { _ = logFile.Close() }()
-	out := io.MultiWriter(logFile, executor.NewHubWriter(s.hub, model.LogKey(pipelineID, buildID)))
+	masked := pkg.NewMaskingWriter(io.MultiWriter(logFile, executor.NewHubWriter(s.hub, model.LogKey(pipelineID, buildID))),
+		s.collectMaskSecrets(ctx, p, b, s.currentSettings()))
+	defer func() { _ = masked.Flush() }()
+	out := io.Writer(masked)
 
 	fmt.Fprintf(out, "\n[republish] start: build #%s -> server %q\n", buildID, cfg.ServerID)
+	envName := b.Environment
+	if envName == "" {
+		envName = p.Environment
+	}
 	if err = s.publisher.PublishArtifacts(ctx, cfg, s.builds.BuildDir(pipelineID, buildID), out); err != nil {
 		fmt.Fprintf(out, "\n[republish] FAILED: %v\n", err)
+		b.Deployments = append(b.Deployments, model.DeploymentRecord{
+			Target: cfg.Name, ServerID: cfg.ServerID, Environment: envName,
+			Status: "failed", DeployedAt: time.Now().UTC(), DeployedBy: pkg.UserFromContext(ctx), Message: err.Error(),
+		})
+		_ = s.builds.Update(context.WithoutCancel(ctx), b)
 		return err
 	}
+	b.Deployments = append(b.Deployments, model.DeploymentRecord{
+		Target: cfg.Name, ServerID: cfg.ServerID, Environment: envName,
+		Status: "success", DeployedAt: time.Now().UTC(), DeployedBy: pkg.UserFromContext(ctx),
+		ArtifactCount: len(manifest.Files), Message: "republish",
+	})
+	_ = s.builds.Update(context.WithoutCancel(ctx), b)
 	fmt.Fprintf(out, "\n[republish] finished\n")
 	return nil
+}
+
+// collectMaskSecrets 汇总本次构建可能被步骤 echo 出来的敏感值。
+// 只遮「平台自己知道」的密钥；步骤里临时生成/外部注入的密钥无法识别。
+func (s *BuildService) collectMaskSecrets(ctx context.Context, p *model.Pipeline, b *model.Build, settings model.Settings) []string {
+	seen := make(map[string]struct{})
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if len(value) < 4 {
+			return
+		}
+		seen[value] = struct{}{}
+	}
+
+	for _, item := range settings.GlobalEnv {
+		if isSecretEnvName(item.Key) {
+			add(item.Value)
+		}
+	}
+	if b != nil {
+		for name, value := range b.Params {
+			if isSecretEnvName(name) {
+				add(value)
+			}
+		}
+		// 密码参数的真实值不在 Params 里，需要解密后再加入遮罩列表。
+		if s.secrets != nil {
+			for name, sealed := range b.SecretParams {
+				if !isSecretEnvName(name) {
+					continue
+				}
+				if plain, err := s.secrets.UnsealSecret(sealed); err == nil {
+					add(plain)
+				}
+			}
+		}
+	}
+	if p.GitCredential != "" && s.credentials != nil {
+		if c, err := s.credentials.Resolve(ctx, p.GitCredential); err == nil {
+			add(c.Secret)
+		}
+	}
+	if p.CommitStatus.Enabled && p.CommitStatus.CredentialID != "" && s.credentials != nil {
+		if c, err := s.credentials.Resolve(ctx, p.CommitStatus.CredentialID); err == nil {
+			add(c.Secret)
+		}
+	}
+	add(settings.Email.Password)
+	add(settings.WebhookNotify.URL)
+	add(p.WebhookSecret)
+	if p.Notify != nil {
+		for _, target := range p.Notify.Targets {
+			add(target.URL)
+		}
+		if p.Notify.Escalation != nil {
+			for _, target := range p.Notify.Escalation.Targets {
+				add(target.URL)
+			}
+		}
+		for _, route := range p.Notify.Routes {
+			for _, target := range route.Targets {
+				add(target.URL)
+			}
+		}
+	}
+
+	for _, publish := range p.EffectiveSshPublishes() {
+		add(publish.Password)
+		if publish.ServerID == "" {
+			continue
+		}
+		for _, server := range settings.SshServers {
+			if server.ID == publish.ServerID {
+				add(server.Password)
+			}
+		}
+	}
+
+	out := make([]string, 0, len(seen))
+	for value := range seen {
+		out = append(out, value)
+	}
+	return out
+}
+
+// isSecretEnvName 判断环境变量/参数名是否属于密钥类。
+func isSecretEnvName(name string) bool {
+	name = strings.ToLower(name)
+	for _, part := range []string{"password", "passwd", "pwd", "token", "secret", "credential", "private_key", "access_key"} {
+		if strings.Contains(name, part) {
+			return true
+		}
+	}
+	return false
 }
 
 // pruneBuilds 应用构建保留策略：任务级配置优先，否则回落到全局 Build Discarders。

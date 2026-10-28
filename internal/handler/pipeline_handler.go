@@ -2,7 +2,9 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -113,9 +115,96 @@ func (h *PipelineHandler) Overview(w http.ResponseWriter, r *http.Request) {
 	pkg.OK(w, summaries)
 }
 
+// Dashboard GET /api/dashboard
+//
+// 返回首页仪表盘聚合数据；只统计当前用户可见的任务，避免泄露无权任务。
+func (h *PipelineHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
+	pipelines, err := h.pipelines.ListFor(r.Context(), pkg.UserFromContext(r.Context()))
+	if err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	data, err := h.builds.Dashboard(r.Context(), pipelines)
+	if err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	pkg.OK(w, data)
+}
+
+// Metrics GET /metrics
+//
+// Prometheus 抓取入口：只暴露聚合指标，不包含任务名/日志等业务数据。
+// 保持公开是因为 Prometheus 通常无法带登录会话；如需要可在外层网关限制来源。
+func (h *PipelineHandler) Metrics(w http.ResponseWriter, r *http.Request) {
+	pipelines, err := h.pipelines.List(r.Context())
+	if err != nil {
+		http.Error(w, "metrics unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	data, err := h.builds.Dashboard(r.Context(), pipelines)
+	if err != nil {
+		http.Error(w, "metrics unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprintln(w, "# HELP ci_platform_jobs_total Number of pipelines.")
+	fmt.Fprintln(w, "# TYPE ci_platform_jobs_total gauge")
+	fmt.Fprintln(w, "ci_platform_jobs_total", data.JobsTotal)
+	fmt.Fprintln(w, "# HELP ci_platform_jobs_disabled Number of disabled pipelines.")
+	fmt.Fprintln(w, "# TYPE ci_platform_jobs_disabled gauge")
+	fmt.Fprintln(w, "ci_platform_jobs_disabled", data.JobsDisabled)
+	fmt.Fprintln(w, "# HELP ci_platform_builds_today Number of builds created today.")
+	fmt.Fprintln(w, "# TYPE ci_platform_builds_today gauge")
+	fmt.Fprintln(w, "ci_platform_builds_today", data.BuildsToday)
+	fmt.Fprintln(w, "# HELP ci_platform_builds_today_by_status Builds created today by status.")
+	fmt.Fprintln(w, "# TYPE ci_platform_builds_today_by_status gauge")
+	fmt.Fprintln(w, `ci_platform_builds_today_by_status{status="success"}`, data.SuccessToday)
+	fmt.Fprintln(w, `ci_platform_builds_today_by_status{status="failed"}`, data.FailedToday)
+	fmt.Fprintln(w, `ci_platform_builds_today_by_status{status="aborted"}`, data.AbortedToday)
+	fmt.Fprintln(w, "# HELP ci_platform_builds_running Running builds.")
+	fmt.Fprintln(w, "# TYPE ci_platform_builds_running gauge")
+	fmt.Fprintln(w, "ci_platform_builds_running", data.RunningBuilds)
+	fmt.Fprintln(w, "# HELP ci_platform_builds_pending Pending builds.")
+	fmt.Fprintln(w, "# TYPE ci_platform_builds_pending gauge")
+	fmt.Fprintln(w, "ci_platform_builds_pending", data.PendingBuilds)
+	fmt.Fprintln(w, "# HELP ci_platform_build_success_rate_today Successful / finished builds today.")
+	fmt.Fprintln(w, "# TYPE ci_platform_build_success_rate_today gauge")
+	fmt.Fprintln(w, "ci_platform_build_success_rate_today", fmt.Sprintf("%.4f", data.SuccessRate))
+	fmt.Fprintln(w, "# HELP ci_platform_build_duration_avg_seconds Average finished build duration today.")
+	fmt.Fprintln(w, "# TYPE ci_platform_build_duration_avg_seconds gauge")
+	fmt.Fprintln(w, "ci_platform_build_duration_avg_seconds", fmt.Sprintf("%.3f", float64(data.AvgDurationMS)/1000))
+	fmt.Fprintln(w, "# HELP ci_platform_queue_length Queued builds.")
+	fmt.Fprintln(w, "# TYPE ci_platform_queue_length gauge")
+	fmt.Fprintln(w, "ci_platform_queue_length", data.QueueLength)
+	fmt.Fprintln(w, "# HELP ci_platform_queue_capacity Build queue capacity.")
+	fmt.Fprintln(w, "# TYPE ci_platform_queue_capacity gauge")
+	fmt.Fprintln(w, "ci_platform_queue_capacity", data.QueueCapacity)
+	fmt.Fprintln(w, "# HELP ci_platform_workers Configured build workers.")
+	fmt.Fprintln(w, "# TYPE ci_platform_workers gauge")
+	fmt.Fprintln(w, "ci_platform_workers", data.Workers)
+	fmt.Fprintln(w, "# HELP ci_platform_quiet_mode Whether the instance is in quiet mode.")
+	fmt.Fprintln(w, "# TYPE ci_platform_quiet_mode gauge")
+	fmt.Fprintln(w, "ci_platform_quiet_mode", boolToInt(data.Quiet))
+	fmt.Fprintln(w, "# HELP ci_platform_deployments_today SSH deployments today.")
+	fmt.Fprintln(w, "# TYPE ci_platform_deployments_today gauge")
+	fmt.Fprintln(w, "ci_platform_deployments_today", data.DeploymentsToday)
+	fmt.Fprintln(w, "# HELP ci_platform_deployment_failures_today Failed SSH deployments today.")
+	fmt.Fprintln(w, "# TYPE ci_platform_deployment_failures_today gauge")
+	fmt.Fprintln(w, "ci_platform_deployment_failures_today", data.DeploymentFailuresToday)
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
 // AllBuilds GET /api/builds
 //
 // 返回跨任务的构建历史，按开始时间倒序，供全局「构建历史」页使用。
+// 支持搜索/状态/任务过滤与分页；总数通过 X-Total-Count 返回，保持数组信封不变。
 func (h *PipelineHandler) AllBuilds(w http.ResponseWriter, r *http.Request) {
 	pipelines, err := h.pipelines.ListFor(r.Context(), pkg.UserFromContext(r.Context()))
 	if err != nil {
@@ -127,7 +216,85 @@ func (h *PipelineHandler) AllBuilds(w http.ResponseWriter, r *http.Request) {
 		pkg.Fail(w, err)
 		return
 	}
-	pkg.OK(w, list)
+
+	query := r.URL.Query()
+	search := strings.ToLower(strings.TrimSpace(query.Get("q")))
+	statuses := make(map[string]struct{})
+	for _, raw := range strings.Split(query.Get("status"), ",") {
+		if status := strings.TrimSpace(raw); status != "" {
+			statuses[status] = struct{}{}
+		}
+	}
+	pipeline := strings.TrimSpace(query.Get("pipeline"))
+	filtered := make([]model.BuildListItem, 0, len(list))
+	for _, item := range list {
+		if len(statuses) > 0 {
+			if _, ok := statuses[string(item.Status)]; !ok {
+				continue
+			}
+		}
+		if pipeline != "" && !strings.EqualFold(item.PipelineID, pipeline) && !strings.EqualFold(item.PipelineName, pipeline) {
+			continue
+		}
+		if search != "" {
+			haystack := strings.ToLower(strings.Join([]string{
+				item.ID, item.PipelineID, item.PipelineName, item.TriggeredBy, item.Branch, item.Commit,
+			}, "\n"))
+			if !strings.Contains(haystack, search) {
+				continue
+			}
+		}
+		filtered = append(filtered, item)
+	}
+
+	// 只在调用方确实传了分页参数时切片：老调用方 GET /api/builds 仍返回全部。
+	_, hasLimit := query["limit"]
+	_, hasPageSize := query["page_size"]
+	_, hasOffset := query["offset"]
+	_, hasPage := query["page"]
+	if hasLimit || hasPageSize || hasOffset || hasPage {
+		limit := 20
+		if raw := firstNonEmptyQuery(query.Get("limit"), query.Get("page_size")); raw != "" {
+			if n, parseErr := strconv.Atoi(raw); parseErr == nil && n > 0 {
+				limit = n
+			}
+		}
+		if limit > 200 {
+			limit = 200
+		}
+		offset := 0
+		if raw := query.Get("offset"); raw != "" {
+			if n, parseErr := strconv.Atoi(raw); parseErr == nil && n > 0 {
+				offset = n
+			}
+		}
+		if offset == 0 && query.Get("page") != "" {
+			if page, parseErr := strconv.Atoi(query.Get("page")); parseErr == nil && page > 1 {
+				offset = (page - 1) * limit
+			}
+		}
+		total := len(filtered)
+		if offset >= total {
+			filtered = []model.BuildListItem{}
+		} else {
+			end := offset + limit
+			if end > total {
+				end = total
+			}
+			filtered = filtered[offset:end]
+		}
+		w.Header().Set("X-Total-Count", strconv.Itoa(total))
+	}
+	pkg.OK(w, filtered)
+}
+
+func firstNonEmptyQuery(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 // Create POST /api/pipelines
@@ -172,7 +339,21 @@ func (h *PipelineHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 // Delete DELETE /api/pipelines/{id}
 func (h *PipelineHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	if err := h.pipelines.Delete(r.Context(), chi.URLParam(r, "pid")); err != nil {
+	pipelineID := chi.URLParam(r, "pid")
+	// 有未结束构建时拒绝删除：先删工作区会让 worker 写日志/归档失败，
+	// 构建状态可能永久停在 running。
+	builds, err := h.builds.ListByPipeline(r.Context(), pipelineID)
+	if err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	for _, b := range builds {
+		if b.Status == model.BuildRunning || b.Status == model.BuildPending || b.Status == model.BuildPendingApproval {
+			pkg.Fail(w, pkg.ErrConflict("任务还有未结束的构建 #%s（%s），请先停止或等待结束后再删除", b.ID, b.Status))
+			return
+		}
+	}
+	if err := h.pipelines.Delete(r.Context(), pipelineID); err != nil {
 		pkg.Fail(w, err)
 		return
 	}
@@ -189,12 +370,18 @@ func (h *PipelineHandler) TriggerBuild(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	h.trigger(w, r, chi.URLParam(r, "pid"), model.TriggerManual, pkg.UserFromContext(r.Context()), in.Params)
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if key == "" {
+		key = in.IdempotencyKey
+	}
+	h.trigger(w, r, chi.URLParam(r, "pid"), model.TriggerManual, pkg.UserFromContext(r.Context()), in.Params, key)
 }
 
 // triggerRequest 是触发构建的请求体：params 为参数化构建的用户填值。
+// idempotency_key 与请求头二选一，方便不能用自定义头的客户端。
 type triggerRequest struct {
-	Params map[string]string `json:"params"`
+	Params         map[string]string `json:"params"`
+	IdempotencyKey string            `json:"idempotency_key"`
 }
 
 // Rename POST /api/pipelines/{id}/rename
@@ -215,8 +402,11 @@ func (h *PipelineHandler) Rename(w http.ResponseWriter, r *http.Request) {
 }
 
 // trigger 是手动与 Webhook 共用的触发入口。
-func (h *PipelineHandler) trigger(w http.ResponseWriter, r *http.Request, pipelineID string, t model.TriggerType, triggeredBy string, params map[string]string) {
-	b, err := h.builds.Trigger(r.Context(), pipelineID, t, triggeredBy, service.TriggerOptions{Params: params})
+func (h *PipelineHandler) trigger(w http.ResponseWriter, r *http.Request, pipelineID string, t model.TriggerType, triggeredBy string, params map[string]string, idempotencyKey string) {
+	b, err := h.builds.Trigger(r.Context(), pipelineID, t, triggeredBy, service.TriggerOptions{
+		Params:         params,
+		IdempotencyKey: idempotencyKey,
+	})
 	if err != nil {
 		pkg.Fail(w, err)
 		return

@@ -5,7 +5,7 @@
 // 这里的类型只负责为配置表单提供预设；不支持的 Jenkins 原生类型
 // 明确置灰并标注原因，而不是伪装成可用。
 
-import { emptyPipeline, step, type PipelinePayload } from './pipeline'
+import { emptyPipeline, step, type PipelinePayload } from './pipeline.ts'
 
 export interface JobTypePreset {
   id: string

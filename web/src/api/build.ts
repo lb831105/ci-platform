@@ -19,8 +19,20 @@ export const buildApi = {
     return http.put<Build>(`/pipelines/${pipelineId}/builds/${buildId}`, payload)
   },
 
-  log(pipelineId: string, buildId: string): Promise<BuildLogPayload> {
-    return http.get<BuildLogPayload>(`/pipelines/${pipelineId}/builds/${buildId}/log`)
+  log(
+    pipelineId: string,
+    buildId: string,
+    options: { tail?: number; grep?: string } = {},
+  ): Promise<BuildLogPayload> {
+    const query = new URLSearchParams()
+    if (options.tail && options.tail > 0) query.set('tail', String(options.tail))
+    if (options.grep) query.set('grep', options.grep)
+    const suffix = query.size > 0 ? `?${query.toString()}` : ''
+    return http.get<BuildLogPayload>(`/pipelines/${pipelineId}/builds/${buildId}/log${suffix}`)
+  },
+
+  downloadLog(pipelineId: string, buildId: string): Promise<Blob> {
+    return http.download(`/pipelines/${pipelineId}/builds/${buildId}/log/download`)
   },
 
   artifacts(pipelineId: string, buildId: string): Promise<ArtifactManifest> {
@@ -35,6 +47,25 @@ export const buildApi = {
 
   downloadArtifactsZip(pipelineId: string, buildId: string): Promise<Blob> {
     return http.download(`/pipelines/${pipelineId}/builds/${buildId}/artifacts.zip`)
+  },
+
+  // 跨任务产物晋级：把源构建产物复制到目标任务（targetBuildId 为空/ latest 时取最近成功构建）。
+  promoteArtifacts(
+    targetPipelineId: string,
+    targetBuildId: string,
+    payload: {
+      source_pipeline_id: string
+      source_build_id: string
+      prefix?: string
+      files?: string[]
+      overwrite?: boolean
+    },
+  ): Promise<ArtifactManifest> {
+    const bid = targetBuildId.trim() || 'latest'
+    return http.post<ArtifactManifest>(
+      `/pipelines/${targetPipelineId}/builds/${bid}/artifacts/promote`,
+      payload,
+    )
   },
 
   // 把该次构建已归档的产物直接发布到 SSH 服务器（不重新编译）。

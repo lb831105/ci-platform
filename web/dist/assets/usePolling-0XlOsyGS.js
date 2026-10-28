@@ -1,1 +1,0 @@
-import{N as a,r}from"./index-DcDyETr5.js";function f(l,o=3e3){const t=r(!1);let e=null;const n=async()=>{try{await l()}finally{t.value&&(e=window.setTimeout(()=>{n()},o))}};function u(){t.value||(t.value=!0,n())}function i(){t.value=!1,e!==null&&(window.clearTimeout(e),e=null)}return a(i),{active:t,start:u,stop:i}}export{f as u};

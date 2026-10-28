@@ -421,6 +421,8 @@ func copyDataEntries(ctx context.Context, src, dst string) error {
 		"rbac.json",
 		"views.json",
 		"credentials",
+		"credentials.key",
+		"tokens.json",
 		"jobs",
 		".workspace-reuse-v1",
 		".artifact-config-v1",

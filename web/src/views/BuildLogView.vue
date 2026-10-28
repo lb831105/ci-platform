@@ -14,6 +14,7 @@ import { useSettingsStore } from '@/stores/settingsStore'
 import type { ArtifactFile, Build } from '@/types/build'
 import type { Pipeline } from '@/types/pipeline'
 import { formatBytes, formatDurationCN, formatRelativeTime, formatTime } from '@/utils/format'
+import { downloadBlob } from '@/utils/download'
 
 const props = defineProps<{ pipelineId: string; buildId: string }>()
 
@@ -26,6 +27,83 @@ const build = ref<Build | null>(null)
 const buildLoading = ref(false)
 const buildParams = computed(() => build.value?.params ?? {})
 const paramNames = computed(() => Object.keys(buildParams.value).sort())
+
+// 控制台日志过滤：tail 只保留最近 N 行，grep 按子串过滤。
+// 只对已有日志做视图过滤，不会改动 log.txt 本身。
+const logSearch = ref('')
+const logTail = ref(500)
+const appliedLogSearch = ref('')
+const appliedLogTail = ref(500)
+const applyingLog = ref(false)
+const downloadingLog = ref(false)
+const logMetaText = computed(() => {
+  const total = log.totalLines.value
+  if (!total) return ''
+  if (appliedLogSearch.value && log.matchedLines.value !== total) {
+    return `命中 ${log.matchedLines.value} / 共 ${total} 行`
+  }
+  if (log.truncated.value) {
+    return `显示最近 ${appliedLogTail.value} 行 / 共 ${total} 行`
+  }
+  return `共 ${total} 行`
+})
+
+async function applyLogFilter(): Promise<void> {
+  applyingLog.value = true
+  appliedLogSearch.value = logSearch.value.trim()
+  appliedLogTail.value = logTail.value
+  try {
+    log.stop()
+    await log.loadInitial({
+      tail: logTail.value > 0 ? logTail.value : undefined,
+      grep: logSearch.value.trim() || undefined,
+    })
+    if (!log.finished.value) {
+      await log.start()
+    }
+  } finally {
+    applyingLog.value = false
+  }
+}
+
+function resetLogFilter(): void {
+  logSearch.value = ''
+  logTail.value = 0
+  void applyLogFilter()
+}
+
+async function onDownloadLog(): Promise<void> {
+  downloadingLog.value = true
+  try {
+    const blob = await buildApi.downloadLog(props.pipelineId, props.buildId)
+    downloadBlob(`build-${props.buildId}-log.txt`, blob)
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    downloadingLog.value = false
+  }
+}
+
+// 用本次构建的参数快照重新触发（对齐 Jenkins Re-run）。没有参数的任务就是再跑一次。
+const rerunning = ref(false)
+async function onRerun(): Promise<void> {
+  if (!can('job.build')) {
+    return
+  }
+  rerunning.value = true
+  try {
+    const next = await pipelineApi.rerun(props.pipelineId, props.buildId)
+    ElMessage.success(`已触发构建 #${next.id}`)
+    void router.push({
+      name: 'build-log',
+      params: { pipelineId: props.pipelineId, buildId: next.id },
+    })
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    rerunning.value = false
+  }
+}
 
 // 手动取消运行中/等待中的构建（对齐 Jenkins Stop Build）。
 const cancelling = ref(false)
@@ -282,7 +360,13 @@ function formatSpent(ms: number | null): string {
   return ms <= 0 ? '0 毫秒' : formatDurationCN(ms)
 }
 
-const waitingMs = computed(() => msBetween(build.value?.created_at, build.value?.started_at))
+const waitingMs = computed(() => {
+  if (!build.value?.created_at) {
+    return null
+  }
+  const end = build.value.started_at ?? (log.finished.value ? null : new Date().toISOString())
+  return msBetween(build.value.created_at, end)
+})
 // 运行中的构建没有 finished_at，Jenkins 也会显示到当前时刻的累计时间。
 const runMs = computed(() => {
   if (build.value?.started_at && !build.value.finished_at && !log.finished.value) {
@@ -305,11 +389,86 @@ const waitingText = computed(() => formatSpent(waitingMs.value))
 const totalText = computed(() => formatSpent(totalMs.value))
 const revision = computed(() => build.value?.commit_full || build.value?.commit || '')
 const repository = computed(() => pipelineConfig.value?.git_url ?? '')
+// 只把 http(s) 仓库地址渲染成可点击链接：git_url 是用户可配置的，
+// 直接绑定 javascript:/data: 会产生存储型 XSS；带 userinfo 的地址同时脱敏，
+// 避免把仓库令牌（https://user:token@host/repo）显示在构建页。
+const repositoryView = computed(() => {
+  const raw = repository.value.trim()
+  if (!raw) {
+    return { display: '', href: '' }
+  }
+  try {
+    const url = new URL(raw)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return { display: raw, href: '' }
+    }
+    if (url.username || url.password) {
+      return {
+        display: `${url.protocol}//***@${url.host}${url.pathname}${url.search}${url.hash}`,
+        href: '',
+      }
+    }
+    return { display: raw, href: raw }
+  } catch {
+    return { display: raw, href: '' }
+  }
+})
+const repositoryHref = computed(() => repositoryView.value.href)
+const repositoryDisplay = computed(() => repositoryView.value.display)
 const gitRefs = computed(() =>
   build.value?.branch ? `refs/remotes/origin/${build.value.branch}` : '',
 )
 const changedFiles = computed(() => build.value?.changed_files ?? [])
-const stepRows = computed(() => pipelineConfig.value?.steps ?? [])
+interface StepRow {
+  name: string
+  status?: string
+  exitCode?: number
+  durationMs?: number
+  allowFailure?: boolean
+  timeoutSec?: number
+  retry?: number
+}
+
+const stepRows = computed<StepRow[]>(() => {
+  const results = build.value?.step_results ?? []
+  if (results.length > 0) {
+    return results.map((result) => ({
+      name: result.name,
+      status: result.status,
+      exitCode: result.exit_code,
+      durationMs: result.duration_ms,
+      allowFailure: result.allow_failure,
+    }))
+  }
+  return (pipelineConfig.value?.steps ?? []).map((step) => ({
+    name: step.name,
+    allowFailure: step.allow_failure,
+    timeoutSec: step.timeout_sec,
+    retry: step.retry,
+  }))
+})
+
+function stepStatusText(status?: string): string {
+  switch (status) {
+    case 'success':
+      return '成功'
+    case 'failed':
+      return '失败'
+    case 'skipped':
+      return '跳过'
+    case 'cancelled':
+      return '取消'
+    default:
+      return '未记录'
+  }
+}
+
+function stepDurationText(ms?: number): string {
+  if (ms === undefined || ms === null) {
+    return '-'
+  }
+  return ms <= 0 ? '0 毫秒' : formatDurationCN(ms)
+}
 
 const descriptionVisible = ref(false)
 const descriptionDraft = ref('')
@@ -363,6 +522,54 @@ async function onKeepForever(value: string | number | boolean): Promise<void> {
 const canRepublish = computed(
   () => log.status.value === 'success' && artifacts.value.length > 0,
 )
+
+// 跨任务产物晋级：构建任务产出包，部署任务消费包。
+const promoteVisible = ref(false)
+const promotePipelines = ref<Pipeline[]>([])
+const promoteTargetPipeline = ref('')
+const promoteTargetBuild = ref('')
+const promotePrefix = ref('')
+const promoteOverwrite = ref(false)
+const promoting = ref(false)
+
+async function openPromote(): Promise<void> {
+  promoteTargetBuild.value = ''
+  promotePrefix.value = ''
+  promoteOverwrite.value = false
+  promoteVisible.value = true
+  try {
+    promotePipelines.value = (await pipelineApi.list()).filter((p) => p.id !== props.pipelineId)
+    promoteTargetPipeline.value = promotePipelines.value[0]?.id ?? ''
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  }
+}
+
+async function submitPromote(): Promise<void> {
+  if (!promoteTargetPipeline.value) {
+    ElMessage.error('请选择目标任务')
+    return
+  }
+  promoting.value = true
+  try {
+    const manifest = await buildApi.promoteArtifacts(
+      promoteTargetPipeline.value,
+      promoteTargetBuild.value,
+      {
+        source_pipeline_id: props.pipelineId,
+        source_build_id: props.buildId,
+        prefix: promotePrefix.value.trim(),
+        overwrite: promoteOverwrite.value,
+      },
+    )
+    ElMessage.success(`已将 ${manifest.files.length} 个产物晋级到目标任务`)
+    promoteVisible.value = false
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    promoting.value = false
+  }
+}
 
 // publishTargets 返回任务里启用的发布目标（兼容旧版单目标配置）。
 const publishTargets = computed(() => {
@@ -462,6 +669,11 @@ async function submitRepublish(): Promise<void> {
           <el-button type="danger" plain :loading="rejecting" @click="onReject">拒绝</el-button>
         </template>
         <el-button
+          v-if="can('job.build')"
+          :loading="rerunning"
+          @click="onRerun"
+        >用上次参数重新构建</el-button>
+        <el-button
           v-if="!log.finished.value && can('job.build')"
           type="danger"
           plain
@@ -525,11 +737,17 @@ async function submitRepublish(): Promise<void> {
           <div>{{ runDurationText }} build duration;</div>
           <div>{{ totalText }} total from scheduled to completion.</div>
         </el-descriptions-item>
+        <el-descriptions-item v-if="build?.environment" label="Environment">
+          <span class="mono">{{ build.environment }}</span>
+        </el-descriptions-item>
         <el-descriptions-item v-if="revision" label="Revision">
           <span class="mono">{{ revision }}</span>
         </el-descriptions-item>
-        <el-descriptions-item v-if="repository" label="Repository">
-          <a :href="repository" target="_blank" rel="noreferrer" class="mono">{{ repository }}</a>
+        <el-descriptions-item v-if="repositoryDisplay" label="Repository">
+          <a v-if="repositoryHref" :href="repositoryHref" target="_blank" rel="noreferrer" class="mono">
+            {{ repositoryDisplay }}
+          </a>
+          <span v-else class="mono">{{ repositoryDisplay }}</span>
         </el-descriptions-item>
         <el-descriptions-item v-if="gitRefs" label="refs">
           <span class="mono">{{ gitRefs }}</span>
@@ -558,6 +776,64 @@ async function submitRepublish(): Promise<void> {
       <div v-else class="muted build-changes__empty">本次提交没有可读取的文件变更（merge/root 提交或读取失败）。</div>
     </el-card>
 
+    <el-card v-if="build?.test_report" shadow="never" class="build-tests">
+      <template #header>
+        <div class="build-tests__header">
+          <div>
+            <span class="build-section__title">测试报告</span>
+            <span class="muted">JUnit</span>
+          </div>
+          <div class="build-tests__summary">
+            <el-tag type="success" effect="plain">{{ build.test_report.passed }} passed</el-tag>
+            <el-tag v-if="build.test_report.failed" type="danger" effect="plain">
+              {{ build.test_report.failed }} failed
+            </el-tag>
+            <el-tag v-if="build.test_report.errors" type="danger" effect="plain">
+              {{ build.test_report.errors }} error
+            </el-tag>
+            <el-tag v-if="build.test_report.skipped" type="info" effect="plain">
+              {{ build.test_report.skipped }} skipped
+            </el-tag>
+          </div>
+        </div>
+      </template>
+      <el-descriptions :column="4" size="small" border>
+        <el-descriptions-item label="总用例">{{ build.test_report.total }}</el-descriptions-item>
+        <el-descriptions-item label="Suite">{{ build.test_report.suites }}</el-descriptions-item>
+        <el-descriptions-item label="耗时">
+          {{ formatDurationCN(build.test_report.duration_ms) }}
+        </el-descriptions-item>
+        <el-descriptions-item label="原始报告">
+          {{ (build.test_report.files ?? []).join(', ') || '-' }}
+        </el-descriptions-item>
+      </el-descriptions>
+      <el-table
+        v-if="build.test_report.failed_cases?.length"
+        :data="build.test_report.failed_cases"
+        size="small"
+        class="build-tests__cases"
+      >
+        <el-table-column label="用例" min-width="220">
+          <template #default="{ row }">
+            <span class="mono">{{ row.class_name ? `${row.class_name}.` : '' }}{{ row.name }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <el-tag :type="row.status === 'error' ? 'danger' : 'warning'" effect="plain" size="small">
+              {{ row.status }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="耗时" width="100">
+          <template #default="{ row }">{{ formatDurationCN(row.time_ms) }}</template>
+        </el-table-column>
+        <el-table-column label="信息" min-width="280" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.message || '-' }}</template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
     <el-card v-if="stepRows.length" shadow="never" class="build-steps">
       <template #header>
         <span class="build-section__title">构建步骤</span>
@@ -567,14 +843,27 @@ async function submitRepublish(): Promise<void> {
         <el-table-column label="步骤" min-width="180">
           <template #default="{ row, $index }">{{ row.name || `步骤 ${$index + 1}` }}</template>
         </el-table-column>
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <span v-if="row.status" class="step-status" :class="`step-status--${row.status}`">
+              {{ stepStatusText(row.status) }}
+            </span>
+            <span v-else class="muted">未记录</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="耗时" width="110">
+          <template #default="{ row }">{{ stepDurationText(row.durationMs) }}</template>
+        </el-table-column>
         <el-table-column label="失败处理" width="120">
-          <template #default="{ row }">{{ row.allow_failure ? '允许失败' : '阻断后续' }}</template>
+          <template #default="{ row }">{{ row.allowFailure ? '允许失败' : '阻断后续' }}</template>
         </el-table-column>
-        <el-table-column label="超时" width="110">
-          <template #default="{ row }">{{ row.timeout_sec > 0 ? `${row.timeout_sec}s` : '不限' }}</template>
+        <el-table-column label="超时" width="100">
+          <template #default="{ row }">
+            {{ (row.timeoutSec ?? 0) > 0 ? `${row.timeoutSec}s` : '-' }}
+          </template>
         </el-table-column>
-        <el-table-column label="重试" width="90">
-          <template #default="{ row }">{{ row.retry }}</template>
+        <el-table-column label="重试" width="80">
+          <template #default="{ row }">{{ row.retry ?? '-' }}</template>
         </el-table-column>
       </el-table>
       <div class="build-steps__tip">每步的实际耗时与输出见下方控制台日志。</div>
@@ -591,6 +880,26 @@ async function submitRepublish(): Promise<void> {
       </el-descriptions>
     </el-card>
 
+    <div class="log-toolbar">
+      <el-input
+        v-model="logSearch"
+        clearable
+        placeholder="搜索日志（grep）"
+        style="width: 240px"
+        @keyup.enter="applyLogFilter"
+      />
+      <el-select v-model="logTail" style="width: 120px">
+        <el-option label="全部行" :value="0" />
+        <el-option label="最近 500 行" :value="500" />
+        <el-option label="最近 1000 行" :value="1000" />
+        <el-option label="最近 5000 行" :value="5000" />
+      </el-select>
+      <el-button :loading="applyingLog" @click="applyLogFilter">应用</el-button>
+      <el-button @click="resetLogFilter">重置</el-button>
+      <el-button :loading="downloadingLog" @click="onDownloadLog">下载日志</el-button>
+      <span v-if="logMetaText" class="muted log-toolbar__meta">{{ logMetaText }}</span>
+    </div>
+
     <LogTerminal :lines="log.lines.value" />
 
     <el-card v-if="artifacts.length > 0" v-loading="artifactsLoading" shadow="never" class="artifact-card">
@@ -606,6 +915,9 @@ async function submitRepublish(): Promise<void> {
             <el-button size="small" @click="downloadAll">下载全部（ZIP）</el-button>
             <el-button v-if="canRepublish && can('job.replay')" size="small" type="primary" plain @click="openRepublish">
               重新发布
+            </el-button>
+            <el-button v-if="canRepublish && can('job.build')" size="small" @click="openPromote">
+              晋级产物
             </el-button>
           </div>
         </div>
@@ -629,6 +941,71 @@ async function submitRepublish(): Promise<void> {
         产物随「丢弃旧的构建」策略一起清理。
       </div>
     </el-card>
+
+    <el-card v-if="build?.deployments?.length" shadow="never" class="artifact-card">
+      <template #header>
+        <div class="artifact-card__header">
+          <div>
+            <span class="artifact-card__title">部署记录</span>
+            <span class="muted">{{ build.deployments.length }} 次 SSH 发布</span>
+          </div>
+        </div>
+      </template>
+      <el-table :data="build.deployments" size="small" class="artifact-card__table">
+        <el-table-column label="目标" min-width="140">
+          <template #default="{ row }">{{ row.target || row.server_id || '默认发布' }}</template>
+        </el-table-column>
+        <el-table-column label="环境" width="120">
+          <template #default="{ row }">{{ row.environment || '—' }}</template>
+        </el-table-column>
+        <el-table-column label="结果" width="100">
+          <template #default="{ row }">
+            <el-tag :type="row.status === 'success' ? 'success' : 'danger'" size="small" disable-transitions>
+              {{ row.status === 'success' ? '成功' : '失败' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="时间" width="180">
+          <template #default="{ row }">{{ formatTime(row.deployed_at) }}</template>
+        </el-table-column>
+        <el-table-column label="操作人" width="120">
+          <template #default="{ row }">{{ row.deployed_by || '—' }}</template>
+        </el-table-column>
+        <el-table-column prop="message" label="说明" min-width="180" show-overflow-tooltip />
+      </el-table>
+    </el-card>
+
+    <el-dialog v-model="promoteVisible" title="晋级产物到其它任务" width="540px">
+      <el-form label-width="120px">
+        <el-form-item label="目标任务" required>
+          <el-select v-model="promoteTargetPipeline" filterable placeholder="选择接收产物的任务" style="width: 100%">
+            <el-option v-for="p in promotePipelines" :key="p.id" :label="p.name" :value="p.id" />
+          </el-select>
+          <div class="form-tip">
+            产物会复制到目标构建的 artifacts/ 目录，并校验源清单里的 SHA-256。
+          </div>
+        </el-form-item>
+        <el-form-item label="目标构建">
+          <el-input v-model="promoteTargetBuild" placeholder="留空 = 最近一次成功构建" />
+        </el-form-item>
+        <el-form-item label="目标目录">
+          <el-input v-model="promotePrefix" placeholder="留空 = promoted/源任务-构建号" />
+        </el-form-item>
+        <el-form-item label="已存在时">
+          <el-checkbox v-model="promoteOverwrite">覆盖目标构建中的同路径产物</el-checkbox>
+        </el-form-item>
+      </el-form>
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="源任务与目标任务都需要相应权限；目标构建必须已经结束。"
+      />
+      <template #footer>
+        <el-button @click="promoteVisible = false">取消</el-button>
+        <el-button type="primary" :loading="promoting" @click="submitPromote">开始晋级</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="republishVisible" title="重新发布产物" width="480px">
       <el-form label-width="120px">
@@ -688,6 +1065,17 @@ async function submitRepublish(): Promise<void> {
 </template>
 
 <style scoped>
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 8px;
+  flex-wrap: wrap;
+}
+.log-toolbar__meta {
+  margin-left: auto;
+  font-size: 12.5px;
+}
 .param-card {
   margin-bottom: 12px;
 }
@@ -837,6 +1225,30 @@ async function submitRepublish(): Promise<void> {
 .build-changes__empty {
   margin-top: 10px;
   font-size: 12.5px;
+}
+.build-tests__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.build-tests__summary {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.build-tests__cases {
+  margin-top: 12px;
+}
+.step-status--success {
+  color: #2e7d32;
+}
+.step-status--failed, .step-status--cancelled {
+  color: #c62828;
+}
+.step-status--skipped {
+  color: #757575;
 }
 .build-steps__tip {
   margin-top: 8px;

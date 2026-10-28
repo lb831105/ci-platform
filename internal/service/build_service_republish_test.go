@@ -61,7 +61,7 @@ func TestRepublishPublishesArchivedArtifacts(t *testing.T) {
 	svc, publisher := newRepublishService(t)
 	// BuildService 依赖通过小写字段装配，这里直接用包内构造器注入 pipeline/build。
 	svc.pipelines = &memPipelineStore{items: map[string]*model.Pipeline{
-		"p1": {ID: "p1", Name: "demo", SshPublish: &model.SshPublishConfig{
+		"p1": {ID: "p1", Name: "demo", Environment: "production", SshPublish: &model.SshPublishConfig{
 			Enabled: true, ServerID: "s1", SourceFiles: []string{"*"},
 		}},
 	}}
@@ -85,6 +85,14 @@ func TestRepublishPublishesArchivedArtifacts(t *testing.T) {
 	}
 	if filepath.Base(publisher.buildDir) != "1" {
 		t.Fatalf("buildDir = %q", publisher.buildDir)
+	}
+	stored, err := builds.Get(context.Background(), "p1", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Deployments) != 1 || stored.Deployments[0].Status != "success" ||
+		stored.Deployments[0].Environment != "production" {
+		t.Fatalf("deployment record = %+v", stored.Deployments)
 	}
 }
 

@@ -278,6 +278,10 @@ const paramDefs = computed(() => job.value?.params ?? [])
 const hasParams = computed(() => paramDefs.value.length > 0)
 
 function onBuild(): void {
+  if (job.value?.disabled) {
+    ElMessage.warning('任务已禁用；请先在任务配置中重新启用')
+    return
+  }
   if (!hasParams.value) {
     void startBuild()
     return
@@ -285,7 +289,11 @@ function onBuild(): void {
   const values: Record<string, string> = {}
   for (const def of paramDefs.value) {
     // bool 用 'true'/'false' 字符串与后端契约保持一致（统一走环境变量）。
-    values[def.name] = def.type === 'bool' ? (def.default === 'true' ? 'true' : 'false') : def.default
+    values[def.name] = def.type === 'bool'
+      ? (def.default === 'true' ? 'true' : 'false')
+      : def.type === 'password'
+        ? ''
+        : def.default
   }
   paramValues.value = values
   paramDialog.value = true
@@ -375,6 +383,7 @@ function toPayload(pipeline: Pipeline, description = pipeline.description): Pipe
     build_retention_max_per_job: pipeline.build_retention_max_per_job ?? 0,
     build_retention_max_age_days: pipeline.build_retention_max_age_days ?? 0,
     cron_spec: pipeline.cron_spec ?? '',
+    disabled: pipeline.disabled ?? false,
     notify: pipeline.notify ?? null,
     delete_workspace_before_build: pipeline.delete_workspace_before_build ?? false,
     artifacts: {
@@ -382,6 +391,18 @@ function toPayload(pipeline: Pipeline, description = pipeline.description): Pipe
       files: [...(pipeline.artifacts?.files ?? [])],
       allow_empty: pipeline.artifacts?.allow_empty ?? false,
     },
+    test_report: {
+      enabled: pipeline.test_report?.enabled ?? false,
+      files: [...(pipeline.test_report?.files ?? [])],
+      allow_empty: pipeline.test_report?.allow_empty ?? false,
+    },
+    cache: pipeline.cache
+      ? {
+          enabled: pipeline.cache.enabled ?? false,
+          key: pipeline.cache.key ?? 'default',
+          paths: [...(pipeline.cache.paths ?? [])],
+        }
+      : null,
     ssh_publish: pipeline.ssh_publish
       ? { ...pipeline.ssh_publish, password: '', source_files: [...pipeline.ssh_publish.source_files] }
       : null,
@@ -485,8 +506,14 @@ function showChanges(): void {
         <el-button @click="goList">返回列表</el-button>
         <el-button v-if="can('job.configure')" @click="goEdit">配置</el-button>
         <el-button v-if="can('job.read')" :loading="exporting" @click="onExport">导出配置</el-button>
-        <el-button v-if="can('job.build')" type="primary" :loading="triggering" @click="onBuild">
-          {{ hasParams ? '参数化构建' : '立即构建' }}
+        <el-button
+          v-if="can('job.build')"
+          type="primary"
+          :loading="triggering"
+          :disabled="job?.disabled"
+          @click="onBuild"
+        >
+          {{ job?.disabled ? '任务已禁用' : hasParams ? '参数化构建' : '立即构建' }}
         </el-button>
       </div>
     </div>
@@ -636,6 +663,14 @@ function showChanges(): void {
             v-model="paramValues[def.name]"
             type="textarea"
             :rows="3"
+          />
+          <el-input
+            v-else-if="def.type === 'password'"
+            v-model="paramValues[def.name]"
+            type="password"
+            show-password
+            autocomplete="new-password"
+            placeholder="密码只在本次构建使用，构建记录中不会保存明文"
           />
           <el-input v-else v-model="paramValues[def.name]" />
         </el-form-item>

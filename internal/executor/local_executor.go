@@ -45,6 +45,13 @@ func shouldRunStep(when string, s stepState) bool {
 }
 
 // RunSteps 在工作区目录下串行执行步骤，返回最终退出码。
+// 这是兼容旧调用方的简化入口；需要步骤耗时/状态时使用 RunStepsWithResults。
+func (l *LocalExecutor) RunSteps(ctx context.Context, spec RunSpec, out io.Writer) (int, error) {
+	_, code, err := l.RunStepsWithResults(ctx, spec, out)
+	return code, err
+}
+
+// RunStepsWithResults 执行步骤并同时返回每一步的状态与耗时。
 //
 // 步骤级控制：
 //   - timeout_sec：单次尝试的执行时限，超时杀掉整个进程树并视为失败（退出码 124）
@@ -54,33 +61,34 @@ func shouldRunStep(when string, s stepState) bool {
 //
 // 未被允许的失败会中止后续 success 步骤，但 always/failure 步骤仍会执行，
 // 这样「清理/收集诊断信息」类步骤不会因为前面的失败而漏跑。
-func (l *LocalExecutor) RunSteps(ctx context.Context, spec RunSpec, out io.Writer) (int, error) {
+func (l *LocalExecutor) RunStepsWithResults(ctx context.Context, spec RunSpec, out io.Writer) ([]model.StepResult, int, error) {
 	if len(spec.Steps) == 0 {
 		fmt.Fprintln(out, "[local] no steps defined, nothing to run")
-		return 0, nil
+		return nil, 0, nil
 	}
 	if spec.Workspace == "" {
-		return -1, errors.New("local exec: workspace is required")
+		return nil, -1, errors.New("local exec: workspace is required")
 	}
 	if err := os.MkdirAll(spec.Workspace, 0o755); err != nil {
-		return -1, fmt.Errorf("local exec: prepare workspace: %w", err)
+		return nil, -1, fmt.Errorf("local exec: prepare workspace: %w", err)
 	}
 
 	// Windows 单行命令直接通过 CmdLine 交给 cmd.exe，保留引号与 && / || 语义；
 	// 多行命令或 PowerShell / 自定义 shell 才写入临时脚本。
 	tmpDir := filepath.Join(spec.Workspace, ".ci-tmp")
 	if err := os.RemoveAll(tmpDir); err != nil {
-		return -1, fmt.Errorf("local exec: clean temp dir: %w", err)
+		return nil, -1, fmt.Errorf("local exec: clean temp dir: %w", err)
 	}
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
-		return -1, fmt.Errorf("local exec: create temp dir: %w", err)
+		return nil, -1, fmt.Errorf("local exec: create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
+	results := make([]model.StepResult, 0, len(spec.Steps))
 	var state stepState
 	for i, step := range spec.Steps {
 		if err := ctx.Err(); err != nil {
-			return -1, err
+			return results, -1, err
 		}
 		name := step.Name
 		if name == "" {
@@ -89,14 +97,29 @@ func (l *LocalExecutor) RunSteps(ctx context.Context, spec RunSpec, out io.Write
 		if !shouldRunStep(step.When, state) {
 			fmt.Fprintf(out, "\n[local] === step %d/%d: %s ===\n[local] skipped (when=%s%s)\n",
 				i+1, len(spec.Steps), name, stepWhen(step.When), skipReason(state))
+			results = append(results, model.StepResult{Name: name, Status: "skipped"})
 			continue
 		}
 
+		startedAt := time.Now()
 		code, err := l.runStepWithRetry(ctx, spec, tmpDir, i, step, name, out)
+		duration := time.Since(startedAt)
 		if err != nil {
 			// 只有取消/启动失败会返回 error；取消必须立即整体中止。
-			return -1, err
+			results = append(results, model.StepResult{
+				Name: name, Status: "cancelled", ExitCode: -1,
+				DurationMS: duration.Milliseconds(), AllowFailure: step.AllowFailure,
+			})
+			return results, -1, err
 		}
+		status := "success"
+		if code != 0 {
+			status = "failed"
+		}
+		results = append(results, model.StepResult{
+			Name: name, Status: status, ExitCode: code,
+			DurationMS: duration.Milliseconds(), AllowFailure: step.AllowFailure,
+		})
 		if code == 0 {
 			continue
 		}
@@ -112,10 +135,10 @@ func (l *LocalExecutor) RunSteps(ctx context.Context, spec RunSpec, out io.Write
 		fmt.Fprintf(out, "[local] step %q failed with exit code %d (中止后续步骤，仅执行 when=always/failure)\n", name, code)
 	}
 	if state.fatalFailed {
-		return state.fatalCode, nil
+		return results, state.fatalCode, nil
 	}
 	fmt.Fprintln(out, "\n[local] all steps succeeded")
-	return 0, nil
+	return results, 0, nil
 }
 
 // stepWhen 把空值归一为默认的 success，便于日志展示。

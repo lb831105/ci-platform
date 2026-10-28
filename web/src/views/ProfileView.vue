@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { authApi } from '@/api/auth'
-import { profileApi } from '@/api/profile'
+import { profileApi, tokenApi } from '@/api/profile'
 import { describeError } from '@/api/request'
-import type { Profile } from '@/types/profile'
+import type { APIToken, Profile } from '@/types/profile'
 
 // 个人资料：用户自助维护联系方式（管理员不必代填），并验证邮箱是否可达。
 // 联系方式被任务通知使用：邮箱用于发信，企微 ID / 手机号用于群机器人 @ 提醒。
@@ -21,6 +21,16 @@ const code = ref('')
 const sentTo = ref('')
 
 const readonly = ref(false)
+
+// API Token：供脚本/外部系统调用，权限继承当前用户；secret 只在创建时展示一次。
+const tokens = ref<APIToken[]>([])
+const tokenLoading = ref(false)
+const tokenDialog = ref(false)
+const tokenName = ref('')
+const tokenDays = ref(30)
+const tokenCreating = ref(false)
+const issuedSecret = ref('')
+const secretVisible = ref(false)
 
 // 修改密码：内置管理员与平台内用户都走同一个接口（POST /api/auth/password），
 // 服务端按账号类型分别写入 settings.json / rbac.json，并让其他设备的会话失效。
@@ -74,7 +84,84 @@ async function load(): Promise<void> {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  void load()
+  void loadTokens()
+})
+
+async function loadTokens(): Promise<void> {
+  tokenLoading.value = true
+  try {
+    tokens.value = await tokenApi.list()
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    tokenLoading.value = false
+  }
+}
+
+function openTokenDialog(): void {
+  tokenName.value = ''
+  tokenDays.value = 30
+  tokenDialog.value = true
+}
+
+async function createToken(): Promise<void> {
+  const name = tokenName.value.trim()
+  if (!name) {
+    ElMessage.error('请填写令牌名称，便于日后识别用途')
+    return
+  }
+  tokenCreating.value = true
+  try {
+    const result = await tokenApi.create(name, tokenDays.value)
+    issuedSecret.value = result.secret
+    tokenDialog.value = false
+    secretVisible.value = true
+    await loadTokens()
+    ElMessage.success('令牌已创建，请立即复制 secret')
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    tokenCreating.value = false
+  }
+}
+
+async function revokeToken(token: APIToken): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `吊销后使用该令牌的脚本会立即失效，且无法恢复。确定吊销「${token.name}」吗？`,
+      '吊销 API 令牌',
+      { type: 'warning', confirmButtonText: '吊销', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await tokenApi.remove(token.id)
+    await loadTokens()
+    ElMessage.success('令牌已吊销')
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  }
+}
+
+async function copySecret(): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(issuedSecret.value)
+    ElMessage.success('已复制到剪贴板')
+  } catch {
+    ElMessage.warning('浏览器不允许自动复制，请手动选中复制')
+  }
+}
+
+function tokenTime(value?: string): string {
+  return value ? new Date(value).toLocaleString() : '—'
+}
+
+function tokenExpiryText(token: APIToken): string {
+  return token.expires_at ? tokenTime(token.expires_at) : '永不过期'
+}
 
 function isEmail(value: string): boolean {
   const parts = value.split('@')
@@ -263,6 +350,88 @@ async function confirmCode(): Promise<void> {
       </el-form>
     </el-card>
 
+    <el-card shadow="never" class="profile-card token-card">
+      <template #header>
+        <div class="profile-header">
+          <div>
+            <h2 class="profile-title">API 访问令牌</h2>
+            <p class="profile-sub">
+              供脚本、CLI 或外部系统调用平台 API。令牌继承你的权限，删除账号或降权后立即受影响。
+            </p>
+          </div>
+          <el-button type="primary" @click="openTokenDialog">创建令牌</el-button>
+        </div>
+      </template>
+
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 14px"
+        title="secret 只显示一次。请像密码一样保存；不要写进仓库、日志或任务参数。"
+      />
+
+      <el-table v-loading="tokenLoading" :data="tokens" size="small" empty-text="还没有创建过访问令牌">
+        <el-table-column prop="name" label="名称" min-width="140" show-overflow-tooltip />
+        <el-table-column label="前缀" width="150">
+          <template #default="{ row }">
+            <span class="mono">{{ row.prefix }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="创建时间" width="180">
+          <template #default="{ row }">{{ tokenTime(row.created_at) }}</template>
+        </el-table-column>
+        <el-table-column label="有效期" width="180">
+          <template #default="{ row }">{{ tokenExpiryText(row) }}</template>
+        </el-table-column>
+        <el-table-column label="最后使用" width="180">
+          <template #default="{ row }">{{ tokenTime(row.last_used_at) }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="90" fixed="right">
+          <template #default="{ row }">
+            <el-button link type="danger" @click="revokeToken(row)">吊销</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
+    <el-dialog v-model="tokenDialog" title="创建 API 令牌" width="460px">
+      <el-form label-width="88px" @submit.prevent>
+        <el-form-item label="名称" required>
+          <el-input v-model="tokenName" maxlength="64" placeholder="例如：发布脚本 / 监控巡检" />
+        </el-form-item>
+        <el-form-item label="有效期">
+          <el-select v-model="tokenDays" style="width: 100%">
+            <el-option :value="7" label="7 天" />
+            <el-option :value="30" label="30 天" />
+            <el-option :value="90" label="90 天" />
+            <el-option :value="180" label="180 天" />
+            <el-option :value="365" label="365 天" />
+            <el-option :value="0" label="永不过期（仍可手动吊销）" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="tokenDialog = false">取消</el-button>
+        <el-button type="primary" :loading="tokenCreating" @click="createToken">创建</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="secretVisible" title="令牌已创建" width="560px" :close-on-click-modal="false">
+      <el-alert
+        type="error"
+        :closable="false"
+        show-icon
+        title="这是唯一一次显示 secret。关闭后无法再次查看，只能重新创建。"
+        style="margin-bottom: 14px"
+      />
+      <el-input :model-value="issuedSecret" readonly class="mono token-secret" />
+      <template #footer>
+        <el-button type="primary" @click="copySecret">复制 secret</el-button>
+        <el-button @click="secretVisible = false">我已保存</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="verifyVisible" title="验证邮箱" width="420px">
       <p class="verify-tip">
         验证码已发送到 <span class="mono">{{ sentTo }}</span>，10 分钟内有效。
@@ -323,5 +492,13 @@ async function confirmCode(): Promise<void> {
   margin: 0 0 12px;
   font-size: 13px;
   color: var(--text-2, #606266);
+}
+
+.token-card {
+  margin-top: 16px;
+}
+
+.token-secret {
+  font-size: 13px;
 }
 </style>

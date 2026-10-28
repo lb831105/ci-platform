@@ -186,7 +186,7 @@ func TestTriggerSnapshotsResolvedParams(t *testing.T) {
 	svc.enqueuer = enq
 	svc.pipelines = &memPipelineStore{items: map[string]*model.Pipeline{
 		"p1": {
-			ID: "p1", Name: "demo", WorkspaceDir: "demo",
+			ID: "p1", Name: "demo", WorkspaceDir: "demo", Environment: "staging",
 			Steps: []model.Step{{Name: "b", Run: "echo ok"}},
 			Params: []model.ParamDef{
 				{Name: "VERSION", Default: "1.0.0"},
@@ -203,6 +203,9 @@ func TestTriggerSnapshotsResolvedParams(t *testing.T) {
 	if b.Params["VERSION"] != "2.0.0" || b.Params["DEBUG"] != "false" {
 		t.Fatalf("params = %v", b.Params)
 	}
+	if b.Environment != "staging" {
+		t.Fatalf("environment snapshot = %q", b.Environment)
+	}
 	if len(enq.jobs) != 1 {
 		t.Fatalf("enqueued = %d, want 1", len(enq.jobs))
 	}
@@ -214,5 +217,14 @@ func TestTriggerSnapshotsResolvedParams(t *testing.T) {
 	}
 	if len(enq.jobs) != 1 {
 		t.Fatalf("rejected trigger must not enqueue, got %d", len(enq.jobs))
+	}
+
+	// 禁用任务：Webhook/定时/手动都必须走 Trigger，所以在这里统一拦截。
+	svc.pipelines.(*memPipelineStore).items["p1"].Disabled = true
+	if _, err := svc.Trigger(context.Background(), "p1", model.TriggerManual, "alice", TriggerOptions{}); err == nil {
+		t.Fatal("disabled task must reject trigger")
+	}
+	if len(enq.jobs) != 1 {
+		t.Fatalf("disabled trigger must not enqueue, got %d", len(enq.jobs))
 	}
 }

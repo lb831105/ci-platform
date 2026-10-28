@@ -57,6 +57,24 @@ func (s *CredentialService) Resolve(ctx context.Context, id string) (*model.Cred
 	return s.store.Get(ctx, id)
 }
 
+// SealSecret 加密构建密码参数等敏感值（与凭据共用 credentials.key）。
+func (s *CredentialService) SealSecret(plain string) (string, error) {
+	sealer, ok := s.store.(interface{ SealSecret(string) (string, error) })
+	if !ok {
+		return "", pkg.NewError(pkg.CodeInternal, "凭据存储不支持加密")
+	}
+	return sealer.SealSecret(plain)
+}
+
+// UnsealSecret 解密构建密码参数。
+func (s *CredentialService) UnsealSecret(value string) (string, error) {
+	unsealer, ok := s.store.(interface{ UnsealSecret(string) (string, error) })
+	if !ok {
+		return "", pkg.NewError(pkg.CodeInternal, "凭据存储不支持解密")
+	}
+	return unsealer.UnsealSecret(value)
+}
+
 // Create 校验并落盘新凭据。
 func (s *CredentialService) Create(ctx context.Context, in *model.Credential) (*model.Credential, error) {
 	if err := normalizeCredential(in); err != nil {

@@ -57,6 +57,11 @@ func (s *BuildStore) BuildDir(pipelineID, buildID string) string {
 	return s.buildDir(pipelineID, buildID)
 }
 
+// CacheDir 返回任务级缓存目录（data/jobs/{pid}/cache/{key}）。
+func (s *BuildStore) CacheDir(pipelineID, cacheKey string) string {
+	return filepath.Join(s.jobsRoot, pipelineID, "cache", cacheKey)
+}
+
 // checkKeys 统一校验 pid/bid，拒绝 "." / ".." / 路径分隔符等，
 // 防止构建接口把读写路径逃逸出 data/jobs。
 func (s *BuildStore) checkKeys(pipelineID, buildID string) error {
@@ -199,6 +204,8 @@ func (s *BuildStore) Get(ctx context.Context, pipelineID, buildID string) (*mode
 }
 
 // Update 覆盖写入构建元数据。
+// 执行中的 worker 持有旧的内存对象；用户可能同时通过构建页改了备注/永久保留，
+// 因此这里以磁盘上的元数据为准，避免 worker 结束时把用户修改覆盖回旧值。
 func (s *BuildStore) Update(ctx context.Context, b *model.Build) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -206,11 +213,48 @@ func (s *BuildStore) Update(ctx context.Context, b *model.Build) error {
 	if err := s.checkKeys(b.PipelineID, b.ID); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	path := filepath.Join(s.buildDir(b.PipelineID, b.ID), buildFileName)
 	if !pkg.Exists(path) {
 		return pkg.ErrNotFound("build %s/%s not found", b.PipelineID, b.ID)
 	}
+	var existing model.Build
+	if err := pkg.ReadJSON(path, &existing); err == nil {
+		b.Description = existing.Description
+		b.KeepForever = existing.KeepForever
+	}
 	return pkg.WriteJSONAtomic(path, b)
+}
+
+// UpdateMetadata 只更新构建页可编辑的元数据，不经过 Update 的“保留磁盘旧值”逻辑。
+func (s *BuildStore) UpdateMetadata(ctx context.Context, pipelineID, buildID string, description *string, keepForever *bool) (*model.Build, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.checkKeys(pipelineID, buildID); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := filepath.Join(s.buildDir(pipelineID, buildID), buildFileName)
+	if !pkg.Exists(path) {
+		return nil, pkg.ErrNotFound("build %s/%s not found", pipelineID, buildID)
+	}
+	var b model.Build
+	if err := pkg.ReadJSON(path, &b); err != nil {
+		return nil, err
+	}
+	if description != nil {
+		b.Description = strings.TrimSpace(*description)
+	}
+	if keepForever != nil {
+		b.KeepForever = *keepForever
+	}
+	if err := pkg.WriteJSONAtomic(path, &b); err != nil {
+		return nil, err
+	}
+	return &b, nil
 }
 
 // ListByPipeline 遍历 builds 目录，按构建编号倒序返回。

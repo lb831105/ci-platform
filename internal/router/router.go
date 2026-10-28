@@ -32,6 +32,7 @@ type Deps struct {
 	View        *handler.ViewHandler
 	Notify      *handler.NotifyHandler
 	Profile     *handler.ProfileHandler
+	Token       *handler.TokenHandler
 	Import      *handler.ImportHandler
 	Portability *handler.PortabilityHandler
 	Tools       *handler.ToolsHandler
@@ -73,6 +74,8 @@ func New(d Deps) http.Handler {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok"))
 	})
+	// Prometheus 指标：只暴露聚合值，不含任务名/日志/密钥。
+	r.Get("/metrics", d.Pipeline.Metrics)
 	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		if d.Config == nil || !pkg.IsDir(d.Config.DataHome) {
 			http.Error(w, "data home is not ready", http.StatusServiceUnavailable)
@@ -123,6 +126,12 @@ func New(d Deps) http.Handler {
 				r.Post("/profile/email/verify", d.Profile.RequestEmailVerify)
 				r.Post("/profile/email/confirm", d.Profile.ConfirmEmail)
 			}
+			// API Token：脚本/外部系统用，权限继承当前用户；原始 secret 只在创建时返回一次。
+			if d.Token != nil {
+				r.Get("/profile/tokens", d.Token.List)
+				r.Post("/profile/tokens", d.Token.Create)
+				r.Delete("/profile/tokens/{id}", d.Token.Delete)
+			}
 
 			// 平台内用户与角色管理：仅 Administer。
 			r.Route("/security", func(r chi.Router) {
@@ -151,6 +160,8 @@ func New(d Deps) http.Handler {
 			// 不能用 overall.read 卡：只被授予任务角色的用户拿不到 overall.read，
 			// 结果就是"授权了却连任务列表都打不开"，任务级权限形同虚设。
 			r.Get("/overview", d.Pipeline.Overview)
+			// 首页仪表盘：统计范围按当前用户可见任务过滤。
+			r.Get("/dashboard", d.Pipeline.Dashboard)
 			r.Get("/builds", d.Pipeline.AllBuilds)
 
 			r.Route("/system", func(r chi.Router) {
@@ -222,6 +233,8 @@ func New(d Deps) http.Handler {
 					r.With(jobPerm(model.PermJobDelete)).Delete("/", d.Pipeline.Delete)
 					r.With(jobPerm(model.PermJobBuild)).Post("/build", d.Pipeline.TriggerBuild)
 					r.With(jobPerm(model.PermJobBuild)).Post("/builds/{bid}/cancel", d.Build.Cancel)
+					// Re-run：密码参数从服务端加密快照还原，前端不接触明文。
+					r.With(jobPerm(model.PermJobBuild)).Post("/builds/{bid}/rerun", d.Build.Rerun)
 					// 发布审批：审批人必须拥有 job.approve，不能复用触发/配置权限。
 					r.With(jobPerm(model.PermJobApprove)).Post("/builds/{bid}/approve", d.Build.Approve)
 					r.With(jobPerm(model.PermJobApprove)).Post("/builds/{bid}/reject", d.Build.Reject)
@@ -233,9 +246,12 @@ func New(d Deps) http.Handler {
 					// 构建页备注与「永久保留」：写操作，按任务配置权限控制。
 					r.With(jobPerm(model.PermJobConfigure)).Put("/builds/{bid}", d.Build.Update)
 					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}/log", d.Build.Log)
+					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}/log/download", d.Build.DownloadLog)
 					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}/artifacts", d.Build.Artifacts)
 					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}/artifacts/download", d.Build.DownloadArtifact)
 					r.With(jobPerm(model.PermJobRead)).Get("/builds/{bid}/artifacts.zip", d.Build.DownloadArtifactsZip)
+					// 跨任务产物晋级：目标任务需 job.build；源任务读权限在 handler 内校验。
+					r.With(jobPerm(model.PermJobBuild)).Post("/builds/{bid}/artifacts/promote", d.Build.PromoteArtifacts)
 					r.With(jobPerm(model.PermJobReplay)).Post("/builds/{bid}/republish", d.Build.Republish)
 					// 删除构建（含 data/jobs/{pid}/builds/{bid} 目录）。
 					r.With(jobPerm(model.PermJobDelete)).Delete("/builds/{bid}", d.Build.Delete)

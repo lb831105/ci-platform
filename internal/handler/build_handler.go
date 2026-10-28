@@ -6,9 +6,11 @@ import (
 	"mime"
 	"net/http"
 	"path/filepath"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
+	"ci-platform/internal/model"
 	"ci-platform/internal/pkg"
 	"ci-platform/internal/service"
 )
@@ -17,11 +19,18 @@ import (
 type BuildHandler struct {
 	builds    *service.BuildService
 	artifacts *service.ArtifactService
+	rbac      *service.RBACService
 }
 
 // NewBuildHandler 构造构建接口处理器。
 func NewBuildHandler(builds *service.BuildService, artifacts *service.ArtifactService) *BuildHandler {
 	return &BuildHandler{builds: builds, artifacts: artifacts}
+}
+
+// SetRBAC 注入权限服务，用于跨任务产物晋级时校验源任务读权限
+// （目标任务的 job.build 已由路由中间件校验，源任务仍需单独确认）。
+func (h *BuildHandler) SetRBAC(rbac *service.RBACService) {
+	h.rbac = rbac
 }
 
 // List GET /api/pipelines/{pid}/builds 遍历构建目录返回历史（编号倒序）。
@@ -31,7 +40,19 @@ func (h *BuildHandler) List(w http.ResponseWriter, r *http.Request) {
 		pkg.Fail(w, err)
 		return
 	}
+	for _, item := range items {
+		sanitizeBuild(item)
+	}
 	pkg.OK(w, items)
+}
+
+// sanitizeBuild 清除 API 响应中的密码参数密文。
+// Params 中对应值已是 ***；SecretParams 只供执行器解密，不能出服务端。
+func sanitizeBuild(b *model.Build) *model.Build {
+	if b != nil {
+		b.SecretParams = nil
+	}
+	return b
 }
 
 // Get GET /api/pipelines/{pid}/builds/{bid}
@@ -41,7 +62,19 @@ func (h *BuildHandler) Get(w http.ResponseWriter, r *http.Request) {
 		pkg.Fail(w, err)
 		return
 	}
-	pkg.OK(w, b)
+	pkg.OK(w, sanitizeBuild(b))
+}
+
+// Rerun POST /api/pipelines/{pid}/builds/{bid}/rerun
+// 用历史构建的参数重新触发；密码参数由服务端从加密快照还原，不经过前端。
+func (h *BuildHandler) Rerun(w http.ResponseWriter, r *http.Request) {
+	b, err := h.builds.Rerun(r.Context(),
+		chi.URLParam(r, "pid"), chi.URLParam(r, "bid"), pkg.UserFromContext(r.Context()))
+	if err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	pkg.OK(w, sanitizeBuild(b))
 }
 
 // updateBuildRequest 是 PUT /api/pipelines/{pid}/builds/{bid} 的请求体。
@@ -65,17 +98,44 @@ func (h *BuildHandler) Update(w http.ResponseWriter, r *http.Request) {
 		pkg.Fail(w, err)
 		return
 	}
-	pkg.OK(w, b)
+	pkg.OK(w, sanitizeBuild(b))
 }
 
-// Log GET /api/pipelines/{pid}/builds/{bid}/log 返回 log.txt 全文。
+// Log GET /api/pipelines/{pid}/builds/{bid}/log?tail=&grep=
+// 默认返回 log.txt 全文；带 tail 时只返回最近 N 行，带 grep 时按子串过滤。
 func (h *BuildHandler) Log(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	tail := model.ParsePositiveInt(query.Get("tail"))
+	if tail > 5000 {
+		tail = 5000
+	}
+	grep := strings.TrimSpace(query.Get("grep"))
+	if runes := []rune(grep); len(runes) > 200 {
+		grep = string(runes[:200])
+	}
+	text, total, matched, truncated, err := h.builds.QueryLog(r.Context(),
+		chi.URLParam(r, "pid"), chi.URLParam(r, "bid"), tail, grep)
+	if err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	pkg.OK(w, map[string]any{
+		"log": text, "total_lines": total, "matched_lines": matched, "truncated": truncated,
+	})
+}
+
+// DownloadLog GET /api/pipelines/{pid}/builds/{bid}/log/download
+// 以纯文本附件下载控制台日志，便于离线排查与贴给同事。
+func (h *BuildHandler) DownloadLog(w http.ResponseWriter, r *http.Request) {
 	text, err := h.builds.ReadLog(r.Context(), chi.URLParam(r, "pid"), chi.URLParam(r, "bid"))
 	if err != nil {
 		pkg.Fail(w, err)
 		return
 	}
-	pkg.OK(w, map[string]string{"log": text})
+	buildID := chi.URLParam(r, "bid")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", attachmentName(fmt.Sprintf("build-%s-log.txt", buildID)))
+	_, _ = fmt.Fprint(w, text)
 }
 
 // Delete DELETE /api/pipelines/{pid}/builds/{bid}
@@ -144,6 +204,57 @@ func (h *BuildHandler) DownloadArtifactsZip(w http.ResponseWriter, r *http.Reque
 		// 响应体可能已开始写入，无法再改状态码；记录日志便于排查。
 		logger.Infof("download artifacts zip %s/%s: %v", pipelineID, buildID, err)
 	}
+}
+
+// promoteArtifactsRequest 是跨任务产物晋级请求体。
+type promoteArtifactsRequest struct {
+	SourcePipelineID string   `json:"source_pipeline_id"`
+	SourceBuildID    string   `json:"source_build_id"`
+	Prefix           string   `json:"prefix"`
+	Files            []string `json:"files"`
+	Overwrite        bool     `json:"overwrite"`
+}
+
+// PromoteArtifacts POST /api/pipelines/{pid}/builds/{bid}/artifacts/promote
+// 把源构建的产物复制到目标任务（bid=latest 时取最近一次成功构建）。
+func (h *BuildHandler) PromoteArtifacts(w http.ResponseWriter, r *http.Request) {
+	var in promoteArtifactsRequest
+	if err := decodeJSON(w, r, &in); err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	in.SourcePipelineID = strings.TrimSpace(in.SourcePipelineID)
+	in.SourceBuildID = strings.TrimSpace(in.SourceBuildID)
+	if in.SourcePipelineID == "" || in.SourceBuildID == "" {
+		pkg.Fail(w, pkg.ErrBadRequest("必须指定源任务和源构建"))
+		return
+	}
+	// 源任务读权限不能因为“目标可构建”而被绕过。
+	if h.rbac != nil {
+		name, err := h.builds.PipelineName(r.Context(), in.SourcePipelineID)
+		if err != nil {
+			pkg.Fail(w, err)
+			return
+		}
+		user := pkg.UserFromContext(r.Context())
+		if !h.rbac.HasJobPermission(user, model.PermJobRead, name) {
+			pkg.Fail(w, pkg.ErrForbidden("没有源任务 %q 的读取权限", name))
+			return
+		}
+	}
+	targetID := chi.URLParam(r, "bid")
+	if targetID == "latest" {
+		targetID = ""
+	}
+	manifest, err := h.artifacts.Promote(r.Context(),
+		in.SourcePipelineID, in.SourceBuildID,
+		chi.URLParam(r, "pid"), targetID,
+		in.Prefix, in.Files, in.Overwrite)
+	if err != nil {
+		pkg.Fail(w, err)
+		return
+	}
+	pkg.OK(w, manifest)
 }
 
 // republishRequest 是重新发布请求体；server_id 留空时使用任务配置的服务器。

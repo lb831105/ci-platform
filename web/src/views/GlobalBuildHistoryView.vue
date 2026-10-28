@@ -14,17 +14,49 @@ const auth = useAuthStore()
 const loading = ref(false)
 const error = ref('')
 const items = ref<BuildListItem[]>([])
+const total = ref(0)
+const page = ref(1)
+const pageSize = ref(20)
+const search = ref('')
+const statusFilter = ref('')
 
 async function load(): Promise<void> {
   loading.value = true
   try {
-    items.value = await pipelineApi.allBuilds()
+    const result = await pipelineApi.allBuildsPage({
+      page: page.value,
+      pageSize: pageSize.value,
+      q: search.value.trim(),
+      status: statusFilter.value,
+    })
+    items.value = result.items
+    total.value = result.total
     error.value = ''
   } catch (e) {
     error.value = describeError(e)
   } finally {
     loading.value = false
   }
+}
+
+function applyFilters(): void {
+  page.value = 1
+  void load()
+}
+
+function resetFilters(): void {
+  search.value = ''
+  statusFilter.value = ''
+  applyFilters()
+}
+
+function onPageChange(): void {
+  void load()
+}
+
+function onPageSizeChange(): void {
+  page.value = 1
+  void load()
 }
 
 onMounted(load)
@@ -50,25 +82,7 @@ function buildKey(build: BuildListItem): string {
   return `${build.pipeline_id}\u0000${build.id}`
 }
 
-function startedAtKey(build: BuildListItem): number {
-  if (!build.started_at) {
-    return 0
-  }
-  const value = new Date(build.started_at).getTime()
-  return Number.isNaN(value) ? 0 : value
-}
-
-function previousFinished(builds: BuildListItem[], index: number): BuildListItem | null {
-  for (let i = index + 1; i < builds.length; i++) {
-    const status = builds[i].status
-    if (status === 'success' || status === 'failed' || status === 'aborted') {
-      return builds[i]
-    }
-  }
-  return null
-}
-
-function statusOf(build: BuildListItem, builds: BuildListItem[], index: number): JenkinsStatus {
+function statusOf(build: BuildListItem): JenkinsStatus {
   switch (build.status) {
     case 'running':
       return { label: '构建中', tone: 'active' }
@@ -78,27 +92,24 @@ function statusOf(build: BuildListItem, builds: BuildListItem[], index: number):
       return { label: '待审批', tone: 'active' }
     case 'aborted':
       return { label: '中断', tone: 'aborted' }
-    case 'success': {
-      const prev = previousFinished(builds, index)
-      if (prev?.status === 'failed') {
+    case 'success':
+      if (build.previous_status === 'failed') {
         return { label: '返回到正常', tone: 'normal' }
       }
       return { label: '稳定', tone: 'stable' }
-    }
     case 'failed': {
-      // 当前失败 streak 的起点（越靠后越旧）。
-      let oldestIndex = index
-      while (oldestIndex + 1 < builds.length && builds[oldestIndex + 1].status === 'failed') {
-        oldestIndex++
-      }
-      const oldest = builds[oldestIndex]
-      const streakCount = oldestIndex - index + 1
-      const age = Date.now() - startedAtKey(oldest)
-      if (streakCount >= LONG_BROKEN_COUNT || age >= LONG_BROKEN_MS) {
+      const streak = build.failure_streak ?? 1
+      const sinceValue = build.failing_since_at ?? build.started_at
+      const since = sinceValue ? new Date(sinceValue).getTime() : 0
+      const age = since > 0 ? Date.now() - since : 0
+      if (streak >= LONG_BROKEN_COUNT || age >= LONG_BROKEN_MS) {
         return { label: '断开很长时间', tone: 'long' }
       }
-      if (streakCount > 1) {
-        return { label: `自从构建 #${oldest.id} 后断开`, tone: 'failure' }
+      if (streak > 1) {
+        return {
+          label: `自从构建 #${build.failing_since_build ?? '?'} 后断开`,
+          tone: 'failure',
+        }
       }
       return { label: '自从这次构建后断开', tone: 'failure' }
     }
@@ -107,34 +118,12 @@ function statusOf(build: BuildListItem, builds: BuildListItem[], index: number):
   }
 }
 
-const statusByBuild = computed<Map<string, JenkinsStatus>>(() => {
-  const byPipeline = new Map<string, BuildListItem[]>()
-  for (const item of items.value) {
-    const list = byPipeline.get(item.pipeline_id)
-    if (list) {
-      list.push(item)
-    } else {
-      byPipeline.set(item.pipeline_id, [item])
-    }
-  }
-
-  const result = new Map<string, JenkinsStatus>()
-  for (const builds of byPipeline.values()) {
-    // API 已按全局开始时间倒序，但同一任务内仍需显式排序，才发现「上一次构建」。
-    builds.sort((a, b) => startedAtKey(b) - startedAtKey(a))
-    builds.forEach((build, index) => {
-      result.set(buildKey(build), statusOf(build, builds, index))
-    })
-  }
-  return result
-})
-
 type BuildRow = BuildListItem & { jenkins: JenkinsStatus; canDelete: boolean }
 
 const rows = computed<BuildRow[]>(() =>
   items.value.map((item) => ({
     ...item,
-    jenkins: statusByBuild.value.get(buildKey(item)) ?? { label: item.status, tone: 'unknown' },
+    jenkins: statusOf(item),
     canDelete: canDelete(item),
   })),
 )
@@ -169,6 +158,9 @@ async function onDelete(row: BuildRow): Promise<void> {
   try {
     await buildApi.remove(row.pipeline_id, row.id)
     ElMessage.success(`构建 #${row.id} 已删除`)
+    if (items.value.length === 1 && page.value > 1) {
+      page.value -= 1
+    }
     await load()
   } catch (e) {
     ElMessage.error(describeError(e))
@@ -190,6 +182,32 @@ async function onDelete(row: BuildRow): Promise<void> {
     </div>
 
     <el-alert v-if="error" type="error" :closable="false" show-icon :title="error" style="margin-bottom: 16px" />
+
+    <el-form class="builds-filter" inline @submit.prevent="applyFilters">
+      <el-form-item label="搜索">
+        <el-input
+          v-model="search"
+          clearable
+          placeholder="任务名 / 构建号 / 分支 / 提交人"
+          style="width: 260px"
+          @keyup.enter="applyFilters"
+        />
+      </el-form-item>
+      <el-form-item label="状态">
+        <el-select v-model="statusFilter" clearable placeholder="全部状态" style="width: 140px">
+          <el-option label="成功" value="success" />
+          <el-option label="失败" value="failed" />
+          <el-option label="中断" value="aborted" />
+          <el-option label="构建中" value="running" />
+          <el-option label="等待中" value="pending" />
+          <el-option label="待审批" value="pending_approval" />
+        </el-select>
+      </el-form-item>
+      <el-form-item>
+        <el-button type="primary" native-type="submit">筛选</el-button>
+        <el-button @click="resetFilters">重置</el-button>
+      </el-form-item>
+    </el-form>
 
     <el-card shadow="never">
       <el-table
@@ -257,11 +275,31 @@ async function onDelete(row: BuildRow): Promise<void> {
           <el-empty description="还没有构建记录" />
         </template>
       </el-table>
+      <div class="builds-pagination">
+        <el-pagination
+          v-model:current-page="page"
+          v-model:page-size="pageSize"
+          background
+          layout="total, sizes, prev, pager, next"
+          :page-sizes="[20, 50, 100]"
+          :total="total"
+          @current-change="onPageChange"
+          @size-change="onPageSizeChange"
+        />
+      </div>
     </el-card>
   </div>
 </template>
 
 <style scoped>
+.builds-filter {
+  margin-bottom: 12px;
+}
+.builds-pagination {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
 .build-cell {
   display: flex;
   flex-direction: column;

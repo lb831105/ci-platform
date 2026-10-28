@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"ci-platform/internal/webhook"
 )
 
 // githubSignature 计算测试用的 GitHub HMAC 签名。
@@ -83,4 +85,16 @@ func bodyOf(r *http.Request) []byte {
 	}
 	data, _ := io.ReadAll(r.Body)
 	return data
+}
+
+func TestWebhookDeliveryKeyIsPerPipeline(t *testing.T) {
+	ev := webhook.Event{Delivery: "same-uuid", Branch: "main", Commit: "abc"}
+	first := webhookDeliveryKey("p1", ev)
+	second := webhookDeliveryKey("p2", ev)
+	if first == second {
+		t.Fatalf("delivery key must include pipeline: %q", first)
+	}
+	if first != webhookDeliveryKey("p1", ev) {
+		t.Fatal("same pipeline/delivery must produce stable key")
+	}
 }

@@ -23,4 +23,9 @@ export interface PipelineSummary extends Pipeline {
 
 export interface BuildListItem extends Build {
   pipeline_name: string
+  // 服务端按任务内序列计算的上下文：分页后仍能显示 Jenkins 的断开语义。
+  previous_status?: BuildStatus
+  failure_streak?: number
+  failing_since_build?: string
+  failing_since_at?: string | null
 }

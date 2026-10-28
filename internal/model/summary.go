@@ -27,6 +27,12 @@ type PipelineSummary struct {
 type BuildListItem struct {
 	Build
 	PipelineName string `json:"pipeline_name"`
+	// 以下字段由服务端按任务内构建序列计算，供全局构建页在分页后仍能
+	// 正确显示 Jenkins 的「返回到正常 / 自从 #N 后断开 / 断开很长时间」。
+	PreviousStatus    BuildStatus `json:"previous_status,omitempty"`
+	FailureStreak     int         `json:"failure_streak,omitempty"`
+	FailingSinceBuild string      `json:"failing_since_build,omitempty"`
+	FailingSinceAt    *time.Time  `json:"failing_since_at,omitempty"`
 }
 
 // Summarize 根据某个 pipeline 的构建列表（需按编号倒序）计算列表视图。

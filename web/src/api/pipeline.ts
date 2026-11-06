@@ -1,7 +1,7 @@
 import { http } from './request'
 import type { Build } from '@/types/build'
 import type { NotifyContact, NotifyTestResult, Pipeline, PipelinePayload } from '@/types/pipeline'
-import type { BuildListItem, PipelineSummary } from '@/types/summary'
+import type { BuildListItem, DashboardData, PipelineSummary } from '@/types/summary'
 
 export const pipelineApi = {
   list(): Promise<Pipeline[]> {
@@ -11,6 +11,11 @@ export const pipelineApi = {
   // 带构建聚合的任务列表（Jenkins 风格作业列表）。
   overview(): Promise<PipelineSummary[]> {
     return http.get<PipelineSummary[]>('/overview')
+  },
+
+  // 首页仪表盘（只统计当前用户可见任务）。
+  dashboard(): Promise<DashboardData> {
+    return http.get<DashboardData>('/dashboard')
   },
 
   // 跨任务的构建历史。

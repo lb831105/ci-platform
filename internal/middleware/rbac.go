@@ -42,6 +42,11 @@ func RequireAnyOf(rbac AnyPermChecker, globalPerms, jobPerms []string) func(http
 				return
 			}
 			user := pkg.UserFromContext(r.Context())
+			if !tokenAllowsAny(r.Context(), globalPerms, jobPerms) {
+				logger.Debugf("[rbac] deny token scope user=%q path=%s", user, r.URL.Path)
+				pkg.Fail(w, pkg.NewError(pkg.CodeForbidden, "API Token 没有该操作所需的权限"))
+				return
+			}
 			if !rbac.HasAnyOf(user, globalPerms, jobPerms) {
 				logger.Debugf("[rbac] deny user=%q perms=%v job_perms=%v path=%s",
 					user, globalPerms, jobPerms, r.URL.Path)
@@ -59,6 +64,12 @@ func RequirePerm(rbac PermChecker, perm string) func(http.Handler) http.Handler 
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if rbac == nil {
 				next.ServeHTTP(w, r)
+				return
+			}
+			if !pkg.TokenAllows(r.Context(), perm) {
+				logger.Debugf("[rbac] deny token scope user=%q perm=%s path=%s",
+					pkg.UserFromContext(r.Context()), perm, r.URL.Path)
+				pkg.Fail(w, pkg.NewError(pkg.CodeForbidden, "API Token 没有该操作所需的权限: %s", perm))
 				return
 			}
 			if !rbac.HasPermission(pkg.UserFromContext(r.Context()), perm) {
@@ -86,6 +97,12 @@ func RequireJobPerm(rbac JobPermChecker, lookup JobNameLookup, action string) fu
 				pkg.Fail(w, err)
 				return
 			}
+			if !pkg.TokenAllows(r.Context(), action) {
+				logger.Debugf("[rbac] deny token scope user=%q job=%q action=%s path=%s",
+					pkg.UserFromContext(r.Context()), name, action, r.URL.Path)
+				pkg.Fail(w, pkg.NewError(pkg.CodeForbidden, "API Token 没有任务「%s」所需权限: %s", name, action))
+				return
+			}
 			if !rbac.HasJobPermission(pkg.UserFromContext(r.Context()), action, name) {
 				pkg.Fail(w, pkg.NewError(pkg.CodeForbidden, "没有任务「%s」所需权限: %s", name, action))
 				return
@@ -93,4 +110,28 @@ func RequireJobPerm(rbac JobPermChecker, lookup JobNameLookup, action string) fu
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// tokenAllowsAny 检查 API Token scopes 是否覆盖任一 required 权限。
+func tokenAllowsAny(ctx context.Context, globalPerms, jobPerms []string) bool {
+	scopes, restricted := pkg.TokenScopesFromContext(ctx)
+	if !restricted {
+		return true
+	}
+	for _, scope := range scopes {
+		if scope == "*" {
+			return true
+		}
+		for _, perm := range globalPerms {
+			if scope == perm {
+				return true
+			}
+		}
+		for _, perm := range jobPerms {
+			if scope == perm {
+				return true
+			}
+		}
+	}
+	return false
 }

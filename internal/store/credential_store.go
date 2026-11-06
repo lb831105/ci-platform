@@ -193,6 +193,12 @@ func (s *CredentialStore) migrateLegacy(id string) {
 	_ = s.writeLocked(&c)
 }
 
+// KeyReady 检查 credentials.key 是否可读且长度正确，供 readiness 使用。
+func (s *CredentialStore) KeyReady() error {
+	_, err := s.encryptionKey()
+	return err
+}
+
 // SealSecret 供构建参数等其它敏感数据复用同一个 AES-GCM 密钥。
 func (s *CredentialStore) SealSecret(plain string) (string, error) {
 	return s.seal(plain)

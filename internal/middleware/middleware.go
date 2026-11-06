@@ -106,12 +106,17 @@ func Auth(auth *service.AuthService) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r.WithContext(pkg.WithUser(r.Context(), "anonymous")))
 				return
 			}
-			username, ok := auth.Verify(pkg.BearerToken(r))
+			username, scopes, isAPIToken, ok := auth.VerifyDetailed(pkg.BearerToken(r))
 			if !ok {
 				pkg.JSON(w, pkg.CodeUnauthorized, "登录状态已失效，请重新登录", nil)
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(pkg.WithUser(r.Context(), username)))
+			ctx := pkg.WithUser(r.Context(), username)
+			if isAPIToken {
+				ctx = pkg.WithAPIToken(ctx)
+			}
+			ctx = pkg.WithTokenScopes(ctx, scopes)
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }

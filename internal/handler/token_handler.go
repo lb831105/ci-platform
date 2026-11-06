@@ -21,8 +21,9 @@ func NewTokenHandler(tokens *service.APITokenService) *TokenHandler {
 
 // createTokenRequest 是创建令牌请求体。
 type createTokenRequest struct {
-	Name          string `json:"name"`
-	ExpiresInDays int    `json:"expires_in_days"`
+	Name          string   `json:"name"`
+	ExpiresInDays int      `json:"expires_in_days"`
+	Scopes        []string `json:"scopes"`
 }
 
 // List GET /api/profile/tokens
@@ -38,13 +39,19 @@ func (h *TokenHandler) List(w http.ResponseWriter, r *http.Request) {
 
 // Create POST /api/profile/tokens
 func (h *TokenHandler) Create(w http.ResponseWriter, r *http.Request) {
+	// 限制 Token 不能通过自身再创建新 Token：否则一个只有 job.read 的令牌
+	// 可以自助铸造 * 权限令牌，scopes 形同虚设。令牌管理只允许登录会话操作。
+	if pkg.IsAPIToken(r.Context()) {
+		pkg.Fail(w, pkg.NewError(pkg.CodeForbidden, "API Token 不能创建新的访问令牌，请使用登录会话操作"))
+		return
+	}
 	username := pkg.UserFromContext(r.Context())
 	var in createTokenRequest
 	if err := decodeJSON(w, r, &in); err != nil {
 		pkg.Fail(w, err)
 		return
 	}
-	result, err := h.tokens.Create(username, in.Name, in.ExpiresInDays)
+	result, err := h.tokens.Create(username, in.Name, in.ExpiresInDays, in.Scopes)
 	if err != nil {
 		pkg.Fail(w, err)
 		return
@@ -54,6 +61,10 @@ func (h *TokenHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 // Delete DELETE /api/profile/tokens/{id}
 func (h *TokenHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	if pkg.IsAPIToken(r.Context()) {
+		pkg.Fail(w, pkg.NewError(pkg.CodeForbidden, "API Token 不能吊销访问令牌，请使用登录会话操作"))
+		return
+	}
 	username := pkg.UserFromContext(r.Context())
 	id := chi.URLParam(r, "id")
 	if id == "" {

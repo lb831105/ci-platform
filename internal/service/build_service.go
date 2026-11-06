@@ -106,6 +106,8 @@ type BuildService struct {
 	enqueuer       Enqueuer
 	// notifier 负责构建结果通知（项目 × 人员/群 × 事件）；为 nil 时跳过。
 	notifier *NotifyService
+	// events 负责全局出站事件订阅（build/deploy/approval）；为 nil 时跳过。
+	events *EventService
 	// queueStats 供首页仪表盘展示队列/worker 状态；为 nil 时相关指标为 0。
 	queueStats QueueStats
 	// toolInstaller 负责「自动安装」的工具（JDK/Maven/Node…）下载；为 nil 时只用已有主目录。
@@ -187,6 +189,9 @@ func (s *BuildService) SetCredentialResolver(r CredentialResolver) { s.credentia
 
 // SetNotifier 注入构建结果通知服务（依赖 RBAC 人员联系方式）。
 func (s *BuildService) SetNotifier(n *NotifyService) { s.notifier = n }
+
+// SetEvents 注入全局出站事件服务。
+func (s *BuildService) SetEvents(events *EventService) { s.events = events }
 
 // Recover 在启动时把上次进程异常退出遗留的 pending/running 构建标记为失败，
 // 避免任务永远显示「运行中」。必须在调度器启动前调用。
@@ -310,6 +315,7 @@ func (s *BuildService) Trigger(ctx context.Context, pipelineID string, trigger m
 		_ = s.builds.AppendLog(ctx, pipelineID, b.ID, []byte(
 			"[ci] 等待发布审批：本任务开启了发布审批，需要拥有 job.approve 权限的人放行后才开始执行\n"))
 		logger.Infof("build %s/%s pending approval (requested by %s)", pipelineID, b.ID, b.TriggeredBy)
+		s.dispatchBuildEvent(p, b, model.CIEventApprovalRequested, nil)
 		s.rememberIdempotency(pipelineID, triggeredBy, opts.IdempotencyKey, b.ID)
 		return b, nil
 	}
@@ -717,6 +723,7 @@ func (s *BuildService) Run(ctx context.Context, job Job) {
 	if err = s.builds.Update(ctx, b); err != nil {
 		return
 	}
+	s.dispatchBuildEvent(p, b, model.CIEventBuildStarted, nil)
 
 	// 日志同时写文件与广播到 WebSocket 订阅者；文件侧带大小上限（超限截断，
 	// 不影响构建结果），WebSocket 侧不限制（在线查看实时输出）。
@@ -771,9 +778,48 @@ func (s *BuildService) Run(ctx context.Context, job Job) {
 	persistCtx := context.WithoutCancel(ctx)
 	_ = s.builds.Update(persistCtx, b)
 
+	s.dispatchBuildEvent(p, b, model.CIEventBuildFinished, nil)
+	for i := range b.Deployments {
+		s.dispatchBuildEvent(p, b, model.CIEventDeployFinished, &b.Deployments[i])
+	}
 	s.reportCommitStatus(p, b, settings, gitlabStateOf(b.Status), buildStatusSummary(b))
 	s.pruneBuilds(persistCtx, p, settings)
 	s.dispatchNotify(persistCtx, p, b)
+}
+
+// dispatchBuildEvent 构造并异步投递一个全局事件。
+// 投递失败只写平台日志，不能影响构建状态或通知链路。
+func (s *BuildService) dispatchBuildEvent(p *model.Pipeline, b *model.Build, eventType string, deployment *model.DeploymentRecord) {
+	if s.events == nil || p == nil || b == nil {
+		return
+	}
+	event := model.CIEvent{
+		Type:       eventType,
+		Time:       time.Now().UTC(),
+		Pipeline:   p.ID,
+		JobName:    p.Name,
+		Build:      b.ID,
+		Status:     string(b.Status),
+		Trigger:    string(b.TriggerType),
+		TriggerBy:  b.TriggeredBy,
+		Branch:     b.Branch,
+		Commit:     b.Commit,
+		Env:        b.Environment,
+		ExitCode:   b.ExitCode,
+		Duration:   b.Duration().Milliseconds(),
+		TestReport: b.TestReport,
+	}
+	switch eventType {
+	case model.CIEventApprovalRequested:
+		event.Approval = b.Approval
+	case model.CIEventDeployFinished:
+		event.Deployment = deployment
+		if deployment != nil {
+			event.Status = deployment.Status
+			event.Env = deployment.Environment
+		}
+	}
+	s.events.DispatchAsync(event)
 }
 
 // dispatchNotify 发送构建结果通知（项目 × 人员/群 × 事件）。
@@ -1681,6 +1727,7 @@ func (s *BuildService) Republish(ctx context.Context, pipelineID, buildID, serve
 			Status: "failed", DeployedAt: time.Now().UTC(), DeployedBy: pkg.UserFromContext(ctx), Message: err.Error(),
 		})
 		_ = s.builds.Update(context.WithoutCancel(ctx), b)
+		s.dispatchBuildEvent(p, b, model.CIEventDeployFinished, &b.Deployments[len(b.Deployments)-1])
 		return err
 	}
 	b.Deployments = append(b.Deployments, model.DeploymentRecord{
@@ -1776,15 +1823,9 @@ func (s *BuildService) collectMaskSecrets(ctx context.Context, p *model.Pipeline
 	return out
 }
 
-// isSecretEnvName 判断环境变量/参数名是否属于密钥类。
+// isSecretEnvName 保留旧调用名，规则统一由 model 提供。
 func isSecretEnvName(name string) bool {
-	name = strings.ToLower(name)
-	for _, part := range []string{"password", "passwd", "pwd", "token", "secret", "credential", "private_key", "access_key"} {
-		if strings.Contains(name, part) {
-			return true
-		}
-	}
-	return false
+	return model.IsSecretEnvName(name)
 }
 
 // pruneBuilds 应用构建保留策略：任务级配置优先，否则回落到全局 Build Discarders。

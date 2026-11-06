@@ -18,6 +18,8 @@ export interface APIToken {
   created_at: string
   last_used_at?: string
   expires_at?: string
+  // 权限范围；空表示继承用户全部权限（旧令牌兼容）
+  scopes?: string[]
 }
 
 export interface CreateAPITokenResult {

@@ -2,6 +2,7 @@ package model
 
 import (
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -84,6 +85,21 @@ type SshServer struct {
 type EnvVar struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+	// Secret 为 true 时值以 AES-GCM 落盘，API 不回传原文；
+	// 构建时注入环境变量并参与日志遮罩。
+	Secret bool `json:"secret,omitempty"`
+}
+
+// IsSecretEnvName 判断环境变量名是否属于密钥类。
+// 系统配置加密、构建日志遮罩、API 脱敏共用同一套规则，避免一处漏掉。
+func IsSecretEnvName(name string) bool {
+	name = strings.ToLower(name)
+	for _, part := range []string{"password", "passwd", "pwd", "token", "secret", "credential", "private_key", "access_key"} {
+		if strings.Contains(name, part) {
+			return true
+		}
+	}
+	return false
 }
 
 // EmailSettings 对应 Jenkins「邮件通知」，用于构建结果通知。

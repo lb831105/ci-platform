@@ -24,11 +24,23 @@ const readonly = ref(false)
 
 // API Token：供脚本/外部系统调用，权限继承当前用户；secret 只在创建时展示一次。
 const tokens = ref<APIToken[]>([])
+const scopeOptions = [
+  { value: '*', label: '全部权限（继承当前用户）' },
+  { value: 'job.read', label: '查看任务 / 构建 / 日志' },
+  { value: 'job.build', label: '触发构建' },
+  { value: 'job.configure', label: '修改任务配置' },
+  { value: 'job.delete', label: '删除任务 / 构建' },
+  { value: 'job.replay', label: '重新发布产物' },
+  { value: 'job.approve', label: '发布审批' },
+  { value: 'credential.view', label: '查看凭据（不含密钥）' },
+  { value: 'view.read', label: '查看视图' },
+]
 const tokenLoading = ref(false)
 const tokenDialog = ref(false)
 const tokenName = ref('')
 const tokenDays = ref(30)
 const tokenCreating = ref(false)
+const tokenScopes = ref<string[]>(['*'])
 const issuedSecret = ref('')
 const secretVisible = ref(false)
 
@@ -103,6 +115,7 @@ async function loadTokens(): Promise<void> {
 function openTokenDialog(): void {
   tokenName.value = ''
   tokenDays.value = 30
+  tokenScopes.value = ['*']
   tokenDialog.value = true
 }
 
@@ -114,7 +127,7 @@ async function createToken(): Promise<void> {
   }
   tokenCreating.value = true
   try {
-    const result = await tokenApi.create(name, tokenDays.value)
+    const result = await tokenApi.create(name, tokenDays.value, tokenScopes.value)
     issuedSecret.value = result.secret
     tokenDialog.value = false
     secretVisible.value = true
@@ -378,6 +391,13 @@ async function confirmCode(): Promise<void> {
             <span class="mono">{{ row.prefix }}</span>
           </template>
         </el-table-column>
+        <el-table-column label="权限" min-width="160" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span v-if="!row.scopes?.length" class="muted">继承全部</span>
+            <el-tag v-else-if="row.scopes.includes('*')" size="small" type="warning" effect="plain" disable-transitions>全部</el-tag>
+            <span v-else class="mono">{{ row.scopes.join(', ') }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="创建时间" width="180">
           <template #default="{ row }">{{ tokenTime(row.created_at) }}</template>
         </el-table-column>
@@ -399,6 +419,12 @@ async function confirmCode(): Promise<void> {
       <el-form label-width="88px" @submit.prevent>
         <el-form-item label="名称" required>
           <el-input v-model="tokenName" maxlength="64" placeholder="例如：发布脚本 / 监控巡检" />
+        </el-form-item>
+        <el-form-item label="权限范围">
+          <el-select v-model="tokenScopes" multiple filterable style="width: 100%">
+            <el-option v-for="opt in scopeOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+          </el-select>
+          <div class="form-tip">建议按最小权限选择；旧脚本需要兼容时可保留「全部权限」。</div>
         </el-form-item>
         <el-form-item label="有效期">
           <el-select v-model="tokenDays" style="width: 100%">

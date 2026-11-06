@@ -1,0 +1,855 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "ci-platform API",
+    "version": "1.0.0",
+    "description": "轻量 CI 平台对外 API。除 /healthz、/readyz、/metrics、/openapi.json、/api/auth/*、/api/webhook/* 外，均需 Bearer Token（登录会话或 API Token）。业务响应通常为 HTTP 200 + {code,msg,data}，code=0 表示成功。"
+  },
+  "servers": [
+    { "url": "/" }
+  ],
+  "security": [
+    { "bearerAuth": [] }
+  ],
+  "tags": [
+    { "name": "auth", "description": "登录与会话" },
+    { "name": "pipelines", "description": "任务与构建" },
+    { "name": "dashboard", "description": "聚合统计" },
+    { "name": "tokens", "description": "API 访问令牌" },
+    { "name": "system", "description": "系统管理" },
+    { "name": "webhook", "description": "代码平台回调" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "登录会话或 cip_ 前缀的 API Token"
+      }
+    },
+    "parameters": {
+      "pid": {
+        "name": "pid",
+        "in": "path",
+        "required": true,
+        "description": "任务 ID",
+        "schema": { "type": "string" }
+      },
+      "bid": {
+        "name": "bid",
+        "in": "path",
+        "required": true,
+        "description": "构建号；产物晋级时可传 latest 表示目标最近一次成功构建",
+        "schema": { "type": "string" }
+      },
+      "tail": {
+        "name": "tail",
+        "in": "query",
+        "description": "只返回最近 N 行，最大 5000",
+        "schema": { "type": "integer", "minimum": 1, "maximum": 5000 }
+      },
+      "grep": {
+        "name": "grep",
+        "in": "query",
+        "description": "只保留包含该子串的行；最长 200 字符",
+        "schema": { "type": "string", "maxLength": 200 }
+      },
+      "limit": {
+        "name": "limit",
+        "in": "query",
+        "description": "分页大小；不传时返回全部（兼容旧调用方）",
+        "schema": { "type": "integer", "minimum": 1, "maximum": 500 }
+      },
+      "offset": {
+        "name": "offset",
+        "in": "query",
+        "schema": { "type": "integer", "minimum": 0 }
+      },
+      "idempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "description": "可选。相同任务 + 用户 + key 在 24 小时内复用第一次创建的构建，最多 128 字符。",
+        "schema": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "responses": {
+      "Envelope": {
+        "description": "统一响应体；data 结构由具体接口决定",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Envelope" }
+          }
+        }
+      },
+      "PlainText": {
+        "description": "文本响应",
+        "content": {
+          "text/plain": { "schema": { "type": "string" } }
+        }
+      }
+    },
+    "schemas": {
+      "Envelope": {
+        "type": "object",
+        "required": ["code", "msg", "data"],
+        "properties": {
+          "code": { "type": "integer", "description": "0=成功；40000 参数错误；40100 未登录；40300 无权限；40400 不存在；40900 冲突；42900 限流；50000 内部错误" },
+          "msg": { "type": "string" },
+          "data": { "nullable": true, "description": "业务数据" }
+        }
+      },
+      "LoginRequest": {
+        "type": "object",
+        "required": ["username", "password"],
+        "properties": {
+          "username": { "type": "string" },
+          "password": { "type": "string", "format": "password" }
+        }
+      },
+      "LoginResponse": {
+        "type": "object",
+        "properties": {
+          "token": { "type": "string" },
+          "username": { "type": "string" },
+          "expires_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "TriggerBuildRequest": {
+        "type": "object",
+        "properties": {
+          "params": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "参数化构建的用户填值；密码参数只需传明文，服务端加密落盘且不回显"
+          },
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "与 Idempotency-Key 请求头二选一"
+          }
+        }
+      },
+      "Pipeline": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "environment": { "type": "string" },
+          "disabled": { "type": "boolean" },
+          "git_url": { "type": "string" },
+          "git_branch": { "type": "string" },
+          "webhook_branch_mode": { "type": "string", "enum": ["", "payload", "fixed"] },
+          "webhook_branches": { "type": "array", "items": { "type": "string" } },
+          "webhook_events": { "type": "array", "items": { "type": "string", "enum": ["push", "tag_push"] } },
+          "cron_spec": { "type": "string" },
+          "require_approval": { "type": "boolean" },
+          "params": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ParamDef" }
+          },
+          "steps": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Step" }
+          },
+          "artifacts": { "$ref": "#/components/schemas/ArtifactConfig" },
+          "cache": { "$ref": "#/components/schemas/CacheConfig" },
+          "has_webhook_secret": { "type": "boolean", "description": "只表示是否已配置；密钥永不回传" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ParamDef": {
+        "type": "object",
+        "required": ["name", "type"],
+        "properties": {
+          "name": { "type": "string" },
+          "type": { "type": "string", "enum": ["string", "bool", "choice", "text", "password"] },
+          "default": { "type": "string", "description": "password 类型禁止默认值" },
+          "options": { "type": "array", "items": { "type": "string" } },
+          "required": { "type": "boolean" },
+          "description": { "type": "string" }
+        }
+      },
+      "Step": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "run": { "type": "string" },
+          "timeout_sec": { "type": "integer" },
+          "retry": { "type": "integer" },
+          "retry_delay_sec": { "type": "integer" },
+          "allow_failure": { "type": "boolean" },
+          "when": { "type": "string", "enum": ["success", "failure", "always"] }
+        }
+      },
+      "ArtifactConfig": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "files": { "type": "array", "items": { "type": "string" } },
+          "allow_empty": { "type": "boolean" }
+        }
+      },
+      "CacheConfig": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "key": { "type": "string", "maxLength": 128 },
+          "paths": { "type": "array", "items": { "type": "string" }, "maxItems": 50 }
+        }
+      },
+      "Build": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "pipeline_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["pending", "running", "success", "failed", "aborted", "pending_approval"] },
+          "trigger_type": { "type": "string", "enum": ["manual", "webhook", "timer"] },
+          "triggered_by": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "started_at": { "type": "string", "format": "date-time" },
+          "finished_at": { "type": "string", "format": "date-time" },
+          "exit_code": { "type": "integer" },
+          "branch": { "type": "string" },
+          "environment": { "type": "string" },
+          "commit": { "type": "string" },
+          "commit_full": { "type": "string" },
+          "commit_message": { "type": "string" },
+          "params": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "密码参数固定为 ***"
+          },
+          "step_results": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/StepResult" }
+          },
+          "test_report": { "$ref": "#/components/schemas/TestReport" },
+          "deployments": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/DeploymentRecord" }
+          },
+          "description": { "type": "string" },
+          "keep_forever": { "type": "boolean" },
+          "approval": { "$ref": "#/components/schemas/BuildApproval" }
+        }
+      },
+      "StepResult": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "status": { "type": "string", "enum": ["success", "failed", "skipped", "cancelled"] },
+          "exit_code": { "type": "integer" },
+          "duration_ms": { "type": "integer" },
+          "allow_failure": { "type": "boolean" }
+        }
+      },
+      "TestReport": {
+        "type": "object",
+        "properties": {
+          "total": { "type": "integer" },
+          "passed": { "type": "integer" },
+          "failed": { "type": "integer" },
+          "errors": { "type": "integer" },
+          "skipped": { "type": "integer" },
+          "suites": { "type": "integer" },
+          "duration_ms": { "type": "integer" },
+          "files": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "DeploymentRecord": {
+        "type": "object",
+        "properties": {
+          "target": { "type": "string" },
+          "server_id": { "type": "string" },
+          "environment": { "type": "string" },
+          "status": { "type": "string", "enum": ["success", "failed"] },
+          "deployed_at": { "type": "string", "format": "date-time" },
+          "deployed_by": { "type": "string" },
+          "artifact_count": { "type": "integer" },
+          "message": { "type": "string" }
+        }
+      },
+      "BuildApproval": {
+        "type": "object",
+        "properties": {
+          "requested_at": { "type": "string", "format": "date-time" },
+          "requested_by": { "type": "string" },
+          "decided_at": { "type": "string", "format": "date-time" },
+          "decided_by": { "type": "string" },
+          "approved": { "type": "boolean" },
+          "comment": { "type": "string" }
+        }
+      },
+      "Dashboard": {
+        "type": "object",
+        "properties": {
+          "jobs_total": { "type": "integer" },
+          "jobs_disabled": { "type": "integer" },
+          "builds_today": { "type": "integer" },
+          "success_today": { "type": "integer" },
+          "failed_today": { "type": "integer" },
+          "aborted_today": { "type": "integer" },
+          "success_rate": { "type": "number" },
+          "avg_duration_ms": { "type": "integer" },
+          "running_builds": { "type": "integer" },
+          "pending_builds": { "type": "integer" },
+          "queue_length": { "type": "integer" },
+          "queue_capacity": { "type": "integer" },
+          "workers": { "type": "integer" },
+          "quiet": { "type": "boolean" },
+          "deployments_today": { "type": "integer" },
+          "deployment_failures_today": { "type": "integer" }
+        }
+      },
+      "APIToken": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "prefix": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "last_used_at": { "type": "string", "format": "date-time" },
+          "expires_at": { "type": "string", "format": "date-time" },
+          "scopes": { "type": "array", "items": { "type": "string" }, "description": "空或包含 *=继承用户全部权限" }
+        }
+      },
+      "CreateTokenRequest": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "maxLength": 64 },
+          "expires_in_days": { "type": "integer", "minimum": 0, "maximum": 3650, "default": 0 },
+          "scopes": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "如 job.read/job.build；不传默认为 *"
+          }
+        }
+      },
+      "CreateTokenResult": {
+        "type": "object",
+        "properties": {
+          "token": { "$ref": "#/components/schemas/APIToken" },
+          "secret": { "type": "string", "description": "只返回一次，服务端只存 SHA-256" }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": ["system"],
+        "summary": "存活探针",
+        "security": [],
+        "responses": { "200": { "$ref": "#/components/responses/PlainText" } }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": ["system"],
+        "summary": "就绪探针（数据目录 + credentials.key）",
+        "security": [],
+        "responses": {
+          "200": { "$ref": "#/components/responses/PlainText" },
+          "503": { "description": "依赖未就绪" }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": ["system"],
+        "summary": "Prometheus 聚合指标",
+        "security": [],
+        "responses": { "200": { "$ref": "#/components/responses/PlainText" } }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "tags": ["system"],
+        "summary": "本 OpenAPI 文档",
+        "security": [],
+        "responses": { "200": { "description": "OpenAPI JSON" } }
+      }
+    },
+    "/api/auth/status": {
+      "get": {
+        "tags": ["auth"],
+        "summary": "认证开关与当前登录态",
+        "security": [],
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/auth/login": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "用户名密码登录",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/LoginRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "登录成功；data 为 LoginResponse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Envelope" },
+                    { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/LoginResponse" } } }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/me": {
+      "get": {
+        "tags": ["auth"],
+        "summary": "当前用户与有效权限",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/auth/logout": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "退出登录（API Token 不会被吊销）",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/dashboard": {
+      "get": {
+        "tags": ["dashboard"],
+        "summary": "仪表盘聚合（按当前用户可见任务）",
+        "responses": {
+          "200": {
+            "description": "data 为 Dashboard",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Envelope" },
+                    { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/Dashboard" } } }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/overview": {
+      "get": {
+        "tags": ["pipelines"],
+        "summary": "带最近构建聚合的任务列表",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/builds": {
+      "get": {
+        "tags": ["pipelines"],
+        "summary": "跨任务构建历史",
+        "parameters": [
+          { "name": "q", "in": "query", "schema": { "type": "string" } },
+          { "name": "status", "in": "query", "schema": { "type": "string" } },
+          { "name": "pipeline", "in": "query", "schema": { "type": "string" } },
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/offset" }
+        ],
+        "responses": {
+          "200": {
+            "description": "data 为 BuildListItem[]；总数在 X-Total-Count 响应头",
+            "headers": {
+              "X-Total-Count": { "schema": { "type": "integer" }, "description": "过滤后的总数" }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Envelope" },
+                    { "type": "object", "properties": { "data": { "type": "array", "items": { "$ref": "#/components/schemas/Build" } } } }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/pipelines": {
+      "get": {
+        "tags": ["pipelines"],
+        "summary": "任务列表（按任务角色过滤）",
+        "responses": {
+          "200": {
+            "description": "data 为 Pipeline[]",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Envelope" },
+                    { "type": "object", "properties": { "data": { "type": "array", "items": { "$ref": "#/components/schemas/Pipeline" } } } }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["pipelines"],
+        "summary": "新建任务",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/Pipeline" } }
+          }
+        },
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/pipelines/{pid}": {
+      "parameters": [{ "$ref": "#/components/parameters/pid" }],
+      "get": {
+        "tags": ["pipelines"],
+        "summary": "任务详情（密钥字段不回传）",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      },
+      "put": {
+        "tags": ["pipelines"],
+        "summary": "更新任务配置",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/Pipeline" } }
+          }
+        },
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      },
+      "delete": {
+        "tags": ["pipelines"],
+        "summary": "删除任务；存在未结束构建时返回 40900",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/pipelines/{pid}/build": {
+      "parameters": [{ "$ref": "#/components/parameters/pid" }],
+      "post": {
+        "tags": ["pipelines"],
+        "summary": "触发构建",
+        "parameters": [{ "$ref": "#/components/parameters/idempotencyKey" }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/TriggerBuildRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "data 为 Build；密码参数不会出现在响应中",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Envelope" },
+                    { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/Build" } } }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/pipelines/{pid}/builds": {
+      "parameters": [{ "$ref": "#/components/parameters/pid" }],
+      "get": {
+        "tags": ["pipelines"],
+        "summary": "构建历史（编号倒序）",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/pipelines/{pid}/builds/{bid}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/pid" },
+        { "$ref": "#/components/parameters/bid" }
+      ],
+      "get": {
+        "tags": ["pipelines"],
+        "summary": "构建详情",
+        "responses": {
+          "200": {
+            "description": "data 为 Build",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Envelope" },
+                    { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/Build" } } }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": ["pipelines"],
+        "summary": "删除构建（含日志与产物）",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/pipelines/{pid}/builds/{bid}/log": {
+      "parameters": [
+        { "$ref": "#/components/parameters/pid" },
+        { "$ref": "#/components/parameters/bid" },
+        { "$ref": "#/components/parameters/tail" },
+        { "$ref": "#/components/parameters/grep" }
+      ],
+      "get": {
+        "tags": ["pipelines"],
+        "summary": "读取构建日志（支持 tail/grep）",
+        "responses": {
+          "200": {
+            "description": "data 为 {log,total_lines,matched_lines,truncated}",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Envelope" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/pipelines/{pid}/builds/{bid}/cancel": {
+      "parameters": [
+        { "$ref": "#/components/parameters/pid" },
+        { "$ref": "#/components/parameters/bid" }
+      ],
+      "post": {
+        "tags": ["pipelines"],
+        "summary": "取消运行中/等待中的构建",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/pipelines/{pid}/builds/{bid}/rerun": {
+      "parameters": [
+        { "$ref": "#/components/parameters/pid" },
+        { "$ref": "#/components/parameters/bid" }
+      ],
+      "post": {
+        "tags": ["pipelines"],
+        "summary": "用历史参数重新构建（密码参数由服务端解密还原）",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/pipelines/{pid}/builds/{bid}/approve": {
+      "parameters": [
+        { "$ref": "#/components/parameters/pid" },
+        { "$ref": "#/components/parameters/bid" }
+      ],
+      "post": {
+        "tags": ["pipelines"],
+        "summary": "放行待审批构建",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "type": "object", "properties": { "comment": { "type": "string" } } }
+            }
+          }
+        },
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/pipelines/{pid}/builds/{bid}/reject": {
+      "parameters": [
+        { "$ref": "#/components/parameters/pid" },
+        { "$ref": "#/components/parameters/bid" }
+      ],
+      "post": {
+        "tags": ["pipelines"],
+        "summary": "拒绝待审批构建（comment 必填）",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["comment"],
+                "properties": { "comment": { "type": "string" } }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/pipelines/{pid}/builds/{bid}/artifacts": {
+      "parameters": [
+        { "$ref": "#/components/parameters/pid" },
+        { "$ref": "#/components/parameters/bid" }
+      ],
+      "get": {
+        "tags": ["pipelines"],
+        "summary": "产物清单",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/pipelines/{pid}/builds/{bid}/artifacts/promote": {
+      "parameters": [
+        { "$ref": "#/components/parameters/pid" },
+        { "$ref": "#/components/parameters/bid" }
+      ],
+      "post": {
+        "tags": ["pipelines"],
+        "summary": "把源构建产物晋级到目标任务",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["source_pipeline_id", "source_build_id"],
+                "properties": {
+                  "source_pipeline_id": { "type": "string" },
+                  "source_build_id": { "type": "string" },
+                  "prefix": { "type": "string" },
+                  "files": { "type": "array", "items": { "type": "string" } },
+                  "overwrite": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/profile/tokens": {
+      "get": {
+        "tags": ["tokens"],
+        "summary": "当前用户的 API Token 列表（不含 hash/secret）",
+        "responses": {
+          "200": {
+            "description": "data 为 APIToken[]",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Envelope" },
+                    { "type": "object", "properties": { "data": { "type": "array", "items": { "$ref": "#/components/schemas/APIToken" } } } }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["tokens"],
+        "summary": "创建 API Token；secret 只返回一次。API Token 自身不能调用本接口",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/CreateTokenRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "data 为 CreateTokenResult",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Envelope" },
+                    { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/CreateTokenResult" } } }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/profile/tokens/{id}": {
+      "delete": {
+        "tags": ["tokens"],
+        "summary": "吊销 API Token（API Token 自身不能调用本接口）",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/system/settings": {
+      "get": {
+        "tags": ["system"],
+        "summary": "读取系统配置（敏感字段脱敏）",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      },
+      "put": {
+        "tags": ["system"],
+        "summary": "更新系统配置；密钥字段留空表示沿用旧值",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/system/events": {
+      "get": {
+        "tags": ["system"],
+        "summary": "出站事件订阅列表（URL/Secret 脱敏）",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      },
+      "put": {
+        "tags": ["system"],
+        "summary": "全量保存出站事件订阅；URL/Secret 留空表示沿用，clear_secret=true 才清除",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/system/events/test": {
+      "post": {
+        "tags": ["system"],
+        "summary": "发送测试事件；body id 为空时发送到全部启用订阅",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "type": "object", "properties": { "id": { "type": "string" } } }
+            }
+          }
+        },
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/security/users": {
+      "get": {
+        "tags": ["system"],
+        "summary": "用户列表（需要 Administer）",
+        "responses": { "200": { "$ref": "#/components/responses/Envelope" } }
+      }
+    },
+    "/api/webhook/{pipeline_id}": {
+      "post": {
+        "tags": ["webhook"],
+        "summary": "代码平台 Webhook 触发；使用任务自身的 Webhook 密钥鉴权",
+        "security": [],
+        "parameters": [
+          { "name": "pipeline_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "X-Webhook-Secret", "in": "header", "schema": { "type": "string" } },
+          { "name": "X-Gitlab-Token", "in": "header", "schema": { "type": "string" } },
+          { "name": "X-Hub-Signature-256", "in": "header", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "触发成功，或被策略忽略（{ignored:true,reason}）" },
+          "401": { "description": "密钥错误" },
+          "404": { "description": "任务不存在" },
+          "409": { "description": "任务禁用/重复投递" },
+          "429": { "description": "队列满" }
+        }
+      }
+    }
+  }
+}

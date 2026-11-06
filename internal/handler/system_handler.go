@@ -46,6 +46,18 @@ func toSettingsView(s model.Settings) settingsView {
 	// Webhook 通知 URL 含 access_token，同样不回传；has_webhook_url 告知是否已设置。
 	hasWebhook := s.WebhookNotify.URL != ""
 	s.WebhookNotify.URL = ""
+	// 全局密钥变量同样不回传原文；前端留空保存时由 service 按 key 沿用旧值。
+	if s.GlobalEnv != nil {
+		env := make([]model.EnvVar, len(s.GlobalEnv))
+		copy(env, s.GlobalEnv)
+		for i := range env {
+			if env[i].Secret || model.IsSecretEnvName(env[i].Key) {
+				env[i].Secret = true
+				env[i].Value = ""
+			}
+		}
+		s.GlobalEnv = env
+	}
 	return settingsView{Settings: s, HasPassword: has, HasWebhookURL: hasWebhook}
 }
 

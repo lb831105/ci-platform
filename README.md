@@ -1,4 +1,4 @@
-# 轻量 CI/CD 平台（类 Jenkins 基础版）
+# 轻量 CI/CD 平台
 
 文件系统存储 + 本地工具链构建 + SSH 发布，**不依赖任何数据库**，**前端内嵌、单文件交付**。
 
@@ -306,13 +306,16 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/healthz` | 进程存活探针（不返回业务数据） |
-| GET | `/readyz` | 数据目录就绪探针（未就绪返回 503） |
+| GET | `/readyz` | 数据目录与凭据密钥就绪探针（未就绪返回 503） |
+| GET | `/metrics` | Prometheus 聚合指标（构建/成功率/队列/部署；不含任务名与密钥） |
+| GET | `/openapi.json` | OpenAPI 3.0 契约（同时提供 `/api/openapi.json`；随二进制内嵌） |
 | GET | `/api/auth/status` | 认证开关与当前登录态（公开） |
 | POST | `/api/auth/login` | 登录，返回 Bearer token（公开） |
 | POST | `/api/auth/logout` | 登出 |
 | GET | `/api/auth/me` | 当前用户 |
 | POST | `/api/auth/password` | 修改**当前登录账号**的密码（校验旧密码；内置管理员与平台内用户都走这里，改密后其他会话失效） |
 | GET | `/api/overview` | 带构建聚合的任务列表（Jenkins 作业列表） |
+| GET | `/api/dashboard` | 首页仪表盘聚合：今日构建/成功率/平均耗时/队列/部署/失败 Top（按当前用户可见任务） |
 | GET | `/api/builds` | 跨任务构建历史；支持 `q` / `status` / `pipeline` / `limit` / `offset`，总数在 `X-Total-Count` 响应头 |
 | GET | `/api/pipelines` | 任务列表 |
 | POST | `/api/pipelines` | 创建任务 |
@@ -340,6 +343,8 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | DELETE | `/api/pipelines/{pid}/builds/{bid}` | 删除单次构建（连 `builds/{bid}` 目录：日志 + 产物，权限 `job.delete`） |
 | WS | `/ws/pipelines/{pid}/builds/{bid}/logs` | 实时日志流（token 查询参数鉴权） |
 | GET/PUT | `/api/system/settings` | 系统配置读取 / 更新（含 `log_max_mb` 日志上限、保留策略定期扫描） |
+| GET/PUT | `/api/system/events` | 全局出站事件订阅：列表（URL/Secret 脱敏）/ 全量保存；URL 与 HMAC 密钥加密落盘，留空表示沿用 |
+| POST | `/api/system/events/test` | 向指定订阅（body `{"id":"..."}`，为空则全部启用项）发送测试事件 |
 | GET | `/api/pipelines/{pid}/config.json` | **导出任务配置**（对齐 Jenkins `job/{name}/config.xml`）：返回裸 JSON 文档（不套 `{code,msg,data}`），**不含任何密钥**，集成 `server_name` / `git_credential_name` 便于跨实例对齐 |
 | POST | `/api/system/import/config` | **导入平台配置文档**：body 为导出文档或原生 `config.json`；query `name`/`mode=create\|update\|skip`/`dry_run=true`（管理员） |
 | POST | `/api/system/import/jenkins` | **从 Jenkins 导入任务**：body 为 `config.xml`（`application/xml`）或 multipart（`file`）；query `name`（必填，config.xml 不含任务名）、`mode=create\|update\|skip`、`dry_run=true`、`keep_source=false`（管理员） |
@@ -351,7 +356,7 @@ ci-platform listening on :8080 (data_home=./data, workers=3, queue=100)
 | GET | `/api/system/audit?limit=300` | 操作审计日志（最近 N 条，时间倒序，管理员） |
 | GET | `/api/system/notify?limit=&pipeline=&recipient=&status=` | 通知投递记录（按收件人粒度，排查漏收） |
 | GET/PUT | `/api/profile` `/api/profile/contact` | 个人资料：查看 / 自助维护联系方式（任何登录用户）；**修改密码**在「个人资料」页自助完成 |
-| GET/POST/DELETE | `/api/profile/tokens` `/api/profile/tokens/{id}` | API 访问令牌：列表（脱敏）/ 创建（secret 只返回一次）/ 吊销；令牌继承用户权限，可替代登录会话用于脚本 |
+| GET/POST/DELETE | `/api/profile/tokens` `/api/profile/tokens/{id}` | API 访问令牌：列表（脱敏）/ 创建（secret 只返回一次）/ 吊销；支持 `scopes` 最小权限，旧 Token 无 scopes 时兼容继承全部权限；Token 不能自助创建/吊销 Token |
 | POST | `/api/profile/email/verify` `/api/profile/email/confirm` | 发送邮箱验证码 / 提交验证码确认 |
 | GET | `/api/security/users` | 用户管理页数据：内置管理员 + 平台用户 + 联系方式 + 角色摘要 |
 | POST | `/api/security/users` | 创建平台内用户（bcrypt；用户名 + 汉字姓名 + 邮箱，管理员） |
@@ -387,6 +392,39 @@ curl -X POST http://[IP]:8080/api/webhook/1703123456 \
 curl -X POST http://[IP]:8080/api/webhook/1703123456
 ```
 
+### OpenAPI 与 CLI
+
+OpenAPI 3.0 契约随服务端内嵌：
+
+```text
+http://[IP]:8080/openapi.json
+http://[IP]:8080/api/openapi.json
+```
+
+CLI 不依赖平台内部包，可单独编译分发：
+
+```bash
+go build -o bin/ci ./cmd/ci
+
+# 交互登录（会话）或直接保存 API Token（长期脚本推荐）
+./bin/ci login --server http://[IP]:8080 --username admin --password '***'
+./bin/ci login --server http://[IP]:8080 --token cip_xxx
+
+./bin/ci list
+./bin/ci build demo-app --wait -param VERSION=1.2.3
+./bin/ci logs demo-app 42 --tail 200 --grep ERROR
+./bin/ci builds demo-app
+./bin/ci status demo-app 42
+./bin/ci cancel demo-app 42
+
+# 令牌管理使用登录会话执行（API Token 不能自助创建新令牌）
+./bin/ci token list
+./bin/ci token create --name deploy --days 90 --scope job.read --scope job.build
+```
+
+连接信息也可用环境变量覆盖：`CI_SERVER`、`CI_TOKEN`；配置文件默认在用户配置目录
+`ci-platform/config.json`，权限 `0600`，可用 `CI_CONFIG` 指定其他路径。
+
 ---
 
 ## 六、文件系统存储设计
@@ -394,7 +432,7 @@ curl -X POST http://[IP]:8080/api/webhook/1703123456
 ```
 ci-platform.json                      # 引导配置：记录 DATA_HOME 位置（已 gitignore，可用 -config 改路径）
 data/                                  # DATA_HOME，运行时创建，已 gitignore
-├── settings.json                      # 系统配置（应用名 / 默认参数 / 认证 / 静默模式 / 邮件 / Webhook / SSH）
+├── settings.json                      # 系统配置（SMTP/SSH/Webhook/全局密钥变量等敏感字段 AES-GCM 加密）
 ├── rbac.json                          # 角色、授权与平台内用户（bcrypt、联系方式、邮箱验证状态）
 ├── views.json                         # 视图（列表视图 / 我的视图）
 ├── audit.log                          # 操作审计（JSONL；16MB 轮转为 audit.log.1）
@@ -403,9 +441,10 @@ data/                                  # DATA_HOME，运行时创建，已 gitig
 │   └── {credential_id}.json           # 凭据（Secret 用 AES-GCM 加密，读取时解密）
 ├── credentials.key                    # 凭据/密码参数加密密钥（0600，必须随 data 一起备份）
 ├── tokens.json                        # API Token（只存 SHA-256 哈希，不存原始 secret）
+├── events.json                        # 出站事件订阅（URL/HMAC Secret 加密落盘）
 ├── jobs/
 │   └── {pipeline_id}/                 # 目录名即 ID（时间戳字符串），无额外索引
-│       ├── config.json                # Pipeline 定义（含 notify/cache/environment 等）
+│       ├── config.json                # Pipeline 定义（Webhook 密钥/SSH 密码/群机器人 URL 加密落盘）
 │       ├── next_build                 # 下一个构建编号（单调递增，删除构建后不回退）
 │       ├── cache/                     # 显式缓存（按 cache key 哈希分目录，成功后写入）
 │       └── builds/
@@ -586,6 +625,48 @@ data/                                  # DATA_HOME，运行时创建，已 gitig
 **安全提示**：SSH 服务器可配置 `known_hosts_path`（如 `~/.ssh/known_hosts`），配置后会校验服务器主机密钥，
 未知主机直接拒绝连接；不填写时跳过校验（存在中间人风险，构建日志会输出 WARN）。
 
+### 出站事件订阅
+
+系统配置 → **出站事件订阅**把平台状态推给外部系统（工单、发布平台、IM Bot）。与任务级
+IM 通知不同，订阅是全局的，payload 是稳定的机器可读 JSON：
+
+```http
+POST https://example.com/hooks/ci
+Content-Type: application/json
+X-CI-Event: build.finished
+X-CI-Delivery: 3f6c...
+X-CI-Signature: sha256=<HMAC-SHA256(secret, raw_body)>
+```
+
+```json
+{
+  "id": "3f6c...",
+  "type": "build.finished",
+  "time": "2026-01-01T12:00:00Z",
+  "pipeline_id": "1703123456",
+  "job_name": "demo-app",
+  "build_id": "42",
+  "status": "success",
+  "trigger_type": "manual",
+  "triggered_by": "alice",
+  "branch": "main",
+  "commit": "a1b2c3d",
+  "environment": "prod",
+  "exit_code": 0,
+  "duration_ms": 12345
+}
+```
+
+事件类型：`build.started`、`build.finished`、`deploy.finished`（带 `deployment`）、
+`approval.requested`（带 `approval`）。行为：
+
+- URL 与 HMAC Secret 使用 `credentials.key` 加密落盘（`data/events.json`），API 只返回
+  `has_url` / `has_secret`；留空保存表示沿用旧值，`clear_secret=true` 才清除。
+- 仅允许 `http(s)` 外网地址；loopback / 私网 / 云元数据地址在保存时直接拒绝。
+- 失败重试 3 次（网络错误 / 5xx / 429），其它 4xx 不重试；投递失败只写平台日志，
+  **绝不影响构建结果**。
+- 单实例最多 20 个订阅；测试事件通过「测试」按钮或 `POST /api/system/events/test` 发送。
+
 ---
 
 ## 十一、验证结果
@@ -627,7 +708,12 @@ bash ./build.sh         # ✅ 双平台产物 + UPX 压缩
 | 平台日志分级记录 + 30 天保留 | ✅ e2e + 7 例单测：默认 info 下无 DEBUG、`-log-level debug` 后出现 DEBUG、一天一个文件 `YYYY-MM/app-YYYY-MM-DD.log`、同一天复用同一文件 / 跨天换文件 / 跨月换目录、级别列落盘、API 返回结构化条目与「保留 30 天」信息、超 30 天的天文件被删除（空月目录一并清理，用户自建目录不碰，旧版根目录月文件也会清） |
 | JUnit 测试报告 | ✅ 解析 `<testsuites>` / 单 `<testsuite>`、汇总 passed/failed/error/skipped/耗时、失败用例与原始报告落盘；failure/error 让构建失败；`allow_empty` 可放行无报告 |
 | 禁用任务 | ✅ 手动/Webhook/定时触发统一拒绝（`Trigger` 入口拦截），配置与历史保留；重新启用即可继续 |
-| API Token / 幂等触发 | ✅ 令牌只存哈希、可吊销/过期、继承用户权限；`Idempotency-Key` 按任务+用户复用首次构建 |
+| API Token / 幂等触发 | ✅ 令牌只存哈希、可吊销/过期、scopes 最小权限；`Idempotency-Key` 按任务+用户复用首次构建；Token 不能自助提权 |
+| CLI / OpenAPI | ✅ `cmd/ci` 独立 CLI（login/list/build/logs/status/cancel/token/dashboard）+ `/openapi.json` 内嵌 OpenAPI 3.0 |
+| 出站事件订阅 | ✅ `build.started` / `build.finished` / `deploy.finished` / `approval.requested`；HMAC-SHA256 签名、失败重试、URL/Secret 加密；投递失败不影响构建 |
+| 首次创建向导 | ✅ 模板库（Go/Node/Maven/流水线/自由风格）+ Git/分支/环境最小输入，一键创建并触发首次构建；模板 payload 单测覆盖 |
+| 密钥治理 | ✅ SMTP/SSH/Webhook/任务 Webhook/SSH 发布/群机器人 URL/全局 secret 变量统一 AES-GCM 落盘；API 不回传原文；`/readyz` 检查 credentials.key |
+| 仪表盘 / Metrics | ✅ 首页 KPI（今日构建/成功率/耗时/队列/部署/失败 Top）；`/metrics` 提供 Prometheus 聚合指标 |
 | 密码参数 | ✅ 触发时填写、`build.json` 只落 AES-GCM 密文、日志遮罩、API 显示 `***`；Re-run 服务端解密还原 |
 | 缓存 / 产物晋级 | ✅ 显式 cache key/paths 恢复与保存；跨任务复制产物并校验 SHA-256 |
 | 环境与部署记录 | ✅ 任务 environment 快照；SSH 发布/重新发布记录目标、状态、时间、操作人 |
@@ -706,7 +792,7 @@ ci-platform/
   需要多人协作时在「系统管理 → 用户管理」创建平台用户，并在「Assign Roles」分配角色（姓名仅汉字、邮箱必填）。
 - 系统配置中的「单次产物大小上限（MB）」「单次产物文件数上限」会在归档时强制执行，防止异常产物写满磁盘。
 - 「准备关机（静默模式）」只拒绝**新的**构建入队，不影响正在运行的构建。
-- 以下配置会**直接作用于构建**：静默期（开始前等待）、SCM 重试次数、Shell、Global Time Out、构建保留策略、全局环境变量（含 Maven / Git 相关变量）、邮件通知、Webhook 通知（钉钉/企微/Slack）。
+- 以下配置会**直接作用于构建**：静默期（开始前等待）、SCM 重试次数、Shell、Global Time Out、构建保留策略、全局环境变量（含 Maven / Git 相关变量；标记 secret 的值加密且 API 不回传）、邮件通知、Webhook 通知（钉钉/企微/Slack）。
 - **构建历史可删除**：任务页构建历史、构建日志页、全局构建历史都支持删除单次构建，
   会连同 `data/jobs/{pid}/builds/{bid}` 目录（日志 + 已归档产物）一起删除，需二次确认；
   运行中/排队中的构建需先停止。删除最新构建后编号不会回退（`next_build` 记录）。

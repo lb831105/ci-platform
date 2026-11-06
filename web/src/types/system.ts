@@ -95,6 +95,8 @@ export interface SshServer {
 export interface EnvVar {
   key: string
   value: string
+  // 密钥变量：值以 AES-GCM 落盘，API 不回传原文，留空保存表示沿用旧值。
+  secret?: boolean
 }
 
 export interface WebhookNotifySettings {
@@ -103,6 +105,19 @@ export interface WebhookNotifySettings {
   url: string
   notify_on_failure: boolean
   notify_on_success: boolean
+}
+
+// 全局出站事件订阅（/system/events）。URL/Secret 由后端加密，接口只返回 has_*。
+export interface EventSubscription {
+  id: string
+  name: string
+  url?: string
+  secret?: string
+  events: string[]
+  enabled: boolean
+  has_url?: boolean
+  has_secret?: boolean
+  clear_secret?: boolean
 }
 
 export interface EmailSettings {

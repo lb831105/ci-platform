@@ -70,7 +70,11 @@ func (s *BuildService) Dashboard(ctx context.Context, pipelines []*model.Pipelin
 				out.PendingBuilds++
 				runningJobs[p.ID] = true
 			}
-			if b.CreatedAt != nil && !b.CreatedAt.Before(startOfDay) {
+			createdAt := b.CreatedAt
+			if createdAt == nil {
+				createdAt = b.StartedAt
+			}
+			if createdAt != nil && !createdAt.Before(startOfDay) {
 				out.BuildsToday++
 				switch b.Status {
 				case model.BuildSuccess:

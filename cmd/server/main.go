@@ -221,6 +221,10 @@ func main() {
 	authHandler := handler.NewAuthHandler(authSvc, settingsSvc)
 	authHandler.SetRBAC(rbacSvc)
 	systemHandler := handler.NewSystemHandler(systemSvc, authSvc)
+	// 全局出站事件订阅：URL/Secret 加密落盘，构建状态变化时异步推送。
+	eventSvc := service.NewEventService(store.NewEventStore(cfg.DataHome))
+	buildSvc.SetEvents(eventSvc)
+	eventHandler := handler.NewEventHandler(eventSvc)
 	credentialHandler := handler.NewCredentialHandler(credentialSvc)
 	// 工具自动安装：下载到 data/tools，构建时按需调用（首次会下载）。
 	toolInstaller := tools.NewInstaller(cfg.ToolsDir(), cfg.ToolsMirror, func(format string, args ...any) {
@@ -263,24 +267,28 @@ func main() {
 	portabilityHandler := handler.NewPortabilityHandler(portabilitySvc)
 
 	handlerRouter := router.New(router.Deps{
-		Config:          cfg,
-		Pipeline:        pipelineHandler,
-		Build:           buildHandler,
-		Webhook:         webhookHandler,
-		WebSocket:       wsHandler,
-		Auth:            authHandler,
-		System:          systemHandler,
-		Credential:      credentialHandler,
-		RBAC:            rbacHandler,
-		View:            viewHandler,
-		Notify:          notifyHandler,
-		Profile:         profileHandler,
-		Token:           tokenHandler,
-		Import:          importHandler,
-		Portability:     portabilityHandler,
-		AuthService:     authSvc,
+		Config:      cfg,
+		Pipeline:    pipelineHandler,
+		Build:       buildHandler,
+		Webhook:     webhookHandler,
+		WebSocket:   wsHandler,
+		Auth:        authHandler,
+		System:      systemHandler,
+		Credential:  credentialHandler,
+		RBAC:        rbacHandler,
+		View:        viewHandler,
+		Notify:      notifyHandler,
+		Profile:     profileHandler,
+		Token:       tokenHandler,
+		Import:      importHandler,
+		Portability: portabilityHandler,
+		AuthService: authSvc,
+		Readiness: func(ctx context.Context) error {
+			return credentialSvc.Health(ctx)
+		},
 		RBACService:     rbacSvc,
 		Tools:           toolsHandler,
+		Event:           eventHandler,
 		PipelineService: pipelineSvc,
 		AuditService:    auditSvc,
 		WebAssets:       webAssets,

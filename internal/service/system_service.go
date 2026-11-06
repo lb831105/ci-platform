@@ -423,6 +423,7 @@ func copyDataEntries(ctx context.Context, src, dst string) error {
 		"credentials",
 		"credentials.key",
 		"tokens.json",
+		"events.json",
 		"jobs",
 		".workspace-reuse-v1",
 		".artifact-config-v1",

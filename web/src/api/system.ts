@@ -14,6 +14,7 @@ import type {
   OldDataReport,
   Settings,
   SystemInfo,
+  EventSubscription,
 } from '@/types/system'
 
 export const systemApi = {
@@ -75,6 +76,19 @@ export const systemApi = {
   // 发送 Webhook 测试通知（钉钉/企微/Slack）。
   testWebhookNotify(): Promise<null> {
     return http.post<null>('/system/webhook/test')
+  },
+
+  // 全局出站事件订阅：URL/Secret 不回传，留空保存表示沿用旧值。
+  events(): Promise<EventSubscription[]> {
+    return http.get<EventSubscription[]>('/system/events')
+  },
+
+  updateEvents(items: EventSubscription[]): Promise<EventSubscription[]> {
+    return http.put<EventSubscription[]>('/system/events', items)
+  },
+
+  testEvent(id = ''): Promise<null> {
+    return http.post<null>('/system/events/test', { id })
   },
 
   // 操作审计日志（最近 limit 条，时间倒序）。

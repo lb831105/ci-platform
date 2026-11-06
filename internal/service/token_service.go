@@ -58,7 +58,7 @@ const (
 )
 
 // Create 为指定用户创建令牌。expiresInDays<=0 表示永不过期（仍可手动吊销）。
-func (s *APITokenService) Create(username, name string, expiresInDays int) (APITokenCreateResult, error) {
+func (s *APITokenService) Create(username, name string, expiresInDays int, scopes []string) (APITokenCreateResult, error) {
 	username = strings.TrimSpace(username)
 	name = strings.TrimSpace(name)
 	if username == "" {
@@ -72,6 +72,10 @@ func (s *APITokenService) Create(username, name string, expiresInDays int) (APIT
 	}
 	if expiresInDays < 0 || expiresInDays > 3650 {
 		return APITokenCreateResult{}, pkg.ErrBadRequest("有效期必须在 1–3650 天之间，或传 0 表示永不过期")
+	}
+	scopes, err := normalizeTokenScopes(scopes)
+	if err != nil {
+		return APITokenCreateResult{}, err
 	}
 
 	raw, err := newAPITokenSecret()
@@ -92,6 +96,7 @@ func (s *APITokenService) Create(username, name string, expiresInDays int) (APIT
 		Prefix:    tokenPrefix(raw),
 		CreatedAt: now,
 		ExpiresAt: expiresAt,
+		Scopes:    scopes,
 	}
 
 	s.mu.Lock()
@@ -170,10 +175,10 @@ func (s *APITokenService) RevokeUserTokens(username string) error {
 
 // VerifyAPIToken 校验原始 token，返回归属用户。
 // LastUsedAt 做一分钟节流，避免每个 API 请求都写一次磁盘。
-func (s *APITokenService) VerifyAPIToken(raw string) (string, bool) {
+func (s *APITokenService) VerifyAPIToken(raw string) (string, []string, bool) {
 	raw = strings.TrimSpace(raw)
 	if !strings.HasPrefix(raw, "cip_") {
-		return "", false
+		return "", nil, false
 	}
 	hash := hashAPIToken(raw)
 
@@ -181,7 +186,7 @@ func (s *APITokenService) VerifyAPIToken(raw string) (string, bool) {
 	defer s.mu.Unlock()
 	list, err := s.store.Load()
 	if err != nil {
-		return "", false
+		return "", nil, false
 	}
 	now := s.now().UTC()
 	for i := range list {
@@ -190,21 +195,52 @@ func (s *APITokenService) VerifyAPIToken(raw string) (string, bool) {
 			continue
 		}
 		if t.ExpiresAt != nil && now.After(*t.ExpiresAt) {
-			return "", false
+			return "", nil, false
 		}
 		if s.userExists != nil && !s.userExists(t.Username) {
-			return "", false
+			return "", nil, false
 		}
 		if t.LastUsedAt == nil || now.Sub(*t.LastUsedAt) >= time.Minute {
 			t.LastUsedAt = &now
 			if err := s.store.Save(list); err != nil {
 				// 记录最后使用时间失败不应让一个本来有效的 token 失效。
-				return t.Username, true
+				return t.Username, append([]string(nil), t.Scopes...), true
 			}
 		}
-		return t.Username, true
+		return t.Username, append([]string(nil), t.Scopes...), true
 	}
-	return "", false
+	return "", nil, false
+}
+
+// normalizeTokenScopes 校验权限范围。空 scopes 在新建时默认 "*"（继承用户全部权限），
+// 旧令牌没有 scopes 字段时仍按"无限制"处理。
+func normalizeTokenScopes(scopes []string) ([]string, error) {
+	if len(scopes) == 0 {
+		return []string{"*"}, nil
+	}
+	allowed := map[string]bool{"*": true}
+	for _, group := range model.PermissionGroups() {
+		for _, item := range group.Permissions {
+			allowed[item.ID] = true
+		}
+	}
+	seen := make(map[string]bool, len(scopes))
+	out := make([]string, 0, len(scopes))
+	for _, raw := range scopes {
+		scope := strings.TrimSpace(raw)
+		if scope == "" || seen[scope] {
+			continue
+		}
+		if !allowed[scope] {
+			return nil, pkg.ErrBadRequest("不支持的令牌权限: %s", scope)
+		}
+		seen[scope] = true
+		out = append(out, scope)
+	}
+	if len(out) == 0 {
+		return []string{"*"}, nil
+	}
+	return out, nil
 }
 
 // newAPITokenSecret 生成 32 字节随机 secret，前缀便于在日志中识别并做泄露扫描。

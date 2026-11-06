@@ -5,7 +5,7 @@ import ManagePageHeader from '@/components/ManagePageHeader.vue'
 import { systemApi } from '@/api/system'
 import { describeError } from '@/api/request'
 import { useSettingsStore } from '@/stores/settingsStore'
-import type { DataHomeInfo, Settings, SshServer, SystemInfo } from '@/types/system'
+import type { DataHomeInfo, EventSubscription, Settings, SshServer, SystemInfo } from '@/types/system'
 
 const settingsStore = useSettingsStore()
 
@@ -20,6 +20,17 @@ const dataHomeForm = ref('')
 const migrateData = ref(true)
 const savingDataHome = ref(false)
 const testTo = ref('')
+
+// 出站事件订阅单独保存，避免与系统配置表单耦合：URL/Secret 留空 = 沿用旧值。
+const events = ref<EventSubscription[]>([])
+const eventSaving = ref(false)
+const eventTesting = ref(false)
+const eventTypeOptions = [
+  { value: 'build.started', label: '构建开始' },
+  { value: 'build.finished', label: '构建结束' },
+  { value: 'deploy.finished', label: '部署结束' },
+  { value: 'approval.requested', label: '等待发布审批' },
+]
 
 const activeNames = ref(['system-message', 'location', 'behavior'])
 
@@ -84,14 +95,16 @@ function defaultForm(): Settings {
 async function load(): Promise<void> {
   loading.value = true
   try {
-    const [s, i, dh] = await Promise.all([
+    const [s, i, dh, ev] = await Promise.all([
       systemApi.getSettings(),
       systemApi.info(),
       systemApi.getDataHome(),
+      systemApi.events(),
     ])
     form.value = s
     info.value = i
     dataHome.value = dh
+    events.value = ev
     dataHomeForm.value = dh.configured_data_home || dh.data_home
     settingsStore.set(s)
   } catch (e) {
@@ -163,7 +176,7 @@ async function onSaveDataHome(): Promise<void> {
 }
 
 function addEnv(): void {
-  form.value.global_env.push({ key: '', value: '' })
+  form.value.global_env.push({ key: '', value: '', secret: false })
 }
 
 function addSshServer(): void {
@@ -190,6 +203,48 @@ function removeSshServer(index: number): void {
 
 function removeEnv(index: number): void {
   form.value.global_env.splice(index, 1)
+}
+
+function addEventSubscription(): void {
+  events.value.push({
+    id: '',
+    name: '',
+    url: '',
+    secret: '',
+    events: eventTypeOptions.map((item) => item.value),
+    enabled: true,
+    has_url: false,
+    has_secret: false,
+    clear_secret: false,
+  })
+}
+
+function removeEventSubscription(index: number): void {
+  events.value.splice(index, 1)
+}
+
+async function onSaveEvents(): Promise<void> {
+  eventSaving.value = true
+  try {
+    events.value = await systemApi.updateEvents(events.value)
+    ElMessage.success('事件订阅已保存')
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    eventSaving.value = false
+  }
+}
+
+async function onTestEvent(id = ''): Promise<void> {
+  eventTesting.value = true
+  try {
+    await systemApi.testEvent(id)
+    ElMessage.success(id ? '测试事件已发送' : '测试事件已发送到全部启用的订阅')
+  } catch (e) {
+    ElMessage.error(describeError(e))
+  } finally {
+    eventTesting.value = false
+  }
 }
 
 async function onQuiet(quiet: boolean): Promise<void> {
@@ -408,7 +463,16 @@ async function onTestWebhook(): Promise<void> {
             </el-table-column>
             <el-table-column label="值" min-width="280">
               <template #default="{ row }">
-                <el-input v-model="row.value" class="mono" />
+                <el-input
+                  v-model="row.value"
+                  class="mono"
+                  :placeholder="row.secret ? '已设置，留空保存则沿用' : ''"
+                />
+              </template>
+            </el-table-column>
+            <el-table-column label="密钥" width="80" align="center">
+              <template #default="{ row }">
+                <el-switch v-model="row.secret" />
               </template>
             </el-table-column>
             <el-table-column label="操作" width="100" align="right">
@@ -421,7 +485,10 @@ async function onTestWebhook(): Promise<void> {
             </template>
           </el-table>
           <el-button size="small" style="margin-top: 10px" @click="addEnv">新增环境变量</el-button>
-          <div class="form-tip">这些变量会注入到每次构建的环境中。</div>
+          <div class="form-tip">
+            这些变量会注入到每次构建的环境中。标记为「密钥」或名称含 token/password/secret 的变量会加密落盘，
+            接口不回传原文；日志中出现其值会自动遮罩。
+          </div>
 
           <div class="section-label" style="margin-top: 18px">工具位置</div>
           <el-alert
@@ -599,6 +666,89 @@ async function onTestWebhook(): Promise<void> {
           </el-form>
         </el-collapse-item>
 
+        <el-collapse-item name="event-subscriptions">
+          <template #title>出站事件订阅（Webhook）</template>
+          <div class="muted">
+            把构建 / 部署 / 审批事件以稳定 JSON 推送给外部系统。URL 与签名密钥加密落盘，
+            接口只返回「是否已设置」；留空保存表示沿用旧值。投递失败只记录平台日志，不影响构建。
+          </div>
+          <div class="event-actions">
+            <el-button size="small" @click="addEventSubscription">新增订阅</el-button>
+            <el-button size="small" type="primary" :loading="eventSaving" @click="onSaveEvents">保存订阅</el-button>
+            <el-button size="small" :loading="eventTesting" @click="onTestEvent()">测试全部启用项</el-button>
+          </div>
+          <el-table :data="events" size="small">
+            <el-table-column label="名称" min-width="130">
+              <template #default="{ row }">
+                <el-input v-model="row.name" placeholder="如 发布工单" />
+              </template>
+            </el-table-column>
+            <el-table-column label="URL" min-width="240">
+              <template #default="{ row }">
+                <el-input
+                  v-model="row.url"
+                  class="mono"
+                  :placeholder="row.has_url ? '已保存，留空沿用' : 'https://example.com/hooks/ci'"
+                />
+              </template>
+            </el-table-column>
+            <el-table-column label="订阅事件" min-width="230">
+              <template #default="{ row }">
+                <el-select v-model="row.events" multiple collapse-tags style="width: 100%">
+                  <el-option
+                    v-for="opt in eventTypeOptions"
+                    :key="opt.value"
+                    :label="opt.label"
+                    :value="opt.value"
+                  />
+                </el-select>
+              </template>
+            </el-table-column>
+            <el-table-column label="签名密钥" min-width="180">
+              <template #default="{ row }">
+                <el-input
+                  v-model="row.secret"
+                  type="password"
+                  show-password
+                  :placeholder="row.has_secret ? '已保存，留空沿用' : '可选，用于 HMAC-SHA256'"
+                />
+                <el-checkbox v-if="row.has_secret" v-model="row.clear_secret" size="small">
+                  清除密钥
+                </el-checkbox>
+              </template>
+            </el-table-column>
+            <el-table-column label="启用" width="70" align="center">
+              <template #default="{ row }">
+                <el-switch v-model="row.enabled" />
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="150" align="right">
+              <template #default="{ row, $index }">
+                <el-button
+                  size="small"
+                  :loading="eventTesting"
+                  :disabled="!row.id"
+                  @click="onTestEvent(row.id)"
+                >
+                  测试
+                </el-button>
+                <el-button size="small" type="danger" plain @click="removeEventSubscription($index)">
+                  删除
+                </el-button>
+              </template>
+            </el-table-column>
+            <template #empty>
+              <div class="empty-tip">尚未配置出站事件订阅</div>
+            </template>
+          </el-table>
+          <div class="form-tip">
+            接收方校验：<span class="mono">X-CI-Signature: sha256=&lt;hex&gt;</span>，签名内容为原始请求体；
+            另有 <span class="mono">X-CI-Event</span> 与 <span class="mono">X-CI-Delivery</span> 头。事件类型：
+            <span class="mono">build.started</span> / <span class="mono">build.finished</span> /
+            <span class="mono">deploy.finished</span> / <span class="mono">approval.requested</span>。
+          </div>
+        </el-collapse-item>
+
         <el-collapse-item name="shutdown">
           <template #title>准备关机</template>
           <el-form label-width="200px" label-position="right">
@@ -691,6 +841,11 @@ async function onTestWebhook(): Promise<void> {
   display: flex;
   gap: 10px;
   margin-top: 18px;
+}
+.event-actions {
+  display: flex;
+  gap: 10px;
+  margin: 10px 0;
 }
 .data-home-actions {
   display: flex;

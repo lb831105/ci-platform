@@ -1,16 +1,17 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import JobStatusIcon from '@/components/JobStatusIcon.vue'
 import JobWeatherIcon from '@/components/JobWeatherIcon.vue'
 import { describeError } from '@/api/request'
+import { pipelineApi } from '@/api/pipeline'
 import { useOverviewStore } from '@/stores/overviewStore'
 import { useAuthStore } from '@/stores/authStore'
 import { usePolling } from '@/composables/usePolling'
 import { usePipeline } from '@/composables/usePipeline'
-import { formatDurationCN, formatRelativeTime } from '@/utils/format'
-import type { BuildRef, PipelineSummary } from '@/types/summary'
+import { formatDurationCN, formatRelativeTime, formatTime } from '@/utils/format'
+import type { BuildRef, DashboardData, DashboardDeployment, DashboardFailure, PipelineSummary } from '@/types/summary'
 
 const router = useRouter()
 const overview = useOverviewStore()
@@ -19,7 +20,21 @@ const { remove, triggerBuild } = usePipeline()
 
 const jobs = computed(() => overview.items)
 
-// 有构建在跑时轮询刷新，全部结束后停止。
+// 仪表盘数据与任务列表一起刷新；失败不遮挡列表（列表仍可用）。
+const dashboard = ref<DashboardData | null>(null)
+const dashboardLoading = ref(false)
+async function loadDashboard(): Promise<void> {
+  dashboardLoading.value = true
+  try {
+    dashboard.value = await pipelineApi.dashboard()
+  } catch {
+    // 仪表盘是增强信息，接口失败时保持上一次数据，不打断任务列表。
+  } finally {
+    dashboardLoading.value = false
+  }
+}
+
+// 有构建在跑时只轮询任务列表；仪表盘是聚合扫描，避免每 3 秒重复扫全部构建。
 const polling = usePolling(async () => {
   await overview.fetch(true)
   if (!jobs.value.some((job) => job.running)) {
@@ -27,12 +42,32 @@ const polling = usePolling(async () => {
   }
 }, 3000)
 
+async function refreshAll(): Promise<void> {
+  await Promise.all([overview.fetch(true), loadDashboard()])
+}
+
 onMounted(async () => {
-  await overview.fetch(true)
+  await refreshAll()
   if (jobs.value.some((job) => job.running)) {
     polling.start()
   }
 })
+
+function goDeployment(row: DashboardDeployment): void {
+  void router.push({ name: 'build-log', params: { pipelineId: row.pipeline_id, buildId: row.build_id } })
+}
+
+function goFailure(row: DashboardFailure): void {
+  if (row.last_build_id) {
+    void router.push({ name: 'build-log', params: { pipelineId: row.pipeline_id, buildId: row.last_build_id } })
+  } else {
+    void router.push({ name: 'build-history', params: { pipelineId: row.pipeline_id } })
+  }
+}
+
+function percent(value: number): string {
+  return `${(value * 100).toFixed(1)}%`
+}
 
 function goCreate(): void {
   void router.push({ name: 'pipeline-create' })
@@ -64,6 +99,7 @@ async function onBuild(job: PipelineSummary): Promise<void> {
     const build = await triggerBuild(job.id)
     ElMessage.success(`已触发构建 #${build.id}`)
     await overview.fetch(true)
+    void loadDashboard()
     polling.start()
   } catch (e) {
     ElMessage.error(describeError(e))
@@ -98,7 +134,7 @@ async function onRemove(job: PipelineSummary): Promise<void> {
         <div class="muted">对应 Jenkins 作业列表：状态 · 健康度 · 上次成功 / 失败 / 耗时</div>
       </div>
       <div>
-        <el-button :loading="overview.loading" @click="overview.fetch(true)">刷新</el-button>
+        <el-button :loading="overview.loading || dashboardLoading" @click="refreshAll">刷新</el-button>
         <el-button type="primary" @click="goCreate">新建任务</el-button>
       </div>
     </div>
@@ -111,6 +147,102 @@ async function onRemove(job: PipelineSummary): Promise<void> {
       :title="overview.error"
       style="margin-bottom: 16px"
     />
+
+    <div v-loading="dashboardLoading" class="dashboard">
+      <div class="dashboard-grid">
+        <div class="metric-card">
+          <div class="metric-card__label">今日构建</div>
+          <div class="metric-card__value">{{ dashboard?.builds_today ?? 0 }}</div>
+          <div class="metric-card__sub">
+            成功 {{ dashboard?.success_today ?? 0 }} · 失败 {{ dashboard?.failed_today ?? 0 }} · 中断 {{ dashboard?.aborted_today ?? 0 }}
+          </div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-card__label">今日成功率</div>
+          <div class="metric-card__value" :class="{ 'is-bad': (dashboard?.success_rate ?? 0) < 0.8 }">
+            {{ dashboard ? percent(dashboard.success_rate) : '—' }}
+          </div>
+          <div class="metric-card__sub">按今日已完成构建计算</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-card__label">平均构建耗时</div>
+          <div class="metric-card__value">{{ formatDurationCN(dashboard?.avg_duration_ms, '—') }}</div>
+          <div class="metric-card__sub">今日成功 / 失败构建</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-card__label">队列 / 运行</div>
+          <div class="metric-card__value">
+            {{ dashboard?.queue_length ?? 0 }}<span class="metric-card__unit">/ {{ dashboard?.queue_capacity ?? 0 }}</span>
+          </div>
+          <div class="metric-card__sub">
+            运行 {{ dashboard?.running_builds ?? 0 }} · 等待 {{ dashboard?.pending_builds ?? 0 }} · Worker {{ dashboard?.workers ?? 0 }}
+          </div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-card__label">今日部署</div>
+          <div class="metric-card__value" :class="{ 'is-bad': (dashboard?.deployment_failures_today ?? 0) > 0 }">
+            {{ dashboard?.deployments_today ?? 0 }}
+          </div>
+          <div class="metric-card__sub">
+            失败 {{ dashboard?.deployment_failures_today ?? 0 }}
+            <el-tag v-if="dashboard?.quiet" size="small" type="warning" effect="plain" disable-transitions>静默模式</el-tag>
+          </div>
+        </div>
+      </div>
+
+      <div class="dashboard-panels">
+        <el-card shadow="never" class="dashboard-panel">
+          <template #header>
+            <div class="dashboard-panel__head">
+              <span>最近部署</span>
+              <span class="muted">环境 · 结果 · 时间</span>
+            </div>
+          </template>
+          <el-table v-if="dashboard?.recent_deployments?.length" :data="dashboard.recent_deployments" size="small">
+            <el-table-column label="任务" min-width="150" show-overflow-tooltip>
+              <template #default="{ row }">
+                <a class="dashboard-link" @click="goDeployment(row)">{{ row.pipeline_name }} #{{ row.build_id }}</a>
+              </template>
+            </el-table-column>
+            <el-table-column label="环境" width="110">
+              <template #default="{ row }">{{ row.environment || '—' }}</template>
+            </el-table-column>
+            <el-table-column label="结果" width="80">
+              <template #default="{ row }">
+                <el-tag :type="row.status === 'success' ? 'success' : 'danger'" size="small" disable-transitions>
+                  {{ row.status === 'success' ? '成功' : '失败' }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="时间" width="160">
+              <template #default="{ row }">{{ formatTime(row.deployed_at) }}</template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-else description="今天还没有部署记录" :image-size="52" />
+        </el-card>
+
+        <el-card shadow="never" class="dashboard-panel">
+          <template #header>
+            <div class="dashboard-panel__head">
+              <span>近 7 天失败最多</span>
+              <span class="muted">按失败次数排序</span>
+            </div>
+          </template>
+          <el-table v-if="dashboard?.top_failures?.length" :data="dashboard.top_failures" size="small">
+            <el-table-column label="任务" min-width="150" show-overflow-tooltip>
+              <template #default="{ row }">
+                <a class="dashboard-link" @click="goFailure(row)">{{ row.pipeline_name }}</a>
+              </template>
+            </el-table-column>
+            <el-table-column prop="failures" label="失败次数" width="90" />
+            <el-table-column label="最近失败" width="150">
+              <template #default="{ row }">{{ formatRelativeTime(row.last_failed_at) }}</template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-else description="近 7 天没有失败构建" :image-size="52" />
+        </el-card>
+      </div>
+    </div>
 
     <el-card shadow="never" class="jobs-card">
       <el-table
@@ -189,6 +321,76 @@ async function onRemove(job: PipelineSummary): Promise<void> {
 </template>
 
 <style scoped>
+.dashboard {
+  margin-bottom: 16px;
+}
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+}
+.metric-card {
+  padding: 14px 16px;
+  border: 1px solid var(--border-1, #ebeef5);
+  border-radius: 10px;
+  background: var(--bg-1, #fff);
+}
+.metric-card__label {
+  color: var(--text-3, #909399);
+  font-size: 12px;
+}
+.metric-card__value {
+  margin-top: 8px;
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.15;
+  color: var(--text-1, #303133);
+}
+.metric-card__value.is-bad {
+  color: var(--danger-600, #d03050);
+}
+.metric-card__unit {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-3, #909399);
+}
+.metric-card__sub {
+  margin-top: 6px;
+  min-height: 18px;
+  color: var(--text-3, #909399);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.dashboard-panels {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 12px;
+}
+.dashboard-panel__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.dashboard-link {
+  color: var(--brand-600);
+  cursor: pointer;
+}
+.dashboard-link:hover {
+  text-decoration: underline;
+}
+@media (max-width: 1100px) {
+  .dashboard-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+@media (max-width: 760px) {
+  .dashboard-grid,
+  .dashboard-panels {
+    grid-template-columns: 1fr;
+  }
+}
 .jobs-card :deep(.el-table__row) {
   cursor: pointer;
 }

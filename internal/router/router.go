@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"net/http"
@@ -36,6 +37,7 @@ type Deps struct {
 	Import      *handler.ImportHandler
 	Portability *handler.PortabilityHandler
 	Tools       *handler.ToolsHandler
+	Event       *handler.EventHandler
 
 	// AuthService 同时供中间件校验会话。为 nil 或未启用时接口不鉴权。
 	AuthService *service.AuthService
@@ -49,6 +51,9 @@ type Deps struct {
 
 	// WebAssets 是前端静态资源文件系统（内嵌或磁盘均可）。为 nil 时将返回明确的提示页。
 	WebAssets fs.FS
+
+	// Readiness 是额外的就绪检查（如凭据密钥可读）；为 nil 时只检查数据目录。
+	Readiness func(context.Context) error
 }
 
 // New 组装路由表与中间件。
@@ -76,10 +81,19 @@ func New(d Deps) http.Handler {
 	})
 	// Prometheus 指标：只暴露聚合值，不含任务名/日志/密钥。
 	r.Get("/metrics", d.Pipeline.Metrics)
+	// OpenAPI 契约：随二进制内嵌，便于脚本/CLI/第三方集成查阅。
+	r.Get("/openapi.json", handler.OpenAPISpec)
+	r.Get("/api/openapi.json", handler.OpenAPISpec)
 	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		if d.Config == nil || !pkg.IsDir(d.Config.DataHome) {
 			http.Error(w, "data home is not ready", http.StatusServiceUnavailable)
 			return
+		}
+		if d.Readiness != nil {
+			if err := d.Readiness(r.Context()); err != nil {
+				http.Error(w, "dependency is not ready: "+err.Error(), http.StatusServiceUnavailable)
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok"))
@@ -182,6 +196,12 @@ func New(d Deps) http.Handler {
 				r.With(perm(model.PermSystemManage)).Post("/quiet", d.System.SetQuiet)
 				r.With(perm(model.PermSystemManage)).Post("/email/test", d.System.TestEmail)
 				r.With(perm(model.PermSystemManage)).Post("/webhook/test", d.System.TestWebhookNotify)
+				// 全局出站事件订阅：配置系统管理，Webhook URL/Secret 不回传。
+				if d.Event != nil {
+					r.With(perm(model.PermSystemRead)).Get("/events", d.Event.List)
+					r.With(perm(model.PermSystemManage)).Put("/events", d.Event.Update)
+					r.With(perm(model.PermSystemManage)).Post("/events/test", d.Event.Test)
+				}
 				r.With(perm(model.PermSystemRead)).Get("/audit", d.System.Audit)
 				// 通知投递记录：按任务/收件人/状态过滤，排查「谁漏收了告警」。
 				if d.Notify != nil {

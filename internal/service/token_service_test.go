@@ -26,7 +26,7 @@ func TestAPITokenLifecycle(t *testing.T) {
 	store := &memTokenStore{}
 	svc := NewAPITokenService(store)
 
-	created, err := svc.Create("alice", "deploy", 30)
+	created, err := svc.Create("alice", "deploy", 30, []string{"job.read", "job.build"})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -36,10 +36,10 @@ func TestAPITokenLifecycle(t *testing.T) {
 	if len(store.items) != 1 || store.items[0].TokenHash == created.Secret {
 		t.Fatal("store must persist hash instead of raw token")
 	}
-	if user, ok := svc.VerifyAPIToken(created.Secret); !ok || user != "alice" {
-		t.Fatalf("verify = %q, %v", user, ok)
+	if user, scopes, ok := svc.VerifyAPIToken(created.Secret); !ok || user != "alice" || len(scopes) != 2 {
+		t.Fatalf("verify = %q, %v, %v", user, scopes, ok)
 	}
-	if _, ok := svc.VerifyAPIToken(created.Secret + "x"); ok {
+	if _, _, ok := svc.VerifyAPIToken(created.Secret + "x"); ok {
 		t.Fatal("tampered token must be rejected")
 	}
 
@@ -53,8 +53,32 @@ func TestAPITokenLifecycle(t *testing.T) {
 	if err := svc.Revoke("alice", created.Token.ID); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
-	if _, ok := svc.VerifyAPIToken(created.Secret); ok {
+	if _, _, ok := svc.VerifyAPIToken(created.Secret); ok {
 		t.Fatal("revoked token must be rejected")
+	}
+}
+
+func TestAPITokenScopes(t *testing.T) {
+	svc := NewAPITokenService(&memTokenStore{})
+	created, err := svc.Create("alice", "reader", 0, []string{"job.read", "job.read"})
+	if err != nil {
+		t.Fatalf("create scoped: %v", err)
+	}
+	if len(created.Token.Scopes) != 1 || created.Token.Scopes[0] != "job.read" {
+		t.Fatalf("scopes = %+v", created.Token.Scopes)
+	}
+	if _, _, ok := svc.VerifyAPIToken(created.Secret); !ok {
+		t.Fatal("scoped token should verify")
+	}
+	if _, err := svc.Create("alice", "bad", 0, []string{"root"}); err == nil {
+		t.Fatal("unknown scope must be rejected")
+	}
+	full, err := svc.Create("alice", "full", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full.Token.Scopes) != 1 || full.Token.Scopes[0] != "*" {
+		t.Fatalf("default scopes = %+v", full.Token.Scopes)
 	}
 }
 
@@ -64,22 +88,22 @@ func TestAPITokenExpiryAndUserDeletion(t *testing.T) {
 	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
 
-	created, err := svc.Create("alice", "short", 1)
+	created, err := svc.Create("alice", "short", 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	svc.now = func() time.Time { return now.Add(2 * 24 * time.Hour) }
-	if _, ok := svc.VerifyAPIToken(created.Secret); ok {
+	if _, _, ok := svc.VerifyAPIToken(created.Secret); ok {
 		t.Fatal("expired token must be rejected")
 	}
 
 	svc.now = func() time.Time { return now }
-	created, err = svc.Create("alice", "long", 30)
+	created, err = svc.Create("alice", "long", 30, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	svc.SetUserChecker(func(name string) bool { return name != "alice" })
-	if _, ok := svc.VerifyAPIToken(created.Secret); ok {
+	if _, _, ok := svc.VerifyAPIToken(created.Secret); ok {
 		t.Fatal("token of deleted user must be rejected")
 	}
 }
@@ -87,14 +111,14 @@ func TestAPITokenExpiryAndUserDeletion(t *testing.T) {
 func TestAPITokenLimitsPerUser(t *testing.T) {
 	svc := NewAPITokenService(&memTokenStore{})
 	for i := 0; i < maxAPITokensPerUser; i++ {
-		if _, err := svc.Create("alice", "t", 0); err != nil {
+		if _, err := svc.Create("alice", "t", 0, nil); err != nil {
 			t.Fatalf("create %d: %v", i, err)
 		}
 	}
-	if _, err := svc.Create("alice", "overflow", 0); err == nil {
+	if _, err := svc.Create("alice", "overflow", 0, nil); err == nil {
 		t.Fatal("token count limit must be enforced")
 	}
-	if _, err := svc.Create("bob", "other", 0); err != nil {
+	if _, err := svc.Create("bob", "other", 0, nil); err != nil {
 		t.Fatalf("other user must not be affected: %v", err)
 	}
 }
@@ -118,4 +142,7 @@ func TestAuthServiceVerifiesAPIToken(t *testing.T) {
 
 type tokenVerifierFunc func(string) (string, bool)
 
-func (f tokenVerifierFunc) VerifyAPIToken(raw string) (string, bool) { return f(raw) }
+func (f tokenVerifierFunc) VerifyAPIToken(raw string) (string, []string, bool) {
+	user, ok := f(raw)
+	return user, []string{"job.read"}, ok
+}

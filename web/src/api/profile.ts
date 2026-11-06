@@ -31,10 +31,11 @@ export const tokenApi = {
     return http.get<APIToken[]>('/profile/tokens')
   },
 
-  create(name: string, expiresInDays: number): Promise<CreateAPITokenResult> {
+  create(name: string, expiresInDays: number, scopes: string[]): Promise<CreateAPITokenResult> {
     return http.post<CreateAPITokenResult>('/profile/tokens', {
       name,
       expires_in_days: expiresInDays,
+      scopes,
     })
   },
 

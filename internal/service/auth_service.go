@@ -37,7 +37,7 @@ type UserPasswordUpdater interface {
 // APITokenVerifier 校验长期访问令牌（由 APITokenService 实现）。
 // 单列接口是为了让 AuthService 不直接依赖令牌存储，测试时也能注入空实现。
 type APITokenVerifier interface {
-	VerifyAPIToken(raw string) (string, bool)
+	VerifyAPIToken(raw string) (string, []string, bool)
 }
 
 // AuthService 负责管理员凭据校验与会话签发/校验。
@@ -306,33 +306,42 @@ func (a *AuthService) UsesPassword(plain string) bool {
 }
 
 // Verify 校验登录会话或 API Token，返回用户名与是否有效。
-// 认证关闭时恒为有效；校验 API Token 时不能在持锁状态下调用外部服务。
 func (a *AuthService) Verify(token string) (string, bool) {
+	user, _, _, ok := a.VerifyDetailed(token)
+	return user, ok
+}
+
+// VerifyDetailed 与 Verify 相同，但额外返回 API Token 的 scopes 与认证类型；
+// 登录会话返回 nil scopes、isAPIToken=false。
+func (a *AuthService) VerifyDetailed(token string) (string, []string, bool, bool) {
 	a.mu.Lock()
 	if !a.enabled {
 		a.mu.Unlock()
-		return "anonymous", true
+		return "anonymous", nil, false, true
 	}
 	if token == "" {
 		a.mu.Unlock()
-		return "", false
+		return "", nil, false, false
 	}
 	now := time.Now()
 	if s, ok := a.sessions[token]; ok {
 		if now.After(s.expiresAt) {
 			delete(a.sessions, token)
 			a.mu.Unlock()
-			return "", false
+			return "", nil, false, false
 		}
 		a.mu.Unlock()
-		return s.username, true
+		return s.username, nil, false, true
 	}
 	verifier := a.tokenVerifier
 	a.mu.Unlock()
 	if verifier != nil {
-		return verifier.VerifyAPIToken(token)
+		user, scopes, ok := verifier.VerifyAPIToken(token)
+		if ok {
+			return user, scopes, true, true
+		}
 	}
-	return "", false
+	return "", nil, false, false
 }
 
 // Logout 主动销毁会话。

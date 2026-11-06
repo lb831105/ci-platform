@@ -119,6 +119,27 @@ func (s *SettingsService) Update(in model.Settings) (model.Settings, error) {
 		in.WebhookNotify.URL = s.current.WebhookNotify.URL
 	}
 
+	// 全局密钥变量在 API 中不回传原文：前端留空表示沿用旧值。
+	// 按 key 合并，避免保存一次系统配置就把所有密钥清空。
+	oldEnv := make(map[string]string, len(s.current.GlobalEnv))
+	for _, item := range s.current.GlobalEnv {
+		if item.Key != "" {
+			oldEnv[strings.ToUpper(item.Key)] = item.Value
+		}
+	}
+	for i := range in.GlobalEnv {
+		item := &in.GlobalEnv[i]
+		if strings.TrimSpace(item.Value) != "" {
+			continue
+		}
+		if !item.Secret && !model.IsSecretEnvName(item.Key) {
+			continue
+		}
+		if old, ok := oldEnv[strings.ToUpper(item.Key)]; ok {
+			item.Value = old
+		}
+	}
+
 	if err := validateSettings(&in); err != nil {
 		return model.Settings{}, err
 	}

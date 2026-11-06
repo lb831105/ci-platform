@@ -57,6 +57,18 @@ func (s *CredentialService) Resolve(ctx context.Context, id string) (*model.Cred
 	return s.store.Get(ctx, id)
 }
 
+// Health 检查密钥是否可用。凭据列表会跳过无法解密的项，
+// 因此 readiness 必须直接检查密钥，而不是只看列表是否返回。
+func (s *CredentialService) Health(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if checker, ok := s.store.(interface{ KeyReady() error }); ok {
+		return checker.KeyReady()
+	}
+	return nil
+}
+
 // SealSecret 加密构建密码参数等敏感值（与凭据共用 credentials.key）。
 func (s *CredentialService) SealSecret(plain string) (string, error) {
 	sealer, ok := s.store.(interface{ SealSecret(string) (string, error) })

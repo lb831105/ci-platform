@@ -103,3 +103,13 @@ func TestEventServiceRejectsPrivateURLAndMergesSecrets(t *testing.T) {
 		t.Fatalf("clear_secret should clear secret: %+v", items[0])
 	}
 }
+
+func TestEventServiceRejectsUnknownEvents(t *testing.T) {
+	store := &memEventStore{}
+	svc := NewEventService(store)
+	if _, err := svc.Update([]model.EventSubscription{{
+		Name: "bad", URL: "https://example.com/hook", Events: []string{"build.typo"}, Enabled: true,
+	}}); err == nil {
+		t.Fatal("unknown event type must be rejected")
+	}
+}

@@ -123,9 +123,9 @@ func (s *EventService) Update(in []model.EventSubscription) ([]model.EventSubscr
 				item.Secret = prev.Secret
 			}
 		}
-		item.Events = normalizeEventTypes(item.Events)
-		if len(item.Events) == 0 {
-			return nil, pkg.ErrBadRequest("事件订阅 %q 至少要选择一个事件", item.Name)
+		item.Events, err = normalizeEventTypes(item.Events)
+		if err != nil {
+			return nil, err
 		}
 		item.HasURL = false
 		item.HasSecret = false
@@ -154,22 +154,28 @@ func validateEventIDs(items []model.EventSubscription) error {
 
 // normalizeEventTypes 去重、校验并排序，返回空表示全部事件。
 // 空列表在保存时按「全部事件」处理，避免用户勾选后误清空。
-func normalizeEventTypes(events []string) []string {
+func normalizeEventTypes(events []string) ([]string, error) {
 	if len(events) == 0 {
-		return append([]string(nil), model.CIEventTypes...)
+		return append([]string(nil), model.CIEventTypes...), nil
 	}
 	seen := make(map[string]bool, len(events))
 	out := make([]string, 0, len(events))
 	for _, raw := range events {
 		event := strings.TrimSpace(raw)
-		if !model.IsValidCIEvent(event) || seen[event] {
+		if event == "" || seen[event] {
 			continue
+		}
+		if !model.IsValidCIEvent(event) {
+			return nil, pkg.ErrBadRequest("不支持的事件类型: %s", event)
 		}
 		seen[event] = true
 		out = append(out, event)
 	}
+	if len(out) == 0 {
+		return append([]string(nil), model.CIEventTypes...), nil
+	}
 	sort.Strings(out)
-	return out
+	return out, nil
 }
 
 // Dispatch 同步投递；构建调用方应使用 DispatchAsync，避免网络抖动拖慢构建。

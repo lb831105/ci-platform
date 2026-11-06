@@ -131,3 +131,23 @@ func TestExecuteStagesFailsWhenSecretCodecMissing(t *testing.T) {
 		t.Fatal("missing secret codec must fail instead of injecting ***")
 	}
 }
+
+func TestCollectMaskSecretsCoversExplicitSecrets(t *testing.T) {
+	svc := &BuildService{secrets: fakeSecretCodec{}}
+	b := &model.Build{
+		SecretParams: map[string]string{
+			"FOO": "enc:" + base64.StdEncoding.EncodeToString([]byte("hunter2")),
+		},
+	}
+	settings := model.Settings{
+		GlobalEnv: []model.EnvVar{{Key: "PLAIN", Value: "s3cr3t", Secret: true}},
+	}
+	got := svc.collectMaskSecrets(context.Background(), &model.Pipeline{}, b, settings)
+	all := strings.Join(got, "\n")
+	if !strings.Contains(all, "hunter2") {
+		t.Fatalf("password param named FOO must be masked: %v", got)
+	}
+	if !strings.Contains(all, "s3cr3t") {
+		t.Fatalf("globally marked secret must be masked: %v", got)
+	}
+}

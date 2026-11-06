@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -8,6 +9,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -194,9 +196,68 @@ func (s *CredentialStore) migrateLegacy(id string) {
 }
 
 // KeyReady 检查 credentials.key 是否可读且长度正确，供 readiness 使用。
+// 密钥缺失时不自动生成：如果已有密文，自动生成新密钥会让旧数据永久不可读。
 func (s *CredentialStore) KeyReady() error {
-	_, err := s.encryptionKey()
-	return err
+	if _, err := s.existingKey(); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if encryptedDataExists(filepath.Dir(s.keyPath)) {
+		return errors.New("credentials.key is missing but encrypted data exists; restore the key from backup")
+	}
+	return nil
+}
+
+// existingKey 只读取已有密钥，绝不生成；供解密与 readiness 使用。
+func (s *CredentialStore) existingKey() ([]byte, error) {
+	if !pkg.Exists(s.keyPath) {
+		return nil, os.ErrNotExist
+	}
+	key, err := os.ReadFile(s.keyPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("credentials key must be 32 bytes, got %d", len(key))
+	}
+	return key, nil
+}
+
+// encryptedDataExists 在密钥缺失时判断数据目录里是否已有密文。
+// 只在密钥缺失的异常路径调用，避免正常启动时扫描大量构建记录。
+func encryptedDataExists(dataHome string) bool {
+	found := false
+	err := filepath.WalkDir(dataHome, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case "workspace", "tools", "logs":
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() || !strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || info.Size() > 16<<20 {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err == nil && bytes.Contains(data, []byte(encryptedSecretPrefix)) {
+			found = true
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		// 无法确认时按“有密文”处理，宁可 readiness 失败也不生成新密钥。
+		return true
+	}
+	return found
 }
 
 // SealSecret 供构建参数等其它敏感数据复用同一个 AES-GCM 密钥。
@@ -239,7 +300,7 @@ func (s *CredentialStore) unseal(value string) (string, error) {
 	if !strings.HasPrefix(value, encryptedSecretPrefix) {
 		return value, nil
 	}
-	key, err := s.encryptionKey()
+	key, err := s.existingKey()
 	if err != nil {
 		return "", err
 	}

@@ -112,6 +112,24 @@ func RequireJobPerm(rbac JobPermChecker, lookup JobNameLookup, action string) fu
 	}
 }
 
+// RequireTokenScope 只校验 API Token 的 scopes，不校验用户 RBAC。
+// 用于 /api/pipelines、/api/builds 这类“登录即可、内容再按任务角色过滤”的集合接口：
+// 否则一个只有 job.build 的令牌也能读取任务名、构建历史等 job.read 数据。
+// 登录会话没有 scopes，直接放行。
+func RequireTokenScope(perm string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !pkg.TokenAllows(r.Context(), perm) {
+				logger.Debugf("[rbac] deny token scope user=%q perm=%s path=%s",
+					pkg.UserFromContext(r.Context()), perm, r.URL.Path)
+				pkg.Fail(w, pkg.NewError(pkg.CodeForbidden, "API Token 没有该操作所需的权限: %s", perm))
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // tokenAllowsAny 检查 API Token scopes 是否覆盖任一 required 权限。
 func tokenAllowsAny(ctx context.Context, globalPerms, jobPerms []string) bool {
 	scopes, restricted := pkg.TokenScopesFromContext(ctx)

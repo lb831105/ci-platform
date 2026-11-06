@@ -20,7 +20,7 @@ const EncryptedSecretPrefix = "enc:v1:"
 // 与凭据存储共用同一个密钥文件：备份 data 时只需备份一份 credentials.key。
 type SecretBox struct {
 	keyPath string
-	once    sync.Once
+	mu      sync.Mutex
 	key     []byte
 	err     error
 }
@@ -60,7 +60,9 @@ func (b *SecretBox) Unseal(value string) (string, error) {
 	if !IsEncryptedSecret(value) {
 		return value, nil
 	}
-	key, err := b.encryptionKey()
+	// 解密绝不能创建新密钥：密钥文件丢失时继续生成只会让旧密文
+	// 永久不可恢复，并让运维误以为数据还能读。必须显式报错。
+	key, err := b.existingKey()
 	if err != nil {
 		return "", err
 	}
@@ -87,8 +89,9 @@ func (b *SecretBox) Unseal(value string) (string, error) {
 }
 
 // KeyReady 检查密钥文件可读且长度为 32 字节，供 readiness 使用。
+// 注意：这里只读，不创建密钥；首次写入时由 Seal 负责创建。
 func (b *SecretBox) KeyReady() error {
-	_, err := b.encryptionKey()
+	_, err := b.existingKey()
 	return err
 }
 
@@ -98,46 +101,64 @@ func IsEncryptedSecret(value string) bool {
 }
 
 func (b *SecretBox) encryptionKey() ([]byte, error) {
-	b.once.Do(func() {
+	return b.loadKey(true)
+}
+
+// existingKey 只读取已有密钥，供解密/readiness 使用。
+func (b *SecretBox) existingKey() ([]byte, error) {
+	return b.loadKey(false)
+}
+
+func (b *SecretBox) loadKey(create bool) ([]byte, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.key != nil {
+		return b.key, nil
+	}
+	if b.err != nil {
+		return nil, b.err
+	}
+	if !Exists(b.keyPath) {
+		if !create {
+			return nil, fmt.Errorf("credentials key is missing: %s", b.keyPath)
+		}
 		if err := EnsureDir(filepath.Dir(b.keyPath)); err != nil {
 			b.err = fmt.Errorf("prepare credentials key dir: %w", err)
-			return
+			return nil, b.err
 		}
-		if !Exists(b.keyPath) {
-			key := make([]byte, 32)
-			if _, err := rand.Read(key); err != nil {
-				b.err = fmt.Errorf("generate credentials key: %w", err)
-				return
-			}
-			// O_EXCL：多实例/并发启动时只有一个能创建成功，另一个读取现有密钥。
-			f, err := os.OpenFile(b.keyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-			if err != nil {
-				if !errors.Is(err, os.ErrExist) {
-					b.err = fmt.Errorf("create credentials key: %w", err)
-					return
-				}
-			} else {
-				if _, err = f.Write(key); err != nil {
-					_ = f.Close()
-					b.err = fmt.Errorf("write credentials key: %w", err)
-					return
-				}
-				if err = f.Close(); err != nil {
-					b.err = fmt.Errorf("close credentials key: %w", err)
-					return
-				}
-			}
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			b.err = fmt.Errorf("generate credentials key: %w", err)
+			return nil, b.err
 		}
-		key, err := os.ReadFile(b.keyPath)
+		// O_EXCL：多实例/并发启动时只有一个能创建成功，另一个读取现有密钥。
+		f, err := os.OpenFile(b.keyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
-			b.err = fmt.Errorf("read credentials key: %w", err)
-			return
+			if !errors.Is(err, os.ErrExist) {
+				b.err = fmt.Errorf("create credentials key: %w", err)
+				return nil, b.err
+			}
+		} else {
+			if _, err = f.Write(key); err != nil {
+				_ = f.Close()
+				b.err = fmt.Errorf("write credentials key: %w", err)
+				return nil, b.err
+			}
+			if err = f.Close(); err != nil {
+				b.err = fmt.Errorf("close credentials key: %w", err)
+				return nil, b.err
+			}
 		}
-		if len(key) != 32 {
-			b.err = fmt.Errorf("credentials key must be 32 bytes, got %d", len(key))
-			return
-		}
-		b.key = key
-	})
-	return b.key, b.err
+	}
+	key, err := os.ReadFile(b.keyPath)
+	if err != nil {
+		b.err = fmt.Errorf("read credentials key: %w", err)
+		return nil, b.err
+	}
+	if len(key) != 32 {
+		b.err = fmt.Errorf("credentials key must be 32 bytes, got %d", len(key))
+		return nil, b.err
+	}
+	b.key = key
+	return b.key, nil
 }

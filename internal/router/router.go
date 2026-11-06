@@ -173,10 +173,11 @@ func New(d Deps) http.Handler {
 			// 总览/全局列表：登录即可访问，内容由任务角色的 Pattern 过滤。
 			// 不能用 overall.read 卡：只被授予任务角色的用户拿不到 overall.read，
 			// 结果就是"授权了却连任务列表都打不开"，任务级权限形同虚设。
-			r.Get("/overview", d.Pipeline.Overview)
+			// 集合接口内容按任务角色过滤；API Token 仍必须至少具备 job.read。
+			r.With(middleware.RequireTokenScope(model.PermJobRead)).Get("/overview", d.Pipeline.Overview)
 			// 首页仪表盘：统计范围按当前用户可见任务过滤。
-			r.Get("/dashboard", d.Pipeline.Dashboard)
-			r.Get("/builds", d.Pipeline.AllBuilds)
+			r.With(middleware.RequireTokenScope(model.PermJobRead)).Get("/dashboard", d.Pipeline.Dashboard)
+			r.With(middleware.RequireTokenScope(model.PermJobRead)).Get("/builds", d.Pipeline.AllBuilds)
 
 			r.Route("/system", func(r chi.Router) {
 				r.With(perm(model.PermSystemRead)).Get("/info", d.System.Info)
@@ -239,7 +240,7 @@ func New(d Deps) http.Handler {
 
 			r.Route("/pipelines", func(r chi.Router) {
 				// 任务列表同理：登录即可，内容按 JobScope 过滤（无任何 job.read 则返回空列表）。
-				r.Get("/", d.Pipeline.List)
+				r.With(middleware.RequireTokenScope(model.PermJobRead)).Get("/", d.Pipeline.List)
 				r.With(perm(model.PermJobCreate)).Post("/", d.Pipeline.Create)
 
 				r.Route("/{pid}", func(r chi.Router) {

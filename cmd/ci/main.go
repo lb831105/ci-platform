@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -544,10 +545,17 @@ func printJSON(v any) error {
 	return enc.Encode(v)
 }
 
+var stdinReader = bufio.NewReader(os.Stdin)
+
 func readLine(prompt string) (string, error) {
 	fmt.Fprint(os.Stderr, prompt)
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && !errors.Is(err, os.ErrClosed) {
+	// 复用同一个 reader：连续读用户名/密码时，第一次 ReadString 可能已经
+	// 把后续行缓冲进来；每次 new reader 会丢数据，管道输入也会在 EOF 时失败。
+	line, err := stdinReader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrClosed) {
+		return "", err
+	}
+	if line == "" && err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(line), nil

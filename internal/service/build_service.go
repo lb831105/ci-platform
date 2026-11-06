@@ -1753,7 +1753,8 @@ func (s *BuildService) collectMaskSecrets(ctx context.Context, p *model.Pipeline
 	}
 
 	for _, item := range settings.GlobalEnv {
-		if isSecretEnvName(item.Key) {
+		// Secret 显式标记优先于名称启发式：用户可以把任意变量名标成密钥。
+		if item.Secret || isSecretEnvName(item.Key) {
 			add(item.Value)
 		}
 	}
@@ -1764,11 +1765,10 @@ func (s *BuildService) collectMaskSecrets(ctx context.Context, p *model.Pipeline
 			}
 		}
 		// 密码参数的真实值不在 Params 里，需要解密后再加入遮罩列表。
+		// SecretParams 本身已经限定了密码参数，不能再按名称过滤：
+		// 参数名叫 FOO 但类型是 password 时也必须遮罩。
 		if s.secrets != nil {
-			for name, sealed := range b.SecretParams {
-				if !isSecretEnvName(name) {
-					continue
-				}
+			for _, sealed := range b.SecretParams {
 				if plain, err := s.secrets.UnsealSecret(sealed); err == nil {
 					add(plain)
 				}

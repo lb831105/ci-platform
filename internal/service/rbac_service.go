@@ -416,12 +416,14 @@ func (s *RBACService) EffectivePermissions(user string) []string {
 // Profile 返回某个用户的个人资料（自助维护联系方式用）。
 // 内置管理员不在 rbac.json 中：返回 Builtin=true，联系方式只读。
 func (s *RBACService) Profile(name string) (model.Profile, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	// 先取管理员名再拿 RBAC 锁：AuthService.Login 会持 auth 锁回调
+	// RBACService.VerifyLogin，反序会形成锁顺序反转。
 	admin := ""
 	if s.auth != nil {
 		admin = s.auth.AdminUser()
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, u := range s.data.Users {
 		if u.Name != name {
 			continue
@@ -459,13 +461,13 @@ func (s *RBACService) SetEmailVerified(name string, verified bool) error {
 // Users 汇总「用户管理」页需要的账号清单：内置管理员 + 平台内用户，附带角色摘要。
 // 只返回展示字段，密码哈希等敏感信息不出服务层。
 func (s *RBACService) Users() []model.UserAccount {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	admin := ""
 	if s.auth != nil {
 		admin = s.auth.AdminUser()
 	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	list := make([]model.UserAccount, 0, len(s.data.Users)+1)
 	if admin != "" {
 		// 内置管理员来自系统配置，不在 rbac.json 的用户里；不单独补一行的话，
